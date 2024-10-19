@@ -7,7 +7,8 @@ import random
 import os
 import open3d as o3d
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
-from sklearn.cluster import KMeans
+from lib.utils import get_kmeans_labels
+
 from typing import List, Tuple
 class cfl_collate_fn:
 
@@ -41,7 +42,26 @@ class cfl_collate_fn:
         return coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch, region_batch, index
 
 
+class cfl_collate_fn_temporal:
 
+    def __call__(self, list_data):
+        coords_q, coords_k, segs_q, segs_k = list(zip(*list_data))
+        coords_q_batch, coords_k_batch = [], []
+        for batch_id, _ in enumerate(coords_q):
+            num_points_q = coords_q[batch_id].shape[0]
+            coords_q_batch.append(torch.cat((torch.ones(num_points_q, 1).int() * batch_id, torch.from_numpy(coords_q[batch_id]).int()), 1))
+
+        for batch_id, _ in enumerate(coords_k):
+            num_points_k = coords_k[batch_id].shape[0]
+            coords_k_batch.append(torch.cat((torch.ones(num_points_k, 1).int() * batch_id, torch.from_numpy(coords_k[batch_id]).int()), 1))
+
+        # Concatenate all lists
+        coords_q_batch = torch.cat(coords_q_batch, 0).float()
+        coords_k_batch = torch.cat(coords_k_batch, 0).float()
+        
+        segs_q = [torch.from_numpy(seg_q) for seg_q in segs_q]
+        segs_k = [torch.from_numpy(seg_k) for seg_k in segs_k]
+        return coords_q_batch, coords_k_batch, segs_q, segs_k
 
 class KITTItrain(Dataset):
     def __init__(self, args, scene_idx, split='train'):
@@ -236,6 +256,10 @@ class KITTItemporal(Dataset):
         
         self.scene_locates, self.scene_diff_locates, self.window_start_locates = self._random_select_samples(scan_range) # [(seq, idx), ...]
         
+        self.trans_coords = trans_coords(shift_ratio=50)  ### 50%
+        self.rota_coords = rota_coords(rotation_bound = ((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
+        self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
+        
         
     def _random_select_samples(self, scan_range:List[int]) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
         scene_idx = np.random.choice(19130, self.args.select_num, replace=False).tolist()
@@ -248,7 +272,7 @@ class KITTItemporal(Dataset):
                     break
                 scan_num += seq_scan_num
         
-        scene_diff = np.random.choice(scan_range, self.args.select_num, replace=False).tolist()
+        scene_diff = np.random.choice(scan_range, self.args.select_num, replace=True).tolist()
         window_pattern = [random.randint(0, self.args.scan_window-abs(diff)-1) for diff in scene_diff]
         scene_diff_locates = []
         window_start_locates = []
@@ -256,7 +280,7 @@ class KITTItemporal(Dataset):
             t2_idx = idx + diff
             # この処理だと稀にt1とt2が重なることがあるけどそれもよき
             if t2_idx >= self.seq_to_scan_num[seq]:
-                t2_idx = self.seq_to_scan_num[seq]
+                t2_idx = self.seq_to_scan_num[seq] - 1
             elif t2_idx < 0:
                 t2_idx = 0
             scene_diff_locates.append((seq, t2_idx))
@@ -264,8 +288,8 @@ class KITTItemporal(Dataset):
             window_idx = min(idx, t2_idx) - pat
             if window_idx < 0:
                 window_idx = 0
-            elif window_idx > self.seq_to_scan_num[seq] - self.args.scan_window + 1:
-                window_idx = self.seq_to_scan_num[seq] - self.args.scan_window + 1
+            elif window_idx > self.seq_to_scan_num[seq] - self.args.scan_window:
+                window_idx = self.seq_to_scan_num[seq] - self.args.scan_window
             window_start_locates.append((seq, window_idx))
     
         return scene_locates, scene_diff_locates, window_start_locates
@@ -274,21 +298,17 @@ class KITTItemporal(Dataset):
     def __getitem__(self, index):
         seq_t1, idx_t1 = self.scene_locates[index]
         seq_t2, idx_t2 = self.scene_diff_locates[index]
-        coords_t1, unique_map_t1, inverse_map_t1 = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
-        coords_t2, unique_map_t2, inverse_map_t2 = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
+        coords_t1, *_ = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
+        coords_t2, *_ = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
         
         scene_idx_in_window = [(self.window_start_locates[index][0], self.window_start_locates[index][1]+i) for i in range(self.args.scan_window)]
-        coords_tn, unique_map_tn, inverse_map_tn = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
-        agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, self.n_clusters)
-        agg_segs = self._clusterize_pcds(agg_coords, agg_ground_labels, self.n_clusters)
-        # coords_tn, 
+        coords_tn, unique_map_tn, inverse_map_tn, mask_tn = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
+        agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn)
+        agg_segs = self._clusterize_pcds(agg_coords, agg_ground_labels)
         segs_tn = []
         for elements_num in elements_nums:
-            # coords_tn.append(agg_coords[:elements_num])
             segs_tn.append(agg_segs[:elements_num])
-            # agg_coords = agg_coords[elements_num:]
             agg_segs = agg_segs[elements_num:]
-        # scene_idx_in_windowの中で、要素が(seq_t1, idx_t1)のもののインデックスを取得
         idx_t1_in_window = scene_idx_in_window.index((seq_t1, idx_t1))
         idx_t2_in_window = scene_idx_in_window.index((seq_t2, idx_t2))
         segs_t1 = segs_tn[idx_t1_in_window]
@@ -296,50 +316,56 @@ class KITTItemporal(Dataset):
         return coords_t1, coords_t2, segs_t1, segs_t2
 
     
-    def _aggretate_pcds(self, scene_idx_in_window, coords_tn):
+    def _aggretate_pcds(self, scene_idx_in_window, coords_tn, unique_map_tn, mask_tn):
         poses = self._load_poses(scene_idx_in_window[0][0])
         points_set = np.empty((0, 3))
         ground_label = np.empty((0, 1))
         element_nums = []
-        for (seq, idx), coords in zip(scene_idx_in_window, coords_tn):
+        for (seq, idx), coords, unique_map, mask in zip(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn):
             pose = poses[idx]
             coords = self._apply_transform(coords, pose)
             g_set = np.fromfile(self._tuple_to_patchwork_path((seq, idx)), dtype=np.uint32)
+            g_set = g_set[unique_map]
+            g_set = g_set[mask]
             g_set = g_set.reshape((-1))[:, np.newaxis]
             points_set = np.vstack((points_set, coords))
             ground_label = np.vstack((ground_label, g_set))
-            element_nums.append(points_set.shape[0])
+            element_nums.append(coords.shape[0])
         last_pose = poses[scene_idx_in_window[-1][1]]
         points_set = self._undo_transform(points_set, last_pose)
         return points_set, ground_label, element_nums
         
     
-    def _clusterize_pcds(self, agg_coords, agg_ground_labels, n_clusters:int):
-        non_ground_indices = np.where(agg_ground_labels != 1)[0]
-        non_ground_coords = agg_coords[non_ground_indices]
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(non_ground_coords)
-        return kmeans.labels_
+    def _clusterize_pcds(self, agg_coords, agg_ground_labels):
+        mask_ground = agg_ground_labels == 1
+        mask_ground = mask_ground.flatten()
+        non_ground_coords = agg_coords[~mask_ground]
+        labels = get_kmeans_labels(self.n_clusters-1, non_ground_coords).detach().cpu().numpy()
+        agg_segs = np.zeros_like(agg_ground_labels).flatten()
+        agg_segs[~mask_ground] = labels
+        agg_segs[mask_ground] = self.n_clusters-1
+        return agg_segs
         
         
     def _get_item_one_scene(self, seq:int, idx:int, aug:bool=True):
         coords, feats, labels = self._load_ply(seq, idx)
+        coords_original = coords.copy()
         means = coords.mean(0)
         coords -= means
         
-        coords, feats, labels, unique_map, inverse_map = self._voxelize(coords, feats, labels, aug) # (123008, x) -> (41342, x)
+        coords, feats, labels, unique_map, inverse_map = self._voxelize(coords, feats, labels) # (123008, x) -> (41342, x)
         coords = coords.astype(np.float32)
         
         mask = np.sqrt(((coords*self.args.voxel_size)**2).sum(-1))< self.args.r_crop
         coords, feats, labels = coords[mask], feats[mask], labels[mask] # (41342, x) -> (39521, x)
         
-        
         if aug:
             coords = self._augs(coords)
             coords, feats, labels = self._augment_coords_to_feats(coords, feats, labels)
         else:
-            coords += means
+            coords = coords_original[unique_map][mask]
         
-        return coords, unique_map, inverse_map # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。
+        return coords, unique_map, inverse_map, mask # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。
     
     
     def _load_ply(self, seq:int, idx:int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -366,12 +392,10 @@ class KITTItemporal(Dataset):
         return norm_coords, feats, labels
 
 
-    def _voxelize(self, coords, feats, labels, scaling:bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _voxelize(self, coords, feats, labels) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         scale = 1 / self.args.voxel_size
         coords = np.floor(coords * scale)
         coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
-        if not scaling:
-            coords *= self.args.voxel_size
         return coords, feats, labels, unique_map, inverse_map
     
     
@@ -400,17 +424,17 @@ class KITTItemporal(Dataset):
         return poses
     
     
-    def _apply_transform(points, pose):
+    def _apply_transform(self, points, pose):
         hpoints = np.hstack((points[:, :3], np.ones_like(points[:, :1])))
         return np.sum(np.expand_dims(hpoints, 2) * pose.T, axis=1)[:,:3]
 
 
-    def _undo_transform(points, pose):
+    def _undo_transform(self, points, pose):
         hpoints = np.hstack((points[:, :3], np.ones_like(points[:, :1])))
         return np.sum(np.expand_dims(hpoints, 2) * np.linalg.inv(pose).T, axis=1)[:,:3]
     
     
-    def _parse_calibration(filename):
+    def _parse_calibration(self, filename):
         calib = {}
 
         calib_file = open(filename)
@@ -441,13 +465,13 @@ class KITTItemporal(Dataset):
         return os.path.join(self.args.pseudo_label_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.npy')
     
     def _seq_to_calib_path(self, seq:int) -> str:
-        return os.path.join("~/dataset/semantickitti/dataset/sequences/", str(seq).zfill(2), 'calib.txt')
+        return os.path.join(self.args.original_data_path, str(seq).zfill(2), 'calib.txt')
     
     def _seq_to_poses_path(self, seq:int) -> str:
-        return os.path.join("~/dataset/semantickitti/dataset/sequences/", str(seq).zfill(2), 'poses.txt')
+        return os.path.join(self.args.original_data_path, str(seq).zfill(2), 'poses.txt')
     
     def _tuple_to_patchwork_path(self, tup:Tuple[int, int]) -> str:
-        return os.path.join("~/dataset/semantickitti/assets/patchwork/", str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.label')
+        return os.path.join(self.args.patchwork_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.label')
 
     def __len__(self):
         return len(self.scene_locates)

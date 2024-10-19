@@ -1,0 +1,54 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "args": [
+                "--data_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp",
+                "--sp_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp_sp",
+                "--save_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp_model",
+                "--batch_size",
+                "4",
+                "--max_epoch",
+                "4",
+                "4",
+                "--select_num",
+                "3000",
+                "--cluster_interval",
+                "2",
+                "--feats_dim",
+                "128",
+                "--workers",
+                "0",
+                "--run_stage",
+                "2",
+                "--workers",
+                "0",
+                "--temporal_workers",
+                "0",
+                "--cluster_workers",
+                "0",
+                "--cluster_interval",
+                "2",
+                "--primitive_num",
+                "100",
+                "--growsp_start",
+                "1000",
+            ],
+            "request": "launch",
+            "program": "~/repos/TCUSS/train_SemanticKITTI.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+                "WANDB_MODE": "disabled"
+            }
+        }
+    ]
+}

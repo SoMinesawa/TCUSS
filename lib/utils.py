@@ -3,14 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
-from sklearn.cluster import KMeans
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
 from typing import Optional
 from tqdm import tqdm
+import wandb
+from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
+from torchclustermetrics import silhouette
+import time
+import random
 
-from models.fpn import Res16FPNBase
-
+# from models.fpn import Res16FPNBase
+from kmeans_gpu import KMeans
 
 def get_sp_feature(args, loader, model, current_growsp):
     print('computing point feats ....')
@@ -67,7 +71,7 @@ def get_sp_feature(args, loader, model, current_growsp):
                     n_segments = region_feats.size(0)
                 else:
                     n_segments = current_growsp
-                sp_idx = torch.from_numpy(KMeans(n_clusters=n_segments, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
+                sp_idx = get_kmeans_labels(n_clusters=n_segments, pcds=region_feats).long()
             else:
                 feats = region_feats
                 sp_idx = torch.tensor(range(region_feats.size(0)))
@@ -110,13 +114,15 @@ def get_sp_feature(args, loader, model, current_growsp):
     return point_feats_list, point_labels_list, all_sp_index, context
 
 
-def get_kittisp_feature(args, loader, model, current_growsp):
+def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     print('computing point feats ....')
     point_feats_list = []
     point_labels_list = []
     all_sp_index = []
     model.eval()
     context = []
+    sl_scores, db_scores, ch_scores, ts = [], [], [], []
+    random_indices = sorted(random.sample(range(len(loader)), 10))
     with torch.no_grad():
         for batch_idx, data in tqdm(enumerate(loader), total=len(loader)):
             coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
@@ -127,7 +133,7 @@ def get_kittisp_feature(args, loader, model, current_growsp):
             raw_region = region.clone()
 
             '''現状の特徴量を計算'''
-            in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device='cpu', quantization_mode=ME.SparseTensorQuantizationMode.RANDOM_SUBSAMPLE)
+            in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
 
             feats = model(in_field) #[67911, 4+3] -> [67911, 4]
             feats = feats[inds.long()].cuda() #[67911, 4] -> [39521, 4]
@@ -148,9 +154,11 @@ def get_kittisp_feature(args, loader, model, current_growsp):
             region_corr.scatter_(1, region.view(-1, 1), 1)
             region_corr = region_corr.cuda()##[N, M]
             per_region_num = region_corr.sum(0, keepdims=True).t()
+            if torch.any(per_region_num == 0):
+                raise ValueError("per_region_num contains zero, which is not allowed.")
             ### per_region_num = [[1], [2], [2]] (266,1)
 
-            region_feats = F.linear(region_corr.t(), feats.t())/per_region_num # [M, 4] これはM個のSPの特徴量
+            region_feats = F.linear(region_corr.t(), feats.t())/per_region_num # [M, 4] これはM個のinit_SPの特徴量
             if current_growsp is not None:
                 region_feats = F.normalize(region_feats, dim=-1)
                 #
@@ -158,19 +166,29 @@ def get_kittisp_feature(args, loader, model, current_growsp):
                     n_segments = region_feats.size(0)
                 else:
                     n_segments = current_growsp
-                sp_idx = torch.from_numpy(KMeans(n_clusters=n_segments, n_init=5, random_state=0, n_jobs=5).fit_predict(region_feats.cpu().numpy())).long()
+                # print(region_feats.size(0), current_growsp, n_segments)
+                sp_idx = get_kmeans_labels(n_clusters=n_segments, pcds=region_feats).long()
+                # print(sp_idx)
             else:
                 feats = region_feats
-                sp_idx = torch.tensor(range(region_feats.size(0)))
+                sp_idx = torch.tensor(range(region_feats.size(0))).cuda()
 
+            # kmeansの評価
+            if batch_idx in random_indices:
+                sl_score, db_score, ch_score, t = calc_cluster_metrics(region_feats, sp_idx.cuda())
+                sl_scores.append(sl_score)
+                db_scores.append(db_score)
+                ch_scores.append(ch_score)
+                ts.append(t)
+            
             neural_region = sp_idx[region]
+            
             pfh = []
 
             '''kmeansしたあとのSPの特徴量を計算'''
             neural_region_num = len(torch.unique(neural_region))
-            neural_region_corr = torch.zeros(neural_region.size(0), neural_region_num)
-            neural_region_corr.scatter_(1, neural_region.view(-1, 1), 1)
-            neural_region_corr = neural_region_corr.cuda()
+            # print(neural_region.max(), neural_region.min(), neural_region_num)
+            neural_region_corr = F.one_hot(neural_region, num_classes=neural_region_num).float().cuda()
             per_neural_region_num = neural_region_corr.sum(0, keepdims=True).t()
             #
             final_remission = F.linear(neural_region_corr.t(), pc_remission.t())/per_neural_region_num
@@ -193,11 +211,15 @@ def get_kittisp_feature(args, loader, model, current_growsp):
             point_feats_list.append(feats.cpu()) # [266, 4+1+10]
             point_labels_list.append(labels.cpu()) # [32629]
 
-            all_sp_index.append(neural_region) # [32629]
+            all_sp_index.append(neural_region.to('cpu').detach().numpy().copy()) # [32629]
             context.append((scene_name, gt, raw_region)) # [39521]
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
+    
+    filtered_db_scores = [x for x in db_scores if x != -1]
+    filtered_ch_scores = [x for x in ch_scores if x != -1]
+    wandb.log({"epoch": epoch, "SC/Silhouette Score": np.mean(sl_scores), "SC/Davies-Bouldin Score": np.mean(filtered_db_scores), "SC/Calinski-Harabasz Score": np.mean(filtered_ch_scores), "SC/Time": np.mean(ts)})
 
     return point_feats_list, point_labels_list, all_sp_index, context
 
@@ -346,13 +368,23 @@ def compute_segment_feats(feats, segs):
     
     return seg_feats
 
-# あっているのか？
+
 def calc_info_nce(seg_feats_q, seg_feats_k, temperature=0.07):
-    sims = F.consine_similarity(seg_feats_q.unsqueeze(1), seg_feats_k.unsqueeze(0), dim=2) / temperature
-    print(sims.size())
-    labels = torch.arange(sims.size(0), device=sims.device)
-    loss = F.cross_entropy(sims, labels)
-    return loss
+    sims = F.cosine_similarity(seg_feats_q.unsqueeze(1), seg_feats_k.unsqueeze(0), dim=2) / temperature
+    sims = sims.cuda()
+    m, n = sims.size()
+    num_pos = min(m, n)
+    # 行方向の損失を計算
+    labels_row = torch.arange(num_pos).to(sims.device)
+    loss_row = F.cross_entropy(sims[:num_pos, :], labels_row, ignore_index=-1)
+    
+    # 列方向の損失を計算
+    labels_col = torch.arange(num_pos).to(sims.device)
+    loss_col = F.cross_entropy(sims[:, :num_pos].T, labels_col, ignore_index=-1)
+    
+    # 総損失を計算
+    loss = (loss_row + loss_col) / 2
+    return loss    
 
 
 @torch.no_grad()
@@ -390,6 +422,17 @@ def momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k, mome
     """
     Momentum update of the key encoder
     """
+    momentum_update_model(model_q, model_k, momentum)
+
+    for param_q, param_k in zip(proj_head_q.parameters(), proj_head_k.parameters()):
+        param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
+        
+        
+@torch.no_grad()
+def momentum_update_model(model_q, model_k, momentum:int=0.999):
+    """
+    Momentum update of the key encoder
+    """
     model_q_dict = model_q.state_dict()
     model_k_dict = model_k.state_dict()
 
@@ -409,6 +452,84 @@ def momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k, mome
                 model_k_dict[name] = model_k_dict[name] * momentum + param_q * (1 - momentum)
 
     model_k.load_state_dict(model_k_dict)
+    
 
-    for param_q, param_k in zip(proj_head_q.parameters(), proj_head_k.parameters()):
-        param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
+def get_kmeans_labels(n_clusters, pcds, max_iter=300):
+    """
+    KMeansを用いてクラスタリングを行い、各点に対するクラスタラベルを返す
+    Args:
+        n_clusters (int): クラスタ数
+        pcds (np.ndarray | torch.tensor): 点群データ (N, D)?
+        max_iter (int): KMeansの最大イテレーション数
+    Returns:
+        labels (torch.tensor): 各点に対するクラスタラベル (N,)
+    """
+    model = KMeans(n_clusters=n_clusters, max_iter=max_iter, distance='euclidean')
+    with torch.no_grad():
+        if isinstance(pcds, np.ndarray):
+            pcds = torch.from_numpy(pcds)
+        pcds = pcds.cuda().float()
+        unsqueezed = pcds.unsqueeze(0)
+        centroids, labels = model(unsqueezed)
+        # centroids = centroids.squeeze(0)
+        # distances = torch.cdist(pcds, centroids)
+        # labels = torch.argmin(distances, dim=1)
+    return labels.squeeze(0)
+
+
+def calc_cluster_metrics(X, labels):
+    """
+    クラスタリングの評価指標を計算する
+    Args:
+        X (torch.tensor): データ行列 (N, D)
+        labels (np.ndarray): クラスタラベル (N,)
+        epoch (int): 現在のエポック数
+        method (str): クラスタリングの手法名
+    Returns:
+        sl_score (float): シルエットスコア
+        db_score (float): Davies-Bouldinスコア
+        ch_score (float): Calinski-Harabaszスコア
+        time (float): 計算時間
+
+    """
+    start = time.time()
+    with torch.no_grad():
+        sl_score = silhouette.score(X, labels)
+        X = X.cpu().numpy()
+        if type(labels) != np.ndarray:
+            labels = labels.cpu().numpy()
+        try:
+            db_score = davies_bouldin_score(X, labels)
+            ch_score = calinski_harabasz_score(X, labels)
+        except ValueError:
+            db_score = -1
+            ch_score = -1
+        
+    t = time.time() - start
+    
+    return sl_score, db_score, ch_score, t
+    
+
+
+if __name__ == '__main__':
+    # テスト用のデータを生成して動作確認を行う
+    import matplotlib.pyplot as plt
+    from sklearn.datasets import make_blobs
+    n_samples = 500
+    n_features = 2
+    n_clusters = 3
+
+    # サンプルデータを生成
+    X, _ = make_blobs(n_samples=n_samples, n_features=n_features, centers=n_clusters, random_state=42)
+    print(X.shape)
+
+    # KMeansラベル取得
+    labels = get_kmeans_labels(n_clusters, X).cpu().numpy()
+
+    # 結果を散布図で確認
+    plt.scatter(X[:, 0], X[:, 1], c=labels, cmap='viridis')
+    plt.title("KMeans Clustering Result")
+    plt.xlabel("Feature 1")
+    plt.ylabel("Feature 2")
+    plt.colorbar(label="Cluster Label")
+    plt.savefig("a.png")

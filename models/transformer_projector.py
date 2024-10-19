@@ -84,7 +84,7 @@ class TransformerProjector(nn.Module):
             encoding = self.enc(
                 src=encoding, src_key_padding_mask=enc_mask)
             
-            encoding = encoding.permute(1, 0, 2) # (N, L, E) -> (L, N, E)で合ってるの？ （batch_first = falseにしちゃった影響）
+            # encoding = encoding.permute(1, 0, 2) # (N, L, E) -> (L, N, E)で合ってるの？ （batch_first = falseにしちゃった影響）
 
             # decoding = self.dec(tgt=decoding,
             #                     memory=encoding,

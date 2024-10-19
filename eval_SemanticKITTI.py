@@ -5,9 +5,8 @@ import numpy as np
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
 from sklearn.utils.linear_assignment_ import linear_assignment  # pip install scikit-learn==0.22.2
-from sklearn.cluster import KMeans
 from models.fpn import Res16FPN18
-from lib.utils import get_fixclassifier
+from lib.utils import get_fixclassifier, get_kmeans_labels
 from lib.helper_ply import read_ply, write_ply
 import warnings
 import argparse
@@ -17,11 +16,11 @@ import os
 ###
 def parse_args():
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
-    parser.add_argument('--data_path', type=str, default='/home/user/SSD2/SemanticKITTI/dataset/sequences/',
+    parser.add_argument('--data_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp',
                         help='pont cloud data path')
-    parser.add_argument('--sp_path', type=str, default='/home/user/SSD2/SemanticKITTI/initial_superpoints/sequences/',
+    parser.add_argument('--sp_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp_sp',
                         help='initial sp path')
-    parser.add_argument('--save_path', type=str, default='trained_models/SemanticKITTI/',
+    parser.add_argument('--save_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp_model',
                         help='model savepath')
     ###
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='batchnorm parameters')
@@ -46,8 +45,8 @@ def eval_once(args, model, test_loader, classifier):
         with torch.no_grad():
             coords, features, inverse_map, labels, index, region = data
 
-            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device='cpu')
-            feats = model(in_field).cuda()
+            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
+            feats = model(in_field)
             feats = F.normalize(feats, dim=1)
 
             scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
@@ -66,7 +65,7 @@ def eval_once(args, model, test_loader, classifier):
 
 def eval(epoch, args):
 
-    model = Res16FPN18(in_channels=args.input_dim, out_channels=args.primitive_num, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
+    model = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
     model.load_state_dict(torch.load(os.path.join(args.save_path, 'model_' + str(epoch) + '_checkpoint.pth')))
     model.eval()
 
@@ -76,8 +75,8 @@ def eval(epoch, args):
 
     primitive_centers = cls.weight.data###[500, 128]
     print('Merging Primitives')
-    cluster_pred = KMeans(n_clusters=args.semantic_class, n_init=5, random_state=0, n_jobs=5).fit_predict(primitive_centers.cpu().numpy())#.astype(np.float64))
-
+    cluster_pred = get_kmeans_labels(n_clusters=args.semantic_class, pcds=primitive_centers).to('cpu').detach().numpy()
+    
     '''Compute Class Centers'''
     centroids = torch.zeros((args.semantic_class, args.feats_dim))
     for cluster_idx in range(args.semantic_class):
@@ -112,19 +111,22 @@ def eval(epoch, args):
     tp = np.diag(hist_new)
     fp = np.sum(hist_new, 0) - tp
     fn = np.sum(hist_new, 1) - tp
-    IoUs = tp / (tp + fp + fn + 1e-8)
+    IoUs = (100 * tp) / (tp + fp + fn + 1e-8)
     m_IoU = np.nanmean(IoUs)
+    IoU_list = []
+    class_name_IoU_list = ["IoU_unlabeled", "IoU_car", "IoU_bicycle", "IoU_motorcycle", "IoU_truck", "IoU_other-vehicle", "IoU_person", "IoU_bicyclist", "IoU_motorcyclist", "IoU_road", "IoU_parking", "IoU_sidewalk", "IoU_other-ground", "IoU_building", "IoU_fence", "IoU_vegetation", "IoU_trunck", "IoU_terrian", "IoU_pole", "IoU_traffic-sign"]
     s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
     for IoU in IoUs:
-        s += '{:5.2f} '.format(100 * IoU)
-
-    return o_Acc, m_Acc, s
+        s += '{:5.2f} '.format(IoU)
+        IoU_list.append(IoU)
+    IoU_dict = dict(zip(class_name_IoU_list, IoU_list))
+    return o_Acc, m_Acc, m_IoU, s, IoU_dict
 
 if __name__ == '__main__':
 
     args = parse_args()
     for epoch in range(1, 500):
-        if epoch%400==0:
+        if epoch%350==0:
             o_Acc, m_Acc, s = eval(epoch, args)
             print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc), s)
 
