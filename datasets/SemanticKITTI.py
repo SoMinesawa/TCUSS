@@ -8,8 +8,10 @@ import os
 import open3d as o3d
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
-
+from tqdm import tqdm
 from typing import List, Tuple
+                
+                
 class cfl_collate_fn:
 
     def __call__(self, list_data):
@@ -62,6 +64,7 @@ class cfl_collate_fn_temporal:
         segs_q = [torch.from_numpy(seg_q) for seg_q in segs_q]
         segs_k = [torch.from_numpy(seg_k) for seg_k in segs_k]
         return coords_q_batch, coords_k_batch, segs_q, segs_k
+    
 
 class KITTItrain(Dataset):
     def __init__(self, args, scene_idx, split='train'):
@@ -253,7 +256,7 @@ class KITTItemporal(Dataset):
             if seq_id in ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10']:
                 for f in np.sort(os.listdir(seq_path)):
                     self.file.append(os.path.join(seq_path, f))
-        
+
         self.scene_locates, self.scene_diff_locates, self.window_start_locates = self._random_select_samples(scan_range) # [(seq, idx), ...]
         
         self.trans_coords = trans_coords(shift_ratio=50)  ### 50%
@@ -298,12 +301,15 @@ class KITTItemporal(Dataset):
     def __getitem__(self, index):
         seq_t1, idx_t1 = self.scene_locates[index]
         seq_t2, idx_t2 = self.scene_diff_locates[index]
-        coords_t1, *_ = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
-        coords_t2, *_ = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
+        coords_t1, labels_t1, *_ = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
+        coords_t2, labels_t2, *_ = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
         
         scene_idx_in_window = [(self.window_start_locates[index][0], self.window_start_locates[index][1]+i) for i in range(self.args.scan_window)]
-        coords_tn, unique_map_tn, inverse_map_tn, mask_tn = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
-        agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn)
+        coords_tn, labels_tn, unique_map_tn, inverse_map_tn, mask_tn = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
+        if self.args.vis:
+            for i, coord in enumerate(coords_tn):
+                np.save(f'tmp/data/coords_{i}.npy', coord)
+        agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn)
         agg_segs = self._clusterize_pcds(agg_coords, agg_ground_labels)
         segs_tn = []
         for elements_num in elements_nums:
@@ -313,15 +319,26 @@ class KITTItemporal(Dataset):
         idx_t2_in_window = scene_idx_in_window.index((seq_t2, idx_t2))
         segs_t1 = segs_tn[idx_t1_in_window]
         segs_t2 = segs_tn[idx_t2_in_window]
+        if self.args.vis:
+            for i, (seg, label) in enumerate(zip(segs_tn, labels_tn)):
+                np.save(f'tmp/data/segs_{i}.npy', seg)
+                np.save(f'tmp/data/labels_{i}.npy', label)
+            np.save('tmp/data/segs_t1.npy', segs_t1)
+            np.save('tmp/data/segs_t2.npy', segs_t2)
+            np.save('tmp/data/coords_t1.npy', coords_t1)
+            np.save('tmp/data/coords_t2.npy', coords_t2)
+            exit()
+            
         return coords_t1, coords_t2, segs_t1, segs_t2
 
     
-    def _aggretate_pcds(self, scene_idx_in_window, coords_tn, unique_map_tn, mask_tn):
+    def _aggretate_pcds(self, scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn): # labels_tnはvis用
         poses = self._load_poses(scene_idx_in_window[0][0])
         points_set = np.empty((0, 3))
         ground_label = np.empty((0, 1))
+        label_set = np.empty((0, 1))
         element_nums = []
-        for (seq, idx), coords, unique_map, mask in zip(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn):
+        for (seq, idx), coords, unique_map, mask, labels in zip(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn):
             pose = poses[idx]
             coords = self._apply_transform(coords, pose)
             g_set = np.fromfile(self._tuple_to_patchwork_path((seq, idx)), dtype=np.uint32)
@@ -330,9 +347,13 @@ class KITTItemporal(Dataset):
             g_set = g_set.reshape((-1))[:, np.newaxis]
             points_set = np.vstack((points_set, coords))
             ground_label = np.vstack((ground_label, g_set))
+            label_set = np.vstack((label_set, np.expand_dims(labels, 1)))
             element_nums.append(coords.shape[0])
         last_pose = poses[scene_idx_in_window[-1][1]]
         points_set = self._undo_transform(points_set, last_pose)
+        if self.args.vis:
+            np.save('tmp/data/agg_points.npy', points_set)
+            np.save('tmp/data/agg_labels.npy', label_set.squeeze())
         return points_set, ground_label, element_nums
         
     
@@ -344,6 +365,8 @@ class KITTItemporal(Dataset):
         agg_segs = np.zeros_like(agg_ground_labels).flatten()
         agg_segs[~mask_ground] = labels
         agg_segs[mask_ground] = self.n_clusters-1
+        if self.args.vis:
+            np.save('tmp/data/agg_segs.npy', agg_segs)
         return agg_segs
         
         
@@ -365,7 +388,7 @@ class KITTItemporal(Dataset):
         else:
             coords = coords_original[unique_map][mask]
         
-        return coords, unique_map, inverse_map, mask # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。
+        return coords, labels, unique_map, inverse_map, mask # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。 # labelsはvis用
     
     
     def _load_ply(self, seq:int, idx:int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -512,11 +535,91 @@ class KITTIval(Dataset):
         seq_list = np.sort(os.listdir(self.args.data_path))
         for seq_id in seq_list:
             seq_path = os.path.join(self.args.data_path, seq_id)
-            if self.split == 'val':
-                if seq_id == '08':
-                    for f in np.sort(os.listdir(seq_path)):
-                        self.file.append(os.path.join(seq_path, f))
-                        self.name.append(os.path.join(seq_path, f)[0:-4].replace(self.args.data_path, ''))
+            if seq_id in ['08']:
+                for f in np.sort(os.listdir(seq_path)):
+                    self.file.append(os.path.join(seq_path, f))
+                    self.name.append(os.path.join(seq_path, f)[0:-4].replace(self.args.data_path, ''))
+
+    def augment_coords_to_feats(self, coords, feats, labels=None):
+        coords_center = coords.mean(0, keepdims=True)
+        coords_center[0, 2] = 0
+        norm_coords = (coords - coords_center)
+        return norm_coords, feats, labels
+
+    def voxelize(self, coords, feats, labels):
+        scale = 1 / self.args.voxel_size
+        coords = np.floor(coords * scale)
+        coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
+        # return coords.numpy(), feats, labels, unique_map, inverse_map.numpy()
+        return coords, feats, labels, unique_map, inverse_map
+
+
+    def __len__(self):
+        return len(self.file)
+
+    def __getitem__(self, index):
+        file = self.file[index]
+        data = read_ply(file)
+        coords = np.array([data['x'], data['y'], data['z']], dtype=np.float32).T
+        feats = np.array(data['remission'])[:, np.newaxis]
+        labels = np.array(data['class'])
+        coords = coords.astype(np.float32)
+        coords -= coords.mean(0)
+
+        coords, feats, _, unique_map, inverse_map = self.voxelize(coords, feats, labels)
+        coords = coords.astype(np.float32)
+
+        region_file = self.args.sp_path + '/' +self.name[index] + '_superpoint.npy'
+        region = np.load(region_file)
+        region = region[unique_map]
+
+        coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
+        # labels -= 1 別にいらんよ。だってtrainでは、validゾーン作るためにlabel=-1を作っていたわけだから。
+        # labels[labels == self.args.ignore_label - 1] = self.args.ignore_label
+        return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index
+
+
+class KITTItest(Dataset):
+    def __init__(self, args, split='test'):
+        self.args = args
+        self.label_to_names = {0: 'unlabeled',
+                               1: 'car',
+                               2: 'bicycle',
+                               3: 'motorcycle',
+                               4: 'truck',
+                               5: 'other-vehicle',
+                               6: 'person',
+                               7: 'bicyclist',
+                               8: 'motorcyclist',
+                               9: 'road',
+                               10: 'parking',
+                               11: 'sidewalk',
+                               12: 'other-ground',
+                               13: 'building',
+                               14: 'fence',
+                               15: 'vegetation',
+                               16: 'trunk',
+                               17: 'terrain',
+                               18: 'pole',
+                               19: 'traffic-sign'}
+        self.name = []
+        # self.mode = 'test'
+        self.split = split
+        self.file = []
+
+        seq_list = np.sort(os.listdir(self.args.data_path))
+        # valid_seqs = ['08'] if self.args.debug else [str(i).zfill(2) for i in range(22)]
+        valid_seqs = ['08'] + [str(i).zfill(2) for i in range(11, 22)]
+        # valid_seqs = ['08']
+        for seq_id in seq_list:
+            seq_path = os.path.join(self.args.data_path, seq_id)
+            if seq_id in valid_seqs:
+                for f in np.sort(os.listdir(seq_path)):
+                    self.file.append(os.path.join(seq_path, f))
+                    self.name.append(os.path.join(seq_path, f)[0:-4].replace(self.args.data_path, ''))
+        # random_indices = random.sample(range(len(self.file)), 10)
+        # self.file = [self.file[i] for i in random_indices]
+        # self.name = [self.name[i] for i in random_indices]
 
 
     def augment_coords_to_feats(self, coords, feats, labels=None):
@@ -553,9 +656,9 @@ class KITTIval(Dataset):
         region = region[unique_map]
 
         coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
-        labels = labels -1
-
-        return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index
+        labels -= 1
+        labels[labels == self.args.ignore_label - 1] = self.args.ignore_label
+        return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index, file
 
 
 class cfl_collate_fn_val:
@@ -581,3 +684,28 @@ class cfl_collate_fn_val:
         region_batch = torch.cat(region_batch, 0)
 
         return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch
+
+
+class cfl_collate_fn_test:
+
+    def __call__(self, list_data):
+        coords, feats, labels, inverse_map, region, index, file_path = list(zip(*list_data))
+        coords_batch, feats_batch, inverse_batch, labels_batch = [], [], [], []
+        region_batch = []
+        for batch_id, _ in enumerate(coords):
+            num_points = coords[batch_id].shape[0]
+            coords_batch.append(
+                torch.cat((torch.ones(num_points, 1).int() * batch_id, torch.from_numpy(coords[batch_id]).int()), 1))
+            feats_batch.append(torch.from_numpy(feats[batch_id]))
+            inverse_batch.append(torch.from_numpy(inverse_map[batch_id]))
+            labels_batch.append(torch.from_numpy(labels[batch_id]).int())
+            region_batch.append(torch.from_numpy(region[batch_id])[:, None])
+        #
+        # Concatenate all lists
+        coords_batch = torch.cat(coords_batch, 0).float()
+        feats_batch = torch.cat(feats_batch, 0).float()
+        inverse_batch = torch.cat(inverse_batch, 0).int()
+        labels_batch = torch.cat(labels_batch, 0).int()
+        region_batch = torch.cat(region_batch, 0)
+
+        return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch, file_path

@@ -91,7 +91,7 @@ def main(args, logger):
             "temporal_workers": args.temporal_workers,
             "cluster_workers": args.cluster_workers,
         },
-        name = 'TCUSS-default',
+        name = 'GrowSP-more-metric',
     )
     
     '''Random select 1500 scans to train, will redo in each round'''
@@ -209,7 +209,7 @@ def main(args, logger):
 
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
                 wandb.log({'epoch': epoch, 'current_growsp': current_growsp})
-            train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer_contrast, epoch, scheduler_contrast, current_growsp)
+            # train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer_contrast, epoch, scheduler_contrast, current_growsp)
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
             momentum_update_model(model_q, model_k)
 
@@ -368,8 +368,7 @@ def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, 
         iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
 
         coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
-        if args.vis:
-            print('coords', coords)
+        
         in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
         feats = model_q(in_field)
 

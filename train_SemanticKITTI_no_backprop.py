@@ -91,7 +91,7 @@ def main(args, logger):
             "temporal_workers": args.temporal_workers,
             "cluster_workers": args.cluster_workers,
         },
-        name = 'TCUSS-default',
+        name = 'TCUSS-NO-backprop',
     )
     
     '''Random select 1500 scans to train, will redo in each round'''
@@ -164,12 +164,11 @@ def main(args, logger):
         model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
         if args.run_stage == 2:
             checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
-            start_grow_epoch = 100
         else:
             checkpoint = torch.load(join(args.save_path, 'model_checkpoint_stage1.pth'))
-            start_grow_epoch = checkpoint['epoch']
         model_q.load_state_dict(checkpoint['model_q_state_dict'])
         model_q = model_q.cuda()
+        start_grow_epoch = checkpoint['epoch']
         is_Growing = True
         current_growsp = args.growsp_start
         optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
@@ -359,46 +358,41 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
     return loss
 
 
+# 対照学習のみで収束するのかのテスト用
 def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, scheduler=None, classifier=None):
-    # train_loader.dataset.mode = 'train'
     model_q.train()
-    loss_display = 0.0
-    time_curr = time.time()
-    for batch_idx, data in enumerate(train_loader):
-        iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
+    with torch.no_grad():
+        loss_display = 0.0
+        time_curr = time.time()
+        for batch_idx, data in enumerate(train_loader):
+            iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
 
-        coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
-        if args.vis:
-            print('coords', coords)
-        in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
-        feats = model_q(in_field)
+            coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
 
-        feats = feats[inds.long()]
-        feats = F.normalize(feats, dim=-1)
-        #
-        pseudo_labels_comp = pseudo_labels.long().cuda()
-        logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
-        loss_sem = loss(logits * 5, pseudo_labels_comp).mean()
+            in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
+            feats = model_q(in_field)
 
-        loss_display += loss_sem.item()
-        optimizer.zero_grad()
-        loss_sem.backward()
-        optimizer.step()
-        scheduler.step()
+            feats = feats[inds.long()]
+            feats = F.normalize(feats, dim=-1)
+            #
+            pseudo_labels_comp = pseudo_labels.long().cuda()
+            logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
+            loss_sem = loss(logits * 5, pseudo_labels_comp).mean()
 
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(torch.device("cuda"))
+            loss_display += loss_sem.item()
 
-        if (batch_idx+1) % args.log_interval == 0:
-            time_used = time.time() - time_curr
-            # loss_display /= args.log_interval # TODO: ここで割るのは合っているか？
-            logger.info(
-                'Train Epoch: {} [{}/{} ({:.0f}%)]{}, Loss: {:.10f}, lr: {:.3e}, Elapsed time: {:.4f}s({} iters)'.format(
-                    epoch, (batch_idx+1), len(train_loader), 100. * (batch_idx+1) / len(train_loader),
-                    iteration, loss_display, scheduler.get_lr()[0], time_used, args.log_interval))
-            time_curr = time.time()
-            # loss_display = 0
-    wandb.log({'epoch': epoch, 'train_loss': loss_display})
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(torch.device("cuda"))
+
+            if (batch_idx+1) % args.log_interval == 0:
+                time_used = time.time() - time_curr
+                logger.info(
+                    'Train Epoch: {} [{}/{} ({:.0f}%)]{}, Loss: {:.10f}, lr: {:.3e}, Elapsed time: {:.4f}s({} iters)'.format(
+                        epoch, (batch_idx+1), len(train_loader), 100. * (batch_idx+1) / len(train_loader),
+                        iteration, loss_display, scheduler.get_lr()[0], time_used, args.log_interval))
+                time_curr = time.time()
+                # loss_display = 0
+        wandb.log({'epoch': epoch, 'train_loss': loss_display})
         
 
 from torch.optim.lr_scheduler import LambdaLR

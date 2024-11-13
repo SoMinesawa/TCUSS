@@ -1,19 +1,23 @@
 import torch
 import torch.nn.functional as F
-from datasets.SemanticKITTI import KITTIval, cfl_collate_fn_val
+from datasets.SemanticKITTI import KITTItest, cfl_collate_fn_test
 import numpy as np
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
 from sklearn.utils.linear_assignment_ import linear_assignment  # pip install scikit-learn==0.22.2
 from models.fpn import Res16FPN18
 from lib.utils import get_fixclassifier, get_kmeans_labels
-from lib.helper_ply import read_ply, write_ply
-import warnings
 import argparse
 import random
 import os
-
+import yaml
+from tqdm import tqdm
 ###
+
+data_config = os.path.join('data_prepare', 'semantic-kitti.yaml')
+DATA = yaml.safe_load(open(data_config, 'r'))
+learning_map_inv = DATA["learning_map_inv"]
+
 def parse_args():
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
     parser.add_argument('--data_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp',
@@ -35,7 +39,9 @@ def parse_args():
     parser.add_argument('--semantic_class', type=int, default=19, help='ground truth semantic class')
     parser.add_argument('--feats_dim', type=int, default=128, help='output feature dimension')
     parser.add_argument('--ignore_label', type=int, default=-1, help='invalid label')
+    parser.add_argument('--debug', action='store_true', help='debug mode')
     return parser.parse_args()
+
 
 def set_seed(seed):
     """
@@ -56,12 +62,15 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.enabled = False
 
-def eval_once(args, model, test_loader, classifier):
 
-    all_preds, all_label = [], []
-    for data in test_loader:
+def eval_once(args, model, test_loader, classifier):
+    
+    save_dir = os.path.join(args.save_path, 'pred_result', 'sequences')
+    os.makedirs(save_dir, exist_ok=True)
+    all_preds, all_preds_no_ignore, all_label, all_label_no_ignore, all_save_path = [], [], [], [], []
+    for data in tqdm(test_loader):
         with torch.no_grad():
-            coords, features, inverse_map, labels, index, region = data
+            coords, features, inverse_map, labels, index, region, file_paths = data
 
             in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
             feats = model(in_field)
@@ -69,16 +78,29 @@ def eval_once(args, model, test_loader, classifier):
 
             scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
             preds = torch.argmax(scores, dim=1).cpu()
-
             preds = preds[inverse_map.long()]
-            preds = preds[labels!=args.ignore_label]
+            preds_no_ignore = preds.clone()
+            labels_no_ignore = labels.clone()
+            if int(os.path.split(os.path.dirname(file_paths[0]))[1]) < 11:
+                # preds_no_ignore[labels==args.ignore_label] = args.ignore_label 
+                preds = preds_no_ignore[labels!=args.ignore_label]
             labels = labels[labels!=args.ignore_label]
-            all_preds.append(preds), all_label.append(labels)
+            relative_path = os.path.relpath(file_paths[0], args.data_path)
+            sequence, filename = os.path.split(relative_path)
+            filename = os.path.splitext(filename)[0] + '.label'
+            
+            # 保存先のディレクトリを作成
+            sequence_dir = os.path.join(save_dir, sequence, 'predictions')
+            os.makedirs(sequence_dir, exist_ok=True)
+            
+            # ラベルを保存
+            save_path = os.path.join(sequence_dir, filename)
+            all_preds.append(preds), all_preds_no_ignore.append(preds_no_ignore), all_label.append(labels), all_label_no_ignore.append(labels_no_ignore), all_save_path.append(save_path)
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
-
-    return all_preds, all_label
+    
+    return all_preds, all_preds_no_ignore, all_label, all_label_no_ignore, all_save_path
 
 
 def eval(epoch, args):
@@ -106,26 +128,49 @@ def eval(epoch, args):
     classifier = get_fixclassifier(in_channel=args.feats_dim, centroids_num=args.semantic_class, centroids=centroids).cuda()
     classifier.eval()
 
-    val_dataset = KITTIval(args)
-    val_loader = DataLoader(val_dataset, batch_size=1, collate_fn=cfl_collate_fn_val(), num_workers=args.cluster_workers, pin_memory=True)
+    test_dataset = KITTItest(args)
+    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=cfl_collate_fn_test(), num_workers=args.cluster_workers, pin_memory=True)
 
-    preds, labels = eval_once(args, model, val_loader, classifier)
+    preds, no_ignore_preds, labels, no_ignore_labels, save_paths = eval_once(args, model, test_loader, classifier)
+    
     all_preds = torch.cat(preds).numpy()
+    all_no_ignore_preds = torch.cat(no_ignore_preds).numpy()
     all_labels = torch.cat(labels).numpy()
+    all_no_ignore_labels = torch.cat(no_ignore_labels).numpy()
 
     '''Unsupervised, Match pred to gt'''
     sem_num = args.semantic_class
-    mask = (all_labels >= 0) & (all_labels < sem_num)
-    histogram = np.bincount(sem_num * all_labels[mask] + all_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
-    '''Hungarian Matching'''
+    mask = (all_no_ignore_labels >= 0) & (all_no_ignore_labels < sem_num)
+    histogram = np.bincount(sem_num * all_no_ignore_labels[mask] + all_no_ignore_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
+    # np.save('histogram.npy', histogram)
+    # '''Hungarian Matching'''
     m = linear_assignment(histogram.max() - histogram)
+    # m = linear_assignment(histogram)
+    print(m)
     o_Acc = histogram[m[:, 0], m[:, 1]].sum() / histogram.sum()*100.
     m_Acc = np.mean(histogram[m[:, 0], m[:, 1]] / histogram.sum(1))*100
     hist_new = np.zeros((sem_num, sem_num))
     for idx in range(sem_num):
         hist_new[:, idx] = histogram[:, m[idx, 1]]
 
-    '''Final Metrics'''
+        
+    for no_ignore_pred, save_path in zip(no_ignore_preds, save_paths):
+        no_ignore_pred = no_ignore_pred.numpy().astype(np.int64)
+        no_ignore_pred_copy = no_ignore_pred.copy()
+        for row in m:
+            no_ignore_pred_copy[no_ignore_pred == row[1]] = row[0]
+        no_ignore_pred_copy = no_ignore_pred_copy + 1
+        no_ignore_pred_inv = np.vectorize(learning_map_inv.get)(no_ignore_pred_copy).astype(np.uint32)
+        no_ignore_pred_inv.tofile(save_path)
+        
+    # acc 100%
+    # for no_ignore_label, save_path in zip(no_ignore_labels, save_paths):
+    #     no_ignore_label = no_ignore_label.numpy().astype(np.uint32)
+    #     # label = label + 1
+    #     no_ignore_label = np.vectorize(learning_map_inv.get)(no_ignore_label).astype(np.uint32)
+        # no_ignore_label.tofile(save_path)
+
+    # '''Final Metrics'''
     tp = np.diag(hist_new)
     fp = np.sum(hist_new, 0) - tp
     fn = np.sum(hist_new, 1) - tp
@@ -140,14 +185,6 @@ def eval(epoch, args):
     IoU_dict = dict(zip(class_name_IoU_list, IoU_list))
     return o_Acc, m_Acc, m_IoU, s, IoU_dict
 
-# if __name__ == '__main__':
-
-#     args = parse_args()
-#     for epoch in range(1, 500):
-#         if epoch%350==0:
-#             o_Acc, m_Acc, s = eval(epoch, args)
-#             print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc), s)
-
 
 import re
 
@@ -158,22 +195,12 @@ def extract_epoch_from_filename(filename):
         return int(match.group(1))
     return None
 
+
 if __name__ == '__main__':
 
     args = parse_args()
     seed = args.seed
     set_seed(seed)
-    
-    val_paths = []
-    val_datas = []
-    seq_list = np.sort(os.listdir(args.data_path))
-    for seq_id in seq_list:
-        seq_path = os.path.join(args.data_path, seq_id)
-        if seq_id in ['08']:
-            for f in np.sort(os.listdir(seq_path)):
-                val_path = os.path.join(seq_path, f)
-                val_paths.append(val_path)
-                val_datas.append(read_ply(val_path))
 
     # チェックポイントファイルのリストを取得
     checkpoint_files = [f for f in os.listdir(args.save_path) if f.endswith('.pth')]
@@ -185,20 +212,20 @@ if __name__ == '__main__':
     epoch_numbers = sorted([e for e in epoch_numbers if e is not None], reverse=True)
     
     # 最も大きい5つのepoch番号を選択
-    top_5_epochs = epoch_numbers[:5]
+    top_1_epochs = epoch_numbers[:1]
 
     eval_results = []
     
     # 各epochでevalを実行して結果を保存
-    for epoch in top_5_epochs:
-        o_Acc, m_Acc, m_IoU, _, _ = eval(epoch, args, val_paths, val_datas)
+    for epoch in top_1_epochs:
+        o_Acc, m_Acc, m_IoU, _, _ = eval(epoch, args)
         eval_results.append([o_Acc, m_Acc, m_IoU])
         print(f'Epoch: {epoch}, oAcc: {o_Acc:.2f}, mAcc: {m_Acc:.2f}, mIoU: {m_IoU:.2f}')
     
-    # 結果の平均と標準偏差を計算
-    eval_results = np.array(eval_results)
-    mean_results = np.mean(eval_results, axis=0)
-    std_results = np.std(eval_results, axis=0)
+    # # 結果の平均と標準偏差を計算
+    # eval_results = np.array(eval_results)
+    # mean_results = np.mean(eval_results, axis=0)
+    # std_results = np.std(eval_results, axis=0)
 
-    print('Mean oAcc: {:.2f}, mAcc: {:.2f}, mIoU: {:.2f}'.format(mean_results[0], mean_results[1], mean_results[2]))
-    print('Std oAcc: {:.2f}, mAcc: {:.2f}, mIoU: {:.2f}'.format(std_results[0], std_results[1], std_results[2]))
+    # print('Mean oAcc: {:.2f}, mAcc: {:.2f}, mIoU: {:.2f}'.format(mean_results[0], mean_results[1], mean_results[2]))
+    # print('Std oAcc: {:.2f}, mAcc: {:.2f}, mIoU: {:.2f}'.format(std_results[0], std_results[1], std_results[2]))

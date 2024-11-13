@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Current File",
+            "name": "train_SemanticKITTI.py",
             "type": "debugpy",
             "args": [
                 "--data_path",
@@ -25,8 +25,6 @@
                 "2",
                 "--feats_dim",
                 "128",
-                "--workers",
-                "0",
                 "--run_stage",
                 "2",
                 "--workers",
@@ -48,7 +46,88 @@
             "env": {
                 "CUDA_VISIBLE_DEVICES": "1",
                 "WANDB_MODE": "disabled"
-            }
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "test_SemanticKITTI.py",
+            "type": "debugpy",
+            "args": [
+                "--data_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp",
+                "--sp_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp_sp",
+                "--save_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp_model_select3000",
+                // "--workers",
+                // "0",
+                // "--cluster_workers",
+                // "0",
+                "--debug",
+            ],
+            "request": "launch",
+            "program": "~/repos/TCUSS/test_SemanticKITTI.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "evaluate_semantics.py",
+            "type": "debugpy",
+            "args": [
+                "-d",
+                "/mnt/urashima/dataset/semantickitti/dataset/",
+                "-p",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp_model_select3000/pred_result/",
+            ],
+            "request": "launch",
+            "program": "~/repos/semantic-kitti-api/evaluate_semantics.py",
+            "console": "integratedTerminal",
+            "cwd": "~/repos/semantic-kitti-api",
+        },
+        {
+            "name": "vis.py",
+            "type": "debugpy",
+            "args": [
+                "--data_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp",
+                "--sp_path",
+                "/mnt/urashima/users/minesawa/semantickitti/growsp_sp",
+                "--save_path",
+                "/mnt/urashima/users/minesawa/semantickitti/tmp_model",
+                "--growsp_start",
+                "80",
+                "--growsp_end",
+                "30",
+                "--run_stage",
+                "2",
+                "--vis",
+                "--select_num",
+                "16",
+                "--contrast_select_num",
+                "16",
+                // "--cluster_workers",
+                // "0",
+                // "--workers",
+                // "0",
+                "--temporal_workers",
+                "0",
+                "--batch_size",
+                "4",
+                "--cluster_interval",
+                "2",
+            ],
+            "request": "launch",
+            "program": "~/repos/TCUSS/train_SemanticKITTI.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3",
+                "WANDB_MODE": "disabled"
+            },
+            "cwd": "${workspaceFolder}"
         }
     ]
 }

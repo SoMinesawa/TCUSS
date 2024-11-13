@@ -14,7 +14,8 @@ import time
 import random
 
 # from models.fpn import Res16FPNBase
-from kmeans_gpu import KMeans
+from kmeans_gpu import KMeans as KMeans_gpu
+from sklearn.cluster import KMeans as KMeans_sklearn
 
 def get_sp_feature(args, loader, model, current_growsp):
     print('computing point feats ....')
@@ -119,8 +120,8 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     point_feats_list = []
     point_labels_list = []
     all_sp_index = []
-    model.eval()
     context = []
+    model.eval()
     sl_scores, db_scores, ch_scores, ts = [], [], [], []
     random_indices = sorted(random.sample(range(len(loader)), 10))
     with torch.no_grad():
@@ -132,46 +133,39 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
             gt = labels.clone()
             raw_region = region.clone()
 
-            '''現状の特徴量を計算'''
-            in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
-
+            # 現状の特徴量を計算
+            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
             feats = model(in_field) #[67911, 4+3] -> [67911, 4]
             feats = feats[inds.long()].cuda() #[67911, 4] -> [39521, 4]
 
-            valid_mask = region!=-1
+            valid_mask = region != -1
             features = features[inds.long()].cuda()
             features = features[valid_mask] # [39521, 1] -> [32629, 1]
             normals = normals[inds.long()].cuda()
             normals = normals[valid_mask] # [39521, 3] -> [32629, 3]
             feats = feats[valid_mask]# [39521, 4] -> [32629, 4]
             labels = labels[valid_mask]# [39521, 1] -> [32629, 1]
-            region = region[valid_mask].long() # [39521] -> [32629]
+            region = region[valid_mask].long().cuda() # [39521] -> [32629]
             ##
             pc_remission = features # [32629, 1]
             ## region = [0, 1, 2, 1, 0]
             region_num = len(torch.unique(region))
-            region_corr = torch.zeros(region.size(0), region_num)#?
-            region_corr.scatter_(1, region.view(-1, 1), 1)
-            region_corr = region_corr.cuda()##[N, M]
+            region_corr = torch.zeros(region.size(0), region_num).cuda()
+            region_corr.scatter_(1, region.view(-1, 1), 1)##[N, M]
             per_region_num = region_corr.sum(0, keepdims=True).t()
-            if torch.any(per_region_num == 0):
-                raise ValueError("per_region_num contains zero, which is not allowed.")
             ### per_region_num = [[1], [2], [2]] (266,1)
 
-            region_feats = F.linear(region_corr.t(), feats.t())/per_region_num # [M, 4] これはM個のinit_SPの特徴量
+            region_feats = F.linear(region_corr.t(), feats.t()) / per_region_num # [M, 4] これはM個のinit_SPの特徴量
             if current_growsp is not None:
                 region_feats = F.normalize(region_feats, dim=-1)
-                #
                 if region_feats.size(0) < current_growsp:
                     n_segments = region_feats.size(0)
                 else:
                     n_segments = current_growsp
-                # print(region_feats.size(0), current_growsp, n_segments)
                 sp_idx = get_kmeans_labels(n_clusters=n_segments, pcds=region_feats).long()
-                # print(sp_idx)
             else:
                 feats = region_feats
-                sp_idx = torch.tensor(range(region_feats.size(0))).cuda()
+                sp_idx = torch.arange(region_feats.size(0)).cuda()
 
             # kmeansの評価
             if batch_idx in random_indices:
@@ -180,46 +174,54 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
                 db_scores.append(db_score)
                 ch_scores.append(ch_score)
                 ts.append(t)
-            
-            neural_region = sp_idx[region]
-            
-            pfh = []
 
+            neural_region = sp_idx[region]
+
+            pfh = []
             '''kmeansしたあとのSPの特徴量を計算'''
             neural_region_num = len(torch.unique(neural_region))
-            # print(neural_region.max(), neural_region.min(), neural_region_num)
             neural_region_corr = F.one_hot(neural_region, num_classes=neural_region_num).float().cuda()
             per_neural_region_num = neural_region_corr.sum(0, keepdims=True).t()
-            #
-            final_remission = F.linear(neural_region_corr.t(), pc_remission.t())/per_neural_region_num
-            #
+            final_remission = F.linear(neural_region_corr.t(), pc_remission.t()) / per_neural_region_num
+
             if current_growsp is not None:
                 feats = F.linear(neural_region_corr.t(), feats.t()) / per_neural_region_num
                 feats = F.normalize(feats, dim=-1)
-            #
+
             for p in torch.unique(neural_region):
-                if p!=-1:
-                    mask = p==neural_region
+                if p != -1:
+                    mask = p == neural_region
                     pfh.append(compute_hist(normals[mask]).unsqueeze(0))
 
             pfh = torch.cat(pfh, dim=0) # [266, 10]
             feats = F.normalize(feats, dim=-1)
-            # #
-            feats = torch.cat((feats, args.c_rgb*final_remission, args.c_shape*pfh), dim=-1)
+            feats = torch.cat((feats, args.c_rgb * final_remission, args.c_shape * pfh), dim=-1)
             feats = F.normalize(feats, dim=-1) # [266, 4+1+10]
 
-            point_feats_list.append(feats.cpu()) # [266, 4+1+10]
-            point_labels_list.append(labels.cpu()) # [32629]
+            # データをCPUに移動
+            feats_cpu = feats.cpu()
+            labels_cpu = labels.cpu()
+            neural_region_cpu = neural_region.cpu().detach().numpy().copy()
 
-            all_sp_index.append(neural_region.to('cpu').detach().numpy().copy()) # [32629]
+            # リストにデータを追加
+            point_feats_list.append(feats_cpu) # [266, 4+1+10]
+            point_labels_list.append(labels_cpu) # [32629]
+            all_sp_index.append(neural_region_cpu) # [32629]
             context.append((scene_name, gt, raw_region)) # [39521]
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
-    
+
+    # kmeansの評価結果をログに記録
     filtered_db_scores = [x for x in db_scores if x != -1]
     filtered_ch_scores = [x for x in ch_scores if x != -1]
-    wandb.log({"epoch": epoch, "SC/Silhouette Score": np.mean(sl_scores), "SC/Davies-Bouldin Score": np.mean(filtered_db_scores), "SC/Calinski-Harabasz Score": np.mean(filtered_ch_scores), "SC/Time": np.mean(ts)})
+    wandb.log({
+        "epoch": epoch,
+        "SC/Silhouette Score": np.mean(sl_scores),
+        "SC/Davies-Bouldin Score": np.mean(filtered_db_scores),
+        "SC/Calinski-Harabasz Score": np.mean(filtered_ch_scores),
+        "SC/Time": np.mean(ts)
+    })
 
     return point_feats_list, point_labels_list, all_sp_index, context
 
@@ -456,7 +458,8 @@ def momentum_update_model(model_q, model_k, momentum:int=0.999):
 
 def get_kmeans_labels(n_clusters, pcds, max_iter=300):
     """
-    KMeansを用いてクラスタリングを行い、各点に対するクラスタラベルを返す
+    KMeansを用いてクラスタリングを行い、各点に対するクラスタラベルを返す。
+    エラー
     Args:
         n_clusters (int): クラスタ数
         pcds (np.ndarray | torch.tensor): 点群データ (N, D)?
@@ -464,16 +467,23 @@ def get_kmeans_labels(n_clusters, pcds, max_iter=300):
     Returns:
         labels (torch.tensor): 各点に対するクラスタラベル (N,)
     """
-    model = KMeans(n_clusters=n_clusters, max_iter=max_iter, distance='euclidean')
+    model = KMeans_gpu(n_clusters=n_clusters, max_iter=max_iter, distance='euclidean')
     with torch.no_grad():
         if isinstance(pcds, np.ndarray):
             pcds = torch.from_numpy(pcds)
         pcds = pcds.cuda().float()
         unsqueezed = pcds.unsqueeze(0)
-        centroids, labels = model(unsqueezed)
+        try:
+            centroids, labels = model(unsqueezed)
         # centroids = centroids.squeeze(0)
         # distances = torch.cdist(pcds, centroids)
         # labels = torch.argmin(distances, dim=1)
+        except ValueError:
+            print("kmeans-gpu ValueError so use sklearn")
+            pcds = pcds.cpu().numpy()
+            np.save("kmeans_error.npy", pcds)
+            labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0, n_jobs=5).fit_predict(pcds)).cuda()
+            
     return labels.squeeze(0)
 
 
