@@ -1,4 +1,4 @@
-import collections
+import collections.abc as collections
 from enum import Enum
 import torch.nn as nn
 

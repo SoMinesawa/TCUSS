@@ -10,6 +10,7 @@ from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
 from tqdm import tqdm
 from typing import List, Tuple
+from cuml.cluster.hdbscan import HDBSCAN
                 
                 
 class cfl_collate_fn:
@@ -228,13 +229,13 @@ class KITTItrain(Dataset):
             region[region != -1] = valid_region
             # region = np.array([1, -1, 0, 1, 2, -1])のようになる
 
-            pseudo = -np.ones_like(labels).astype(np.long)
+            pseudo = -np.ones_like(labels).astype(np.int64)
 
         else:
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
             file_path = self.args.pseudo_label_path + '/' + scene_name + '.npy'
-            pseudo = np.array(np.load(file_path), dtype=np.long)
+            pseudo = np.array(np.load(file_path), dtype=np.int64)
 
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
@@ -361,7 +362,16 @@ class KITTItemporal(Dataset):
         mask_ground = agg_ground_labels == 1
         mask_ground = mask_ground.flatten()
         non_ground_coords = agg_coords[~mask_ground]
-        labels = get_kmeans_labels(self.n_clusters-1, non_ground_coords).detach().cpu().numpy()
+        if self.args.hdb:
+            labels = HDBSCAN(min_cluster_size=20).fit_predict(non_ground_coords).squeeze()
+            lbls, counts = np.unique(labels, return_counts=True)
+            cluster_info = np.array(list(zip(lbls[1:], counts[1:])))
+            cluster_info = cluster_info[cluster_info[:,1].argsort()]
+
+            clusters_labels = cluster_info[::-1][:50-1, 0]
+            labels[np.in1d(labels, clusters_labels, invert=True)] = -1
+        else:
+            labels = get_kmeans_labels(self.n_clusters-1, non_ground_coords).detach().cpu().numpy()
         agg_segs = np.zeros_like(agg_ground_labels).flatten()
         agg_segs[~mask_ground] = labels
         agg_segs[mask_ground] = self.n_clusters-1
@@ -539,9 +549,6 @@ class KITTIval(Dataset):
                 for f in np.sort(os.listdir(seq_path)):
                     self.file.append(os.path.join(seq_path, f))
                     self.name.append(os.path.join(seq_path, f)[0:-4].replace(self.args.data_path, ''))
-        # random_indices = random.sample(range(len(self.file)), 10)
-        # self.file = [self.file[i] for i in random_indices]
-        # self.name = [self.name[i] for i in random_indices]
 
     def augment_coords_to_feats(self, coords, feats, labels=None):
         coords_center = coords.mean(0, keepdims=True)

@@ -25,14 +25,14 @@ from tqdm import tqdm
 def parse_args():
     '''PARAMETERS'''
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
-    parser.add_argument('--data_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp',
+    parser.add_argument('--data_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp',
                         help='point cloud data path')
-    parser.add_argument('--sp_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp_sp',
+    parser.add_argument('--sp_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_sp',
                         help='initial sp path')
-    parser.add_argument('--original_data_path', type=str, default='/mnt/urashima/dataset/semantickitti/dataset/sequences')
-    parser.add_argument('--patchwork_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/patchwork')
-    parser.add_argument('--save_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp_model', help='model savepath')
-    parser.add_argument('--load_path', default='/mnt/urashima/users/minesawa/semantickitti/growsp_model', type=str, help='model load path')
+    parser.add_argument('--original_data_path', type=str, default='/mnt/data/dataset/semantickitti/dataset/sequences')
+    parser.add_argument('--patchwork_path', type=str, default='/mnt/data/users/minesawa/semantickitti/patchwork')
+    parser.add_argument('--save_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_model', help='model savepath')
+    parser.add_argument('--load_path', default='/mnt/data/users/minesawa/semantickitti/growsp_model', type=str, help='model load path')
     parser.add_argument('--pseudo_label_path', default='pseudo_label_kitti/', type=str, help='pseudo label save path') # 同時に複数実行する場合のみ、被らないように変更する必要がある
     ##
     parser.add_argument('--max_epoch', type=int, nargs='+', default=[100, 350], help='max epoch for non-growing and growing stage')
@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument('--cluster_workers', type=int, default=16, help='how many workers for loading data in clustering')
     parser.add_argument('--seed', type=int, default=2022, help='random seed')
     parser.add_argument('--log-interval', type=int, default=80, help='log interval')
-    parser.add_argument('--batch_size', type=int, default=48, help='batchsize in training')
+    parser.add_argument('--batch_size', type=int, nargs='+', default=[16, 8], help='batchsize in training[GrowSP, TARL]')
     parser.add_argument('--voxel_size', type=float, default=0.15, help='voxel size in SparseConv')
     parser.add_argument('--input_dim', type=int, default=3, help='network input dimension')### 6 for XYZGB
     parser.add_argument('--primitive_num', type=int, default=500, help='how many primitives used in training')
@@ -63,6 +63,8 @@ def parse_args():
     parser.add_argument('--select_num', type=int, default=1500, help='scene number selected in each round')
     parser.add_argument('--r_crop', type=float, default=50, help='cropping radius in training')
     parser.add_argument('--cluster_interval', type=int, default=10, help='cluster interval')
+    parser.add_argument('--eval_interval', type=int, default=1, help='eval interval')
+    parser.add_argument('--silhouette', action='store_true', help='more eval metrics for kmeans')
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--scan_window', type=int, default=12, help='scan window size')
     parser.add_argument('--contrast_select_num', type=int, default=1500, help='contrastive select number')
@@ -85,20 +87,22 @@ def main(args, logger):
             "max_epoch_1": args.max_epoch[0],
             "max_epoch_2": args.max_epoch[1],
             "cluster_interval": args.cluster_interval,
-            "batch_size": args.batch_size,
+            "batch_size_growsp": args.batch_size[0],
+            "batch_size_tarl": args.batch_size[1],
             "lr": args.lr,
             "workers": args.workers,
             "temporal_workers": args.temporal_workers,
             "cluster_workers": args.cluster_workers,
+            "run_stage": args.run_stage,
         },
-        name = 'GrowSP-more-metric',
+        name = 'GrowSP-more-metric-poseidon',
     )
     
     '''Random select 1500 scans to train, will redo in each round'''
     scene_idx = np.random.choice(19130, args.select_num, replace=False).tolist()## SemanticKITTI totally has 19130 training samples
     
     trainset = KITTItrain(args, scene_idx, 'train')
-    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, collate_fn=cfl_collate_fn(), num_workers=args.workers, pin_memory=True, worker_init_fn=worker_init_fn)
+    train_loader = DataLoader(trainset, batch_size=args.batch_size[0], shuffle=True, collate_fn=cfl_collate_fn(), num_workers=args.workers, pin_memory=True, worker_init_fn=worker_init_fn)
 
     clusterset = KITTItrain(args, scene_idx, 'train')
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
@@ -125,36 +129,35 @@ def main(args, logger):
 
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
-
-            # if epoch% args.cluster_interval==0:
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
             torch.save(classifier.state_dict(), join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'))
-            with torch.no_grad():
-                
-                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
-                logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
-                d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
-                d.update(IoU_dict)
-                wandb.log(d)
-                
-                # SPの評価
-                feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
-                sp_feats = torch.cat(feats, dim=0)
-                # SPCの評価
-                primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
-                sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
-                wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
-                
-            iterations = (epoch+10) * len(train_loader)
-            if iterations > args.max_iter[0]:
-                # start_grow_epoch = epoch
-                break
+            
+            if epoch % args.eval_interval==0:
+                with torch.no_grad():
+                    
+                    o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
+                    logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
+                    d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
+                    d.update(IoU_dict)
+                    wandb.log(d)
+                    if args.silhouette:
+                        # SPCの評価
+                        feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
+                        sp_feats = torch.cat(feats, dim=0)
+                        primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
+                        sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
+                        wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
+
+            # iterations = (epoch+10) * len(train_loader)
+            # if iterations > args.max_iter[0]:
+            #     # start_grow_epoch = epoch
+            #     break
         
         torch.save({
             'start_grow_epoch': start_grow_epoch,
             'model_q_state_dict': model_q.state_dict(),
             'epoch': epoch,
-            }, join(args.save_path,  'model_checkpoint_stage1.pth'))
+            }, join(args.save_path, 'model_checkpoint_stage1.pth'))
 
     if args.run_stage == 0 or args.run_stage == 2:
         '''Superpoints will grow in 2nd Stage'''
@@ -164,7 +167,7 @@ def main(args, logger):
         model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
         if args.run_stage == 2:
             checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
-            start_grow_epoch = 100
+            start_grow_epoch = args.max_epoch[0]
         else:
             checkpoint = torch.load(join(args.save_path, 'model_checkpoint_stage1.pth'))
             start_grow_epoch = checkpoint['epoch']
@@ -173,7 +176,7 @@ def main(args, logger):
         is_Growing = True
         current_growsp = args.growsp_start
         optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.max_iter[1])
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(train_loader))
         loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).cuda()
         
         # for contrastive learning
@@ -193,11 +196,11 @@ def main(args, logger):
         proj_head_k = proj_head_k.cuda()
         predictor = predictor.cuda()
         optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr)
-        scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, total_steps=args.max_iter[1])
         
         temporalset = KITTItemporal(args)
-        temporal_loader = DataLoader(temporalset, batch_size=args.batch_size, shuffle=True, collate_fn=cfl_collate_fn_temporal(), num_workers=args.temporal_workers, pin_memory=True, worker_init_fn=worker_init_fn)
-        
+        temporal_loader = DataLoader(temporalset, batch_size=args.batch_size[1], shuffle=True, collate_fn=cfl_collate_fn_temporal(), num_workers=args.temporal_workers, pin_memory=True, worker_init_fn=worker_init_fn)
+        scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
+
         for epoch in range(1, args.max_epoch[1]+1):
             epoch += start_grow_epoch
 
@@ -212,24 +215,24 @@ def main(args, logger):
             # train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer_contrast, epoch, scheduler_contrast, current_growsp)
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
             momentum_update_model(model_q, model_k)
-
-            # if epoch% args.cluster_interval==0:
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
             torch.save(classifier.state_dict(), join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'))
-            with torch.no_grad():
-                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
-                logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
-                d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
-                d.update(IoU_dict)
-                wandb.log(d)    
-                
-                # SPの評価
-                feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
-                sp_feats = torch.cat(feats, dim=0)
-                # SPCの評価
-                primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
-                sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
-                wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
+
+            if epoch% args.eval_interval==0:
+                with torch.no_grad():
+                    o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
+                    logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
+                    d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
+                    d.update(IoU_dict)
+                    wandb.log(d)    
+                    
+                    if args.silhouette:
+                        # SPCの評価
+                        feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
+                        sp_feats = torch.cat(feats, dim=0)
+                        primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
+                        sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
+                        wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
 
 
 
@@ -307,7 +310,7 @@ def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q,
     predictor.train()
     loss_display = 0.0
     time_curr = time.time()
-    for batch_idx, data in enumerate(temporal_loader):
+    for batch_idx, data in tqdm(enumerate(temporal_loader), desc='Contrast Epoch: {}'.format(epoch)):
 
         coords_q, coords_k, segs_q, segs_k = data
 
@@ -364,11 +367,12 @@ def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, 
     model_q.train()
     loss_display = 0.0
     time_curr = time.time()
-    for batch_idx, data in enumerate(train_loader):
+    for batch_idx, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch)):
         iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
 
         coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
-        
+        if args.vis:
+            print('coords', coords)
         in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
         feats = model_q(in_field)
 

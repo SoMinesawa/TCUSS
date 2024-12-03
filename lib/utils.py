@@ -41,9 +41,9 @@ def get_sp_feature(args, loader, model, current_growsp):
 
             valid_mask = region!=-1
             '''Compute avg rgb/xyz/norm for each Superpoints to help merging superpoints'''
-            features = features[inds.long()].cuda()
+            features = features[inds.long()].to("cuda:0")
             features = features[valid_mask]
-            normals = normals[inds.long()].cuda()
+            normals = normals[inds.long()].to("cuda:0")
             normals = normals[valid_mask]
             feats = feats[valid_mask]
             labels = labels[valid_mask]
@@ -55,7 +55,7 @@ def get_sp_feature(args, loader, model, current_growsp):
             region_num = len(torch.unique(region))
             region_corr = torch.zeros(region.size(0), region_num)#?
             region_corr.scatter_(1, region.view(-1, 1), 1)
-            region_corr = region_corr.cuda()##[N, M]
+            region_corr = region_corr.to("cuda:0")##[N, M]
             per_region_num = region_corr.sum(0, keepdims=True).t()
             ###
             region_feats = F.linear(region_corr.t(), feats.t())/per_region_num
@@ -83,7 +83,7 @@ def get_sp_feature(args, loader, model, current_growsp):
             neural_region_num = len(torch.unique(neural_region))
             neural_region_corr = torch.zeros(neural_region.size(0), neural_region_num)
             neural_region_corr.scatter_(1, neural_region.view(-1, 1), 1)
-            neural_region_corr = neural_region_corr.cuda()
+            neural_region_corr = neural_region_corr.to("cuda:0")
             per_neural_region_num = neural_region_corr.sum(0, keepdims=True).t()
             #
             '''Compute avg rgb/pfh for each Superpoints to help Primitives Learning'''
@@ -96,7 +96,7 @@ def get_sp_feature(args, loader, model, current_growsp):
             for p in torch.unique(neural_region):
                 if p!=-1:
                     mask = p==neural_region
-                    pfh.append(compute_hist(normals[mask].cpu()).unsqueeze(0).cuda())
+                    pfh.append(compute_hist(normals[mask].cpu()).unsqueeze(0).to("cuda:0"))
 
             pfh = torch.cat(pfh, dim=0)
             feats = F.normalize(feats, dim=-1)
@@ -123,9 +123,9 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     context = []
     model.eval()
     sl_scores, db_scores, ch_scores, ts = [], [], [], []
-    random_indices = sorted(random.sample(range(len(loader)), 10))
+    random_indices = sorted(random.sample(range(len(loader)), 10)) if args.silhouette else []
     with torch.no_grad():
-        for batch_idx, data in tqdm(enumerate(loader), total=len(loader)):
+        for batch_idx, data in tqdm(enumerate(loader), total=len(loader), desc="get_kittisp_feature in utils.py"):
             coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
 
             region = region.squeeze() #[39521, 1] -> [39521]
@@ -136,40 +136,40 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
             # 現状の特徴量を計算
             in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
             feats = model(in_field) #[67911, 4+3] -> [67911, 4]
-            feats = feats[inds.long()].cuda() #[67911, 4] -> [39521, 4]
+            feats = feats[inds.long()].to("cuda:0") #[67911, 4] -> [39521, 4]
 
             valid_mask = region != -1
-            features = features[inds.long()].cuda()
+            features = features[inds.long()].to("cuda:0")
             features = features[valid_mask] # [39521, 1] -> [32629, 1]
-            normals = normals[inds.long()].cuda()
+            normals = normals[inds.long()].to("cuda:0")
             normals = normals[valid_mask] # [39521, 3] -> [32629, 3]
             feats = feats[valid_mask]# [39521, 4] -> [32629, 4]
             labels = labels[valid_mask]# [39521, 1] -> [32629, 1]
-            region = region[valid_mask].long().cuda() # [39521] -> [32629]
+            region = region[valid_mask].long().to("cuda:0") # [39521] -> [32629]
             ##
             pc_remission = features # [32629, 1]
             ## region = [0, 1, 2, 1, 0]
             region_num = len(torch.unique(region))
-            region_corr = torch.zeros(region.size(0), region_num).cuda()
-            region_corr.scatter_(1, region.view(-1, 1), 1)##[N, M]
+            region_corr = torch.zeros(region.size(0), region_num).to("cuda:0")
+            region_corr.scatter_(1, region.view(-1, 1), 1)##[N, M] M=266 は M_0、つまり、init superpointの数
             per_region_num = region_corr.sum(0, keepdims=True).t()
-            ### per_region_num = [[1], [2], [2]] (266,1)
+            ### per_region_num = [[1], [2], [2]] (266,1) 266個のSuperpointについて、それぞれのに含まれている点の数
 
             region_feats = F.linear(region_corr.t(), feats.t()) / per_region_num # [M, 4] これはM個のinit_SPの特徴量
             if current_growsp is not None:
                 region_feats = F.normalize(region_feats, dim=-1)
-                if region_feats.size(0) < current_growsp:
+                if region_feats.size(0) < current_growsp: # 基本ない？M=266が80よりも小さくなるような場合
                     n_segments = region_feats.size(0)
                 else:
                     n_segments = current_growsp
                 sp_idx = get_kmeans_labels(n_clusters=n_segments, pcds=region_feats).long()
             else:
                 feats = region_feats
-                sp_idx = torch.arange(region_feats.size(0)).cuda()
+                sp_idx = torch.arange(region_feats.size(0)).to("cuda:0")
 
             # kmeansの評価
             if batch_idx in random_indices:
-                sl_score, db_score, ch_score, t = calc_cluster_metrics(region_feats, sp_idx.cuda())
+                sl_score, db_score, ch_score, t = calc_cluster_metrics(region_feats, sp_idx.to("cuda:0"))
                 sl_scores.append(sl_score)
                 db_scores.append(db_score)
                 ch_scores.append(ch_score)
@@ -180,7 +180,7 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
             pfh = []
             '''kmeansしたあとのSPの特徴量を計算'''
             neural_region_num = len(torch.unique(neural_region))
-            neural_region_corr = F.one_hot(neural_region, num_classes=neural_region_num).float().cuda()
+            neural_region_corr = F.one_hot(neural_region, num_classes=neural_region_num).float().to("cuda:0")
             per_neural_region_num = neural_region_corr.sum(0, keepdims=True).t()
             final_remission = F.linear(neural_region_corr.t(), pc_remission.t()) / per_neural_region_num
 
@@ -215,13 +215,14 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     # kmeansの評価結果をログに記録
     filtered_db_scores = [x for x in db_scores if x != -1]
     filtered_ch_scores = [x for x in ch_scores if x != -1]
-    wandb.log({
-        "epoch": epoch,
-        "SC/Silhouette Score": np.mean(sl_scores),
-        "SC/Davies-Bouldin Score": np.mean(filtered_db_scores),
-        "SC/Calinski-Harabasz Score": np.mean(filtered_ch_scores),
-        "SC/Time": np.mean(ts)
-    })
+    if not((len(sl_scores)==0) and (len(filtered_ch_scores)==0) and (len(filtered_db_scores)==0)):
+        wandb.log({
+            "epoch": epoch,
+            "SC/Silhouette Score": np.mean(sl_scores),
+            "SC/Davies-Bouldin Score": np.mean(filtered_db_scores),
+            "SC/Calinski-Harabasz Score": np.mean(filtered_ch_scores),
+            "SC/Time": np.mean(ts)
+        })
 
     return point_feats_list, point_labels_list, all_sp_index, context
 
@@ -347,9 +348,14 @@ def compute_hist(normal, bins=10, min=-1, max=1):
     
 
 def compute_segment_feats(feats, segs):
+    
+    mask = segs != -1
+    feats = feats[mask]
+    segs = segs[mask]
+    
     # segsのユニークな要素とそのインデックスを取得
     unique_segs, inverse_indices = torch.unique(segs, return_inverse=True)
-    
+
     # segsのユニークな数（k）
     seg_num = unique_segs.size(0)
     
@@ -373,7 +379,7 @@ def compute_segment_feats(feats, segs):
 
 def calc_info_nce(seg_feats_q, seg_feats_k, temperature=0.07):
     sims = F.cosine_similarity(seg_feats_q.unsqueeze(1), seg_feats_k.unsqueeze(0), dim=2) / temperature
-    sims = sims.cuda()
+    sims = sims.to("cuda:0")
     m, n = sims.size()
     num_pos = min(m, n)
     # 行方向の損失を計算
@@ -467,7 +473,7 @@ def get_kmeans_labels(n_clusters, pcds, max_iter=300):
     Returns:
         labels (torch.tensor): 各点に対するクラスタラベル (N,)
     """
-    model = KMeans_gpu(n_clusters=n_clusters, max_iter=max_iter, distance='euclidean')
+    model = KMeans_gpu(n_clusters=n_clusters, max_iter=max_iter, distance='euclidean').cuda()
     with torch.no_grad():
         if isinstance(pcds, np.ndarray):
             pcds = torch.from_numpy(pcds)
@@ -482,9 +488,12 @@ def get_kmeans_labels(n_clusters, pcds, max_iter=300):
             print("kmeans-gpu ValueError so use sklearn")
             pcds = pcds.cpu().numpy()
             np.save("kmeans_error.npy", pcds)
-            labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0, n_jobs=5).fit_predict(pcds)).cuda()
-            
-    return labels.squeeze(0)
+            labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0, n_jobs=5).fit_predict(pcds))
+    
+    lbls = labels.float().squeeze(0).cuda()
+    del labels, model, pcds
+    torch.cuda.empty_cache()
+    return lbls
 
 
 def calc_cluster_metrics(X, labels):

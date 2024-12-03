@@ -25,7 +25,6 @@ from tqdm import tqdm
 def parse_args():
     '''PARAMETERS'''
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
-    parser.add_argument('--name', type=str, required=True, help='name of the experiment')
     parser.add_argument('--data_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp',
                         help='point cloud data path')
     parser.add_argument('--sp_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_sp',
@@ -33,6 +32,7 @@ def parse_args():
     parser.add_argument('--original_data_path', type=str, default='/mnt/data/dataset/semantickitti/dataset/sequences')
     parser.add_argument('--patchwork_path', type=str, default='/mnt/data/users/minesawa/semantickitti/patchwork')
     parser.add_argument('--save_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_model', help='model savepath')
+    parser.add_argument('--load_path', default='/mnt/data/users/minesawa/semantickitti/growsp_model', type=str, help='model load path')
     parser.add_argument('--pseudo_label_path', default='pseudo_label_kitti/', type=str, help='pseudo label save path') # 同時に複数実行する場合のみ、被らないように変更する必要がある
     ##
     parser.add_argument('--max_epoch', type=int, nargs='+', default=[100, 350], help='max epoch for non-growing and growing stage')
@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument('--cluster_workers', type=int, default=16, help='how many workers for loading data in clustering')
     parser.add_argument('--seed', type=int, default=2022, help='random seed')
     parser.add_argument('--log-interval', type=int, default=80, help='log interval')
-    parser.add_argument('--batch_size', type=int, nargs='+', default=[16, 16], help='batchsize in training[GrowSP, TARL]')
+    parser.add_argument('--batch_size', type=int, nargs='+', default=[16, 8], help='batchsize in training[GrowSP, TARL]')
     parser.add_argument('--voxel_size', type=float, default=0.15, help='voxel size in SparseConv')
     parser.add_argument('--input_dim', type=int, default=3, help='network input dimension')### 6 for XYZGB
     parser.add_argument('--primitive_num', type=int, default=500, help='how many primitives used in training')
@@ -72,15 +72,10 @@ def parse_args():
     parser.add_argument('--run_stage', type=int, default=0, help='Stage to train  0 or 1 or 2 (0=all)')
     parser.add_argument('--lmb', type=float, default=0.5, help='lambda for contrastive learning')
     parser.add_argument('--vis', action='store_true', help='visualize')
-    parser.add_argument('--resume', action='store_true', help='resume training')
-    parser.add_argument('--wandb_run_id', type=str, help='wandb run id')
     return parser.parse_args()
 
 
 def main(args, logger):
-    
-    if (args.resume and args.run_stage == 2):
-        raise ValueError('Cannot resume training in stage 2')
     
     run = wandb.init(
         project="TCUSS",
@@ -99,22 +94,9 @@ def main(args, logger):
             "temporal_workers": args.temporal_workers,
             "cluster_workers": args.cluster_workers,
             "run_stage": args.run_stage,
-            "cluster_interval": args.cluster_interval,
-            "resume": args.resume,
         },
-        name = args.name if args.name else None,
-        resume= 'must' if args.resume else 'never',
-        id = args.wandb_run_id if args.resume else None,
-        fork_from= f'x' if args.run_stage==2 else None # TODO: write
+        name = 'TCUSS-NO-backprop',
     )
-    
-    model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
-    model_q = model_q.to("cuda:0")
-    
-    if args.resume:
-        resume_epoch = wandb.run.summary.get("epoch", 0)
-        _ = np.random.randint(resume_epoch)
-        print(f'Resume from epoch {resume_epoch}')
     
     '''Random select 1500 scans to train, will redo in each round'''
     scene_idx = np.random.choice(19130, args.select_num, replace=False).tolist()## SemanticKITTI totally has 19130 training samples
@@ -124,28 +106,21 @@ def main(args, logger):
 
     clusterset = KITTItrain(args, scene_idx, 'train')
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
-    
-    optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=args.max_epoch[0], steps_per_epoch=len(train_loader))
-    loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).to("cuda:0")
 
-    if args.resume:
-        checkpoint = torch.load(join(args.save_path, f'checkpoint_epoch_{resume_epoch-1}.pth'))
-        model_q.load_state_dict(checkpoint['model_q_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    classifier = None
-
-    start_grow_epoch = args.max_epoch[0]
     if args.run_stage == 0 or args.run_stage == 1:
-        # start_grow_epoch = 0
+        '''Prepare Model/Optimizer'''
+        model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
+        model_q = model_q.cuda()
+        optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=args.max_epoch[0], steps_per_epoch=len(train_loader))
+        loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).cuda()
+        start_grow_epoch = 0
+
         '''Train and Cluster'''
         '''Superpoints will not Grow in 1st Stage'''
         is_Growing = False
         for epoch in range(1, args.max_epoch[0]+1):
-            if args.resume and epoch < resume_epoch:
-                continue
+
             '''Take 10 epochs as a round'''
             if (epoch-1) % args.cluster_interval==0:
                 scene_idx = np.random.choice(19130, args.select_num, replace=False)
@@ -153,15 +128,7 @@ def main(args, logger):
                 cluster_loader.dataset.random_select_sample(scene_idx)
 
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
-            
-            if classifier is None: # for resume
-                scene_idx = np.random.choice(19130, args.select_num, replace=False)
-                train_loader.dataset.random_select_sample(scene_idx)
-                cluster_loader.dataset.random_select_sample(scene_idx)
-
-                classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
-            # 要変更
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
             torch.save(classifier.state_dict(), join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'))
             
@@ -185,30 +152,32 @@ def main(args, logger):
             # if iterations > args.max_iter[0]:
             #     # start_grow_epoch = epoch
             #     break
-            torch.save({
-                'epoch': epoch,
-                'model_q_state_dict': model_q.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-            }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
-
+        
+        torch.save({
+            'start_grow_epoch': start_grow_epoch,
+            'model_q_state_dict': model_q.state_dict(),
+            'epoch': epoch,
+            }, join(args.save_path, 'model_checkpoint_stage1.pth'))
 
     if args.run_stage == 0 or args.run_stage == 2:
         '''Superpoints will grow in 2nd Stage'''
         logger.info('#################################')
         logger.info('### Superpoints Begin Growing ###')
         logger.info('#################################')
-        if torch.cuda.device_count() != 2:
-            raise RuntimeError("使用できるCUDA GPUがちょうど2つ必要です。現在のデバイス数: {}".format(torch.cuda.device_count()))
-        
-        if args.run_stage == 2: # TODO: change
+        model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
+        if args.run_stage == 2:
             checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
             start_grow_epoch = args.max_epoch[0]
+        else:
+            checkpoint = torch.load(join(args.save_path, 'model_checkpoint_stage1.pth'))
+            start_grow_epoch = checkpoint['epoch']
+        model_q.load_state_dict(checkpoint['model_q_state_dict'])
+        model_q = model_q.cuda()
         is_Growing = True
         current_growsp = args.growsp_start
         optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(train_loader))
-        loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).to("cuda:0")
+        loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).cuda()
         
         # for contrastive learning
         proj_head_q = TransformerProjector(d_model=args.feats_dim, num_layer=1)
@@ -222,32 +191,18 @@ def main(args, logger):
             param_k.requires_grad = False
 
         predictor = TransformerProjector(d_model=args.feats_dim, num_layer=1)
-        proj_head_q = proj_head_q.to("cuda:0")
-        model_k = model_k.to("cuda:0")
-        proj_head_k = proj_head_k.to("cuda:0")
-        predictor = predictor.to("cuda:0")
+        proj_head_q = proj_head_q.cuda()
+        model_k = model_k.cuda()
+        proj_head_k = proj_head_k.cuda()
+        predictor = predictor.cuda()
         optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr)
+        scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
         
         temporalset = KITTItemporal(args)
         temporal_loader = DataLoader(temporalset, batch_size=args.batch_size[1], shuffle=True, collate_fn=cfl_collate_fn_temporal(), num_workers=args.temporal_workers, pin_memory=True, worker_init_fn=worker_init_fn)
-        scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
         
-        classifier = None
-        if (args.resume and resume_epoch-1 > args.max_epoch[0]): # 2回もloadしないように
-            model_q.load_state_dict(checkpoint['model_q_state_dict']) # 別にしなくてもいいけどね
-            model_k.load_state_dict(checkpoint['model_k_state_dict'])
-            proj_head_q.load_state_dict(checkpoint['proj_head_q_state_dict'])
-            proj_head_k.load_state_dict(checkpoint['proj_head_k_state_dict'])
-            predictor.load_state_dict(checkpoint['predictor_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            optimizer_contrast.load_state_dict(checkpoint['optimizer_contrast_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
-
         for epoch in range(1, args.max_epoch[1]+1):
             epoch += start_grow_epoch
-            if args.resume and epoch < resume_epoch:
-                continue
 
             '''Take 10 epochs as a round'''
             if (epoch-1) % args.cluster_interval==0:
@@ -258,12 +213,6 @@ def main(args, logger):
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
                 wandb.log({'epoch': epoch, 'current_growsp': current_growsp})
             train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer_contrast, epoch, scheduler_contrast, current_growsp)
-            if classifier is None: # for resume
-                scene_idx = np.random.choice(19130, args.select_num, replace=False)
-                train_loader.dataset.random_select_sample(scene_idx)
-                cluster_loader.dataset.random_select_sample(scene_idx)
-
-                classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
             momentum_update_model(model_q, model_k)
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
@@ -275,7 +224,7 @@ def main(args, logger):
                     logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
                     d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
                     d.update(IoU_dict)
-                    wandb.log(d)
+                    wandb.log(d)    
                     
                     if args.silhouette:
                         # SPCの評価
@@ -285,18 +234,6 @@ def main(args, logger):
                         sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
                         wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
 
-            torch.save({
-                'epoch': epoch,
-                'model_q_state_dict': model_q.state_dict(),
-                'model_k_state_dict': model_k.state_dict(),
-                'proj_head_q_state_dict': proj_head_q.state_dict(),
-                'proj_head_k_state_dict': proj_head_k.state_dict(),
-                'predictor_state_dict': predictor.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
-            }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
 def cluster(args, logger, cluster_loader:DataLoader, model_q:Res16FPNBase, epoch:int, start_grow_epoch:int=None, is_Growing:bool=False):
@@ -361,7 +298,7 @@ def cluster(args, logger, cluster_loader:DataLoader, model_q:Res16FPNBase, epoch
     for IoU in IoUs:
         s += '{:5.2f} '.format(100 * IoU)
     logger.info('Primitives oAcc {:.2f} IoUs'.format(o_Acc) + s)
-    return classifier.to("cuda:0"), current_growsp
+    return classifier.cuda(), current_growsp
 
 
 def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer, epoch, scheduler, current_growsp):
@@ -373,7 +310,7 @@ def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q,
     predictor.train()
     loss_display = 0.0
     time_curr = time.time()
-    for data in tqdm(temporal_loader, desc='Contrast Epoch: {}'.format(epoch), total=len(temporal_loader)):
+    for batch_idx, data in tqdm(enumerate(temporal_loader), desc='Contrast Epoch: {}'.format(epoch)):
 
         coords_q, coords_k, segs_q, segs_k = data
 
@@ -401,7 +338,7 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
     for batch_id in batch_ids:
         mask = coords_q[:, 0] == batch_id
         scene_feats_q = feats_q[mask]
-        scene_seg_feats_q = compute_segment_feats(scene_feats_q, segs_q[int(batch_id)].to("cuda:0"))
+        scene_seg_feats_q = compute_segment_feats(scene_feats_q, segs_q[int(batch_id)].cuda())
         seg_feats_q = torch.cat((seg_feats_q, scene_seg_feats_q), dim=0)
         
     proj_feats_q = proj_head_q(seg_feats_q.unsqueeze(1))
@@ -415,7 +352,7 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
         for batch_id in batch_ids:
             mask = coords_k[:, 0] == batch_id
             scene_feats_k = feats_k[mask]
-            scene_seg_feats_k = compute_segment_feats(scene_feats_k, segs_k[int(batch_id)].to("cuda:0"))
+            scene_seg_feats_k = compute_segment_feats(scene_feats_k, segs_k[int(batch_id)].cuda())
             seg_feats_k = torch.cat((seg_feats_k, scene_seg_feats_k), dim=0)
             
         proj_feats_k = proj_head_k(seg_feats_k.unsqueeze(1)).squeeze(1)
@@ -425,48 +362,41 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
     return loss
 
 
+# 対照学習のみで収束するのかのテスト用
 def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, scheduler=None, classifier=None):
-    # train_loader.dataset.mode = 'train'
     model_q.train()
-    loss_display = 0.0
-    time_curr = time.time()
-    for batch_idx, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch)):
-        iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
+    with torch.no_grad():
+        loss_display = 0.0
+        time_curr = time.time()
+        for batch_idx, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch)):
+            iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
 
-        coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
-        if args.vis:
-            print('coords', coords)
-        in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
-        feats = model_q(in_field)
+            coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
 
-        feats = feats[inds.long()]
-        feats = F.normalize(feats, dim=-1)
-        #
-        pseudo_labels_comp = pseudo_labels.long().to("cuda:0")
-        logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
-        loss_sem = loss(logits * 5, pseudo_labels_comp).mean()
+            in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
+            feats = model_q(in_field)
 
-        loss_display += loss_sem.item()
-        optimizer.zero_grad()
-        # loss_sem /= 5
-        loss_sem.backward()
-        # if x:
-        optimizer.step()
-        scheduler.step()
+            feats = feats[inds.long()]
+            feats = F.normalize(feats, dim=-1)
+            #
+            pseudo_labels_comp = pseudo_labels.long().cuda()
+            logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
+            loss_sem = loss(logits * 5, pseudo_labels_comp).mean()
 
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(torch.device("cuda"))
+            loss_display += loss_sem.item()
 
-        if (batch_idx+1) % args.log_interval == 0:
-            time_used = time.time() - time_curr
-            # loss_display /= args.log_interval # TODO: ここで割るのは合っているか？
-            logger.info(
-                'Train Epoch: {} [{}/{} ({:.0f}%)]{}, Loss: {:.10f}, lr: {:.3e}, Elapsed time: {:.4f}s({} iters)'.format(
-                    epoch, (batch_idx+1), len(train_loader), 100. * (batch_idx+1) / len(train_loader),
-                    iteration, loss_display, scheduler.get_lr()[0], time_used, args.log_interval))
-            time_curr = time.time()
-            # loss_display = 0
-    wandb.log({'epoch': epoch, 'train_loss': loss_display})
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(torch.device("cuda"))
+
+            if (batch_idx+1) % args.log_interval == 0:
+                time_used = time.time() - time_curr
+                logger.info(
+                    'Train Epoch: {} [{}/{} ({:.0f}%)]{}, Loss: {:.10f}, lr: {:.3e}, Elapsed time: {:.4f}s({} iters)'.format(
+                        epoch, (batch_idx+1), len(train_loader), 100. * (batch_idx+1) / len(train_loader),
+                        iteration, loss_display, scheduler.get_lr()[0], time_used, args.log_interval))
+                time_curr = time.time()
+                # loss_display = 0
+        wandb.log({'epoch': epoch, 'train_loss': loss_display})
         
 
 from torch.optim.lr_scheduler import LambdaLR
@@ -490,8 +420,6 @@ class PolyLR(LambdaStepLR):
     super(PolyLR, self).__init__(optimizer, lambda s: (1 - s / (max_iter + 1))**power, last_step)
 
 def worker_init_fn(worker_id):
-    gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択(GPU0はmodel用)
-    torch.cuda.set_device(gpu_id)
     # WorkerごとにユニークなシードをNumPyに設定
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)

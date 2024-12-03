@@ -152,3 +152,14 @@ CUDA_VISIBLE_DEVICES=3 WANDB_MODE=disabled python train_SemanticKITTI.py --data_
 CUDA_VISIBLE_DEVICES=1 python train_SemanticKITTI_no_backprop.py --data_path /mnt/urashima/users/minesawa/semantickitti/growsp --sp_path /mnt/urashima/users/minesawa/semantickitti/growsp_sp --save_path /mnt/urashima/users/minesawa/semantickitti/tcuss_model_no_backprop --workers 4 --temporal_workers 8 --cluster_workers 4
 
 CUDA_VISIBLE_DEVICES=1 python train_SemanticKITTI_no_backprop.py --data_path /mnt/urashima/users/minesawa/semantickitti/growsp --sp_path /mnt/urashima/users/minesawa/semantickitti/growsp_sp --save_path /mnt/urashima/users/minesawa/semantickitti/tcuss_model_no_backprop --workers 8 --temporal_workers 8 --cluster_workers 8 --batch_size 64 64行けるか？？？
+
+
+### poseidon
+CUDA_VISIBLE_DEVICES=0 python train_SemanticKITTI.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_default_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
+CUDA_VISIBLE_DEVICES=1 python train_SemanticKITTI_no_backprop.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_no_backprop_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
+CUDA_VISIBLE_DEVICES=2 python train_SemanticKITTI_growsp.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/growsp_model_more_metric_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
+CUDA_VISIBLE_DEVICES=3 python train_SemanticKITTI_hdb.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_hdb --workers 8 --temporal_workers 4 --cluster_workers 8 --hdb
+
+CUDA_VISIBLE_DEVICES=0 python train_SemanticKITTI.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_default_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
+CUDA_VISIBLE_DEVICES=0,1 python train_SemanticKITTI_onlyTARL.py --name onlyTARL_noScheduler --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/onlyTARL_noScheduler --workers 16 --temporal_workers 6 --cluster_workers 16 --batch_size 16 16
+### for debug

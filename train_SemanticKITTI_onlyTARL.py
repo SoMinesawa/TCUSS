@@ -25,7 +25,7 @@ from tqdm import tqdm
 def parse_args():
     '''PARAMETERS'''
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
-    parser.add_argument('--name', type=str, required=True, help='name of the experiment')
+    parser.add_argument('--name', type=str, help='name of the experiment')
     parser.add_argument('--data_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp',
                         help='point cloud data path')
     parser.add_argument('--sp_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_sp',
@@ -68,12 +68,13 @@ def parse_args():
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--scan_window', type=int, default=12, help='scan window size')
     parser.add_argument('--contrast_select_num', type=int, default=1500, help='contrastive select number')
-    parser.add_argument('--contrast_lr', type=float, default=1e-3, help='contrastive learning rate')  # TARLでは0.0002
+    parser.add_argument('--contrast_lr', type=float, default=0.0002, help='contrastive learning rate')  # TARLでは0.0002
     parser.add_argument('--run_stage', type=int, default=0, help='Stage to train  0 or 1 or 2 (0=all)')
     parser.add_argument('--lmb', type=float, default=0.5, help='lambda for contrastive learning')
     parser.add_argument('--vis', action='store_true', help='visualize')
     parser.add_argument('--resume', action='store_true', help='resume training')
     parser.add_argument('--wandb_run_id', type=str, help='wandb run id')
+    parser.add_argument('--weight_decay', type=float, default=1e-2, help='weight decay')
     return parser.parse_args()
 
 
@@ -112,7 +113,7 @@ def main(args, logger):
     model_q = model_q.to("cuda:0")
     
     if args.resume:
-        resume_epoch = wandb.run.summary.get("epoch", 0)
+        resume_epoch = wandb.run.summary.get("epoch", 0) 
         _ = np.random.randint(resume_epoch)
         print(f'Resume from epoch {resume_epoch}')
     
@@ -144,6 +145,7 @@ def main(args, logger):
         '''Superpoints will not Grow in 1st Stage'''
         is_Growing = False
         for epoch in range(1, args.max_epoch[0]+1):
+            break
             if args.resume and epoch < resume_epoch:
                 continue
             '''Take 10 epochs as a round'''
@@ -198,8 +200,8 @@ def main(args, logger):
         logger.info('#################################')
         logger.info('### Superpoints Begin Growing ###')
         logger.info('#################################')
-        if torch.cuda.device_count() != 2:
-            raise RuntimeError("使用できるCUDA GPUがちょうど2つ必要です。現在のデバイス数: {}".format(torch.cuda.device_count()))
+        # if torch.cuda.device_count() != 2:
+        #     raise RuntimeError("使用できるCUDA GPUがちょうど2つ必要です。現在のデバイス数: {}".format(torch.cuda.device_count()))
         
         if args.run_stage == 2: # TODO: change
             checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
@@ -226,11 +228,12 @@ def main(args, logger):
         model_k = model_k.to("cuda:0")
         proj_head_k = proj_head_k.to("cuda:0")
         predictor = predictor.to("cuda:0")
-        optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr)
+        optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr, weight_decay=args.weight_decay)
         
         temporalset = KITTItemporal(args)
         temporal_loader = DataLoader(temporalset, batch_size=args.batch_size[1], shuffle=True, collate_fn=cfl_collate_fn_temporal(), num_workers=args.temporal_workers, pin_memory=True, worker_init_fn=worker_init_fn)
-        scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
+        # scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
+        scheduler_contrast = None
         
         classifier = None
         if (args.resume and resume_epoch-1 > args.max_epoch[0]): # 2回もloadしないように
@@ -242,7 +245,7 @@ def main(args, logger):
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             optimizer_contrast.load_state_dict(checkpoint['optimizer_contrast_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
+            # scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
 
         for epoch in range(1, args.max_epoch[1]+1):
             epoch += start_grow_epoch
@@ -264,7 +267,7 @@ def main(args, logger):
                 cluster_loader.dataset.random_select_sample(scene_idx)
 
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
-            train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
+            # train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
             momentum_update_model(model_q, model_k)
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
             torch.save(classifier.state_dict(), join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'))
@@ -295,7 +298,7 @@ def main(args, logger):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
+                # 'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
             }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
@@ -385,7 +388,7 @@ def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q,
         loss = loss * args.lmb
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        # scheduler.step()
         momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
 
         torch.cuda.empty_cache()
@@ -490,7 +493,7 @@ class PolyLR(LambdaStepLR):
     super(PolyLR, self).__init__(optimizer, lambda s: (1 - s / (max_iter + 1))**power, last_step)
 
 def worker_init_fn(worker_id):
-    gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択(GPU0はmodel用)
+    gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択
     torch.cuda.set_device(gpu_id)
     # WorkerごとにユニークなシードをNumPyに設定
     worker_seed = torch.initial_seed() % 2**32

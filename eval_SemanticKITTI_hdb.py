@@ -4,7 +4,7 @@ from datasets.SemanticKITTI import KITTIval, cfl_collate_fn_val
 import numpy as np
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
-from sklearn.utils.linear_assignment_ import linear_assignment  # pip install scikit-learn==0.22.2
+from scipy.optimize import linear_sum_assignment as linear_assignment
 from models.fpn import Res16FPN18
 from lib.utils import get_fixclassifier, get_kmeans_labels
 from lib.helper_ply import read_ply, write_ply
@@ -12,7 +12,6 @@ import warnings
 import argparse
 import random
 import os
-from tqdm import tqdm
 
 ###
 def parse_args():
@@ -57,10 +56,10 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.enabled = False
 
-def eval_once(args, model, test_loader, classifier, epoch):
+def eval_once(args, model, test_loader, classifier):
 
     all_preds, all_label = [], []
-    for data in tqdm(test_loader, desc='Eval Epoch: {}'.format(epoch)):
+    for data in test_loader:
         with torch.no_grad():
             coords, features, inverse_map, labels, index, region = data
 
@@ -110,7 +109,7 @@ def eval(epoch, args):
     val_dataset = KITTIval(args)
     val_loader = DataLoader(val_dataset, batch_size=1, collate_fn=cfl_collate_fn_val(), num_workers=args.cluster_workers, pin_memory=True)
 
-    preds, labels = eval_once(args, model, val_loader, classifier, epoch)
+    preds, labels = eval_once(args, model, val_loader, classifier)
     all_preds = torch.cat(preds).numpy()
     all_labels = torch.cat(labels).numpy()
 
@@ -120,11 +119,11 @@ def eval(epoch, args):
     histogram = np.bincount(sem_num * all_labels[mask] + all_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
     '''Hungarian Matching'''
     m = linear_assignment(histogram.max() - histogram)
-    o_Acc = histogram[m[:, 0], m[:, 1]].sum() / histogram.sum()*100.
-    m_Acc = np.mean(histogram[m[:, 0], m[:, 1]] / histogram.sum(1))*100
+    o_Acc = histogram[m[0], m[1]].sum() / histogram.sum()*100.
+    m_Acc = np.mean(histogram[m[0], m[1]] / histogram.sum(1))*100
     hist_new = np.zeros((sem_num, sem_num))
     for idx in range(sem_num):
-        hist_new[:, idx] = histogram[:, m[idx, 1]]
+        hist_new[:, idx] = histogram[:, m[1][idx]]
 
     '''Final Metrics'''
     tp = np.diag(hist_new)
