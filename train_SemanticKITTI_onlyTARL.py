@@ -397,33 +397,57 @@ def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q,
 
 
 def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor):
-    in_field_q = ME.TensorField(coords_q[:, 1:]*args.voxel_size, coords_q, device=0)
+    in_field_q = ME.TensorField(coords_q[:, 1:] * args.voxel_size, coords_q, device=0)
     feats_q = model_q(in_field_q)
     batch_ids = torch.unique(coords_q[:, 0])
-    seg_feats_q = torch.empty((0, args.feats_dim), device=0)
+    seg_feats_q_list = []
     for batch_id in batch_ids:
         mask = coords_q[:, 0] == batch_id
         scene_feats_q = feats_q[mask]
         scene_seg_feats_q = compute_segment_feats(scene_feats_q, segs_q[int(batch_id)].to("cuda:0"))
-        seg_feats_q = torch.cat((seg_feats_q, scene_seg_feats_q), dim=0)
-        
-    proj_feats_q = proj_head_q(seg_feats_q.unsqueeze(1))
-    pred_feats_q = predictor(proj_feats_q).squeeze(1)
-        
+        seg_feats_q_list.append(scene_seg_feats_q)
+
+    # パディングを適用してテンソルの形状を統一
+    padded_seg_feats_q = torch.nn.utils.rnn.pad_sequence(seg_feats_q_list, batch_first=True, padding_value=0.0)
+    lengths_q = [x.size(0) for x in seg_feats_q_list]
+    max_seg_num = max(lengths_q)
+
+    # マスクを作成
+    mask_q = torch.arange(max_seg_num).expand(len(lengths_q), max_seg_num).to(padded_seg_feats_q.device) >= torch.tensor(lengths_q).unsqueeze(1).to(padded_seg_feats_q.device)
+
+    # プロジェクションヘッドに入力
+    proj_feats_q = proj_head_q(padded_seg_feats_q, enc_mask=mask_q)
+
+    # プレディクターに入力
+    pred_feats_q = predictor(proj_feats_q, enc_mask=mask_q)
+
     with torch.no_grad():
-        in_field_k = ME.TensorField(coords_k[:, 1:]*args.voxel_size, coords_k, device=0)
+        in_field_k = ME.TensorField(coords_k[:, 1:] * args.voxel_size, coords_k, device=0)
         feats_k = model_k(in_field_k)
         batch_ids = torch.unique(coords_k[:, 0])
-        seg_feats_k = torch.empty((0, args.feats_dim), device=0)
+        seg_feats_k_list = []
         for batch_id in batch_ids:
             mask = coords_k[:, 0] == batch_id
             scene_feats_k = feats_k[mask]
             scene_seg_feats_k = compute_segment_feats(scene_feats_k, segs_k[int(batch_id)].to("cuda:0"))
-            seg_feats_k = torch.cat((seg_feats_k, scene_seg_feats_k), dim=0)
-            
-        proj_feats_k = proj_head_k(seg_feats_k.unsqueeze(1)).squeeze(1)
-        
-    loss = calc_info_nce(pred_feats_q, proj_feats_k)
+            seg_feats_k_list.append(scene_seg_feats_k)
+
+        # パディングを適用してテンソルの形状を統一
+        padded_seg_feats_k = torch.nn.utils.rnn.pad_sequence(seg_feats_k_list, batch_first=True, padding_value=0.0)
+        lengths_k = [x.size(0) for x in seg_feats_k_list]
+        max_seg_num_k = max(lengths_k)
+
+        # マスクを作成
+        mask_k = torch.arange(max_seg_num_k).expand(len(lengths_k), max_seg_num_k).to(padded_seg_feats_k.device) >= torch.tensor(lengths_k).unsqueeze(1).to(padded_seg_feats_k.device)
+
+        # プロジェクションヘッドに入力
+        proj_feats_k = proj_head_k(padded_seg_feats_k, enc_mask=mask_k)
+
+        # プレディクターに入力
+        pred_feats_k = predictor(proj_feats_k, enc_mask=mask_k)
+
+    # ロスを計算
+    loss = calc_info_nce(pred_feats_q, pred_feats_k, mask_q, mask_k)
     torch.cuda.empty_cache()
     return loss
 

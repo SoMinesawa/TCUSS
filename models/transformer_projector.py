@@ -76,22 +76,19 @@ class TransformerProjector(nn.Module):
 
     def forward(self, encoding, enc_mask=None):
         if self.num_layer > 0:
-            enc_mask = enc_mask if enc_mask is None else logical_not(
-                enc_mask[..., 0])
-            # dec_mask = dec_mask if dec_mask is None else logical_not(
-            #     dec_mask[..., 0])
-
-            encoding = self.enc(
-                src=encoding, src_key_padding_mask=enc_mask)
+            # (batch_size, seq_length, embedding_dim) -> (seq_length, batch_size, embedding_dim)
+            encoding = encoding.permute(1, 0, 2)
             
-            # encoding = encoding.permute(1, 0, 2) # (N, L, E) -> (L, N, E)で合ってるの？ （batch_first = falseにしちゃった影響）
-
-            # decoding = self.dec(tgt=decoding,
-            #                     memory=encoding,
-            #                     tgt_key_padding_mask=dec_mask,
-            #                     memory_key_padding_mask=enc_mask)
-
-        return encoding#, decoding
+            # if enc_mask is not None:
+            #     enc_mask = enc_mask.T  # マスクも (batch_size, seq_length) -> (seq_length, batch_size)
+            
+            # Transformerエンコーダに入力
+            encoding = self.enc(src=encoding, src_key_padding_mask=enc_mask)
+            
+            # (seq_length, batch_size, embedding_dim) -> (batch_size, seq_length, embedding_dim)
+            encoding = encoding.permute(1, 0, 2)
+        
+        return encoding
 
 class BasicBlock(nn.Module):
     expansion = 1

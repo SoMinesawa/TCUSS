@@ -377,22 +377,42 @@ def compute_segment_feats(feats, segs):
     return seg_feats
 
 
-def calc_info_nce(seg_feats_q, seg_feats_k, temperature=0.07):
-    sims = F.cosine_similarity(seg_feats_q.unsqueeze(1), seg_feats_k.unsqueeze(0), dim=2) / temperature
-    sims = sims.to("cuda:0")
-    m, n = sims.size()
-    num_pos = min(m, n)
-    # 行方向の損失を計算
-    labels_row = torch.arange(num_pos).to(sims.device)
-    loss_row = F.cross_entropy(sims[:num_pos, :], labels_row, ignore_index=-1)
+def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
+    batch_size, max_len_q, dim = seg_feats_q.size()
+    _, max_len_k, _ = seg_feats_k.size()
     
-    # 列方向の損失を計算
-    labels_col = torch.arange(num_pos).to(sims.device)
-    loss_col = F.cross_entropy(sims[:, :num_pos].T, labels_col, ignore_index=-1)
+    # マスクを展開してブール型に変換（パディング部分がFalse、データ部分がTrue）
+    mask_q = ~mask_q  # パディング部分がFalse、データ部分がTrue
+    mask_k = ~mask_k
+
+    losses = []
+    for i in range(batch_size):
+        # 有効なシーケンス長を取得 ok
+        valid_feats_q = seg_feats_q[i][mask_q[i, :max_len_q]]
+        valid_feats_k = seg_feats_k[i][mask_k[i, :max_len_k]]
+        
+        # コサイン類似度の計算 ok
+        sims = F.cosine_similarity(valid_feats_q.unsqueeze(1), valid_feats_k.unsqueeze(0), dim=2) / temperature
+        
+        # ラベルを作成
+        num_pos = min(valid_feats_q.size(0), valid_feats_k.size(0))
+        labels = torch.arange(num_pos).to(sims.device)
+        
+        # 損失の計算
+        if num_pos > 0:
+            loss_row = F.cross_entropy(sims[:num_pos], labels)
+            loss_col = F.cross_entropy(sims.t()[:num_pos], labels)
+            loss = (loss_row + loss_col) / 2
+            losses.append(loss)
+        else:
+            # 有効なデータがない場合は損失をゼロとする
+            losses.append(torch.tensor(0.0, device=sims.device))
     
-    # 総損失を計算
-    loss = (loss_row + loss_col) / 2
-    return loss    
+    # バッチ全体の損失を平均
+    total_loss = torch.stack(losses).mean()
+    return total_loss
+
+
 
 
 @torch.no_grad()
