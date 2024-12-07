@@ -25,7 +25,7 @@ from tqdm import tqdm
 def parse_args():
     '''PARAMETERS'''
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
-    parser.add_argument('--name', type=str, help='name of the experiment')
+    parser.add_argument('--name', type=str, required=True, help='name of the experiment')
     parser.add_argument('--data_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp',
                         help='point cloud data path')
     parser.add_argument('--sp_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_sp',
@@ -113,7 +113,7 @@ def main(args, logger):
     model_q = model_q.to("cuda:0")
     
     if args.resume:
-        resume_epoch = wandb.run.summary.get("epoch", 0) 
+        resume_epoch = wandb.run.summary.get("epoch", 0)
         _ = np.random.randint(resume_epoch)
         print(f'Resume from epoch {resume_epoch}')
     
@@ -200,8 +200,6 @@ def main(args, logger):
         logger.info('#################################')
         logger.info('### Superpoints Begin Growing ###')
         logger.info('#################################')
-        # if torch.cuda.device_count() != 2:
-        #     raise RuntimeError("使用できるCUDA GPUがちょうど2つ必要です。現在のデバイス数: {}".format(torch.cuda.device_count()))
         
         if args.run_stage == 2: # TODO: change
             checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
@@ -517,7 +515,7 @@ class PolyLR(LambdaStepLR):
     super(PolyLR, self).__init__(optimizer, lambda s: (1 - s / (max_iter + 1))**power, last_step)
 
 def worker_init_fn(worker_id):
-    gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択
+    gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択(GPU0はmodel用)
     torch.cuda.set_device(gpu_id)
     # WorkerごとにユニークなシードをNumPyに設定
     worker_seed = torch.initial_seed() % 2**32

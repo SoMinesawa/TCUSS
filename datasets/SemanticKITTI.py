@@ -481,11 +481,11 @@ class KITTItemporal(Dataset):
     def _tuple_to_path(self, tup:Tuple[int, int]) -> str:
         return os.path.join(self.args.data_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.ply')
 
-    def _tuple_to_sp_path(self, tup:Tuple[int, int]) -> str:
-        return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
+    # def _tuple_to_sp_path(self, tup:Tuple[int, int]) -> str:
+    #     return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
 
-    def _tuple_to_psuedo_path(self, tup:Tuple[int, int]) -> str:
-        return os.path.join(self.args.pseudo_label_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.npy')
+    # def _tuple_to_psuedo_path(self, tup:Tuple[int, int]) -> str:
+    #     return os.path.join(self.args.pseudo_label_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.npy')
     
     def _seq_to_calib_path(self, seq:int) -> str:
         return os.path.join(self.args.original_data_path, str(seq).zfill(2), 'calib.txt')

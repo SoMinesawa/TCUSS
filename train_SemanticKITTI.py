@@ -68,12 +68,13 @@ def parse_args():
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--scan_window', type=int, default=12, help='scan window size')
     parser.add_argument('--contrast_select_num', type=int, default=1500, help='contrastive select number')
-    parser.add_argument('--contrast_lr', type=float, default=1e-3, help='contrastive learning rate')  # TARLでは0.0002
+    parser.add_argument('--contrast_lr', type=float, default=0.0002, help='contrastive learning rate')  # TARLでは0.0002
     parser.add_argument('--run_stage', type=int, default=0, help='Stage to train  0 or 1 or 2 (0=all)')
     parser.add_argument('--lmb', type=float, default=0.5, help='lambda for contrastive learning')
     parser.add_argument('--vis', action='store_true', help='visualize')
     parser.add_argument('--resume', action='store_true', help='resume training')
     parser.add_argument('--wandb_run_id', type=str, help='wandb run id')
+    parser.add_argument('--weight_decay', type=float, default=1e-2, help='weight decay')
     return parser.parse_args()
 
 
@@ -113,7 +114,8 @@ def main(args, logger):
     
     if args.resume:
         resume_epoch = wandb.run.summary.get("epoch", 0)
-        _ = np.random.randint(resume_epoch)
+        for i in range(args.cluster_interval, resume_epoch-1, args.cluster_interval):
+            _ = np.random.choice(19130, args.select_num, replace=False)
         print(f'Resume from epoch {resume_epoch}')
     
     '''Random select 1500 scans to train, will redo in each round'''
@@ -198,8 +200,6 @@ def main(args, logger):
         logger.info('#################################')
         logger.info('### Superpoints Begin Growing ###')
         logger.info('#################################')
-        if torch.cuda.device_count() != 2:
-            raise RuntimeError("使用できるCUDA GPUがちょうど2つ必要です。現在のデバイス数: {}".format(torch.cuda.device_count()))
         
         if args.run_stage == 2: # TODO: change
             checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
@@ -226,11 +226,12 @@ def main(args, logger):
         model_k = model_k.to("cuda:0")
         proj_head_k = proj_head_k.to("cuda:0")
         predictor = predictor.to("cuda:0")
-        optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr)
+        optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr, weight_decay=args.weight_decay)
         
         temporalset = KITTItemporal(args)
         temporal_loader = DataLoader(temporalset, batch_size=args.batch_size[1], shuffle=True, collate_fn=cfl_collate_fn_temporal(), num_workers=args.temporal_workers, pin_memory=True, worker_init_fn=worker_init_fn)
-        scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
+        # scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
+        scheduler_contrast = None
         
         classifier = None
         if (args.resume and resume_epoch-1 > args.max_epoch[0]): # 2回もloadしないように
@@ -242,7 +243,7 @@ def main(args, logger):
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             optimizer_contrast.load_state_dict(checkpoint['optimizer_contrast_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
+            # scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
 
         for epoch in range(1, args.max_epoch[1]+1):
             epoch += start_grow_epoch
@@ -295,7 +296,7 @@ def main(args, logger):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
+                # 'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
             }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
@@ -385,7 +386,8 @@ def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q,
         loss = loss * args.lmb
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        wandb.log({'epoch': epoch, 'contrast_lr': optimizer.param_groups[0]['lr']})
+        # scheduler.step()
         momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
 
         torch.cuda.empty_cache()
@@ -394,33 +396,57 @@ def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q,
 
 
 def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor):
-    in_field_q = ME.TensorField(coords_q[:, 1:]*args.voxel_size, coords_q, device=0)
+    in_field_q = ME.TensorField(coords_q[:, 1:] * args.voxel_size, coords_q, device=0)
     feats_q = model_q(in_field_q)
     batch_ids = torch.unique(coords_q[:, 0])
-    seg_feats_q = torch.empty((0, args.feats_dim), device=0)
+    seg_feats_q_list = []
     for batch_id in batch_ids:
         mask = coords_q[:, 0] == batch_id
         scene_feats_q = feats_q[mask]
         scene_seg_feats_q = compute_segment_feats(scene_feats_q, segs_q[int(batch_id)].to("cuda:0"))
-        seg_feats_q = torch.cat((seg_feats_q, scene_seg_feats_q), dim=0)
-        
-    proj_feats_q = proj_head_q(seg_feats_q.unsqueeze(1))
-    pred_feats_q = predictor(proj_feats_q).squeeze(1)
-        
+        seg_feats_q_list.append(scene_seg_feats_q)
+
+    # パディングを適用してテンソルの形状を統一
+    padded_seg_feats_q = torch.nn.utils.rnn.pad_sequence(seg_feats_q_list, batch_first=True, padding_value=0.0)
+    lengths_q = [x.size(0) for x in seg_feats_q_list]
+    max_seg_num = max(lengths_q)
+
+    # マスクを作成
+    mask_q = torch.arange(max_seg_num).expand(len(lengths_q), max_seg_num).to(padded_seg_feats_q.device) >= torch.tensor(lengths_q).unsqueeze(1).to(padded_seg_feats_q.device)
+
+    # プロジェクションヘッドに入力
+    proj_feats_q = proj_head_q(padded_seg_feats_q, enc_mask=mask_q)
+
+    # プレディクターに入力
+    pred_feats_q = predictor(proj_feats_q, enc_mask=mask_q)
+
     with torch.no_grad():
-        in_field_k = ME.TensorField(coords_k[:, 1:]*args.voxel_size, coords_k, device=0)
+        in_field_k = ME.TensorField(coords_k[:, 1:] * args.voxel_size, coords_k, device=0)
         feats_k = model_k(in_field_k)
         batch_ids = torch.unique(coords_k[:, 0])
-        seg_feats_k = torch.empty((0, args.feats_dim), device=0)
+        seg_feats_k_list = []
         for batch_id in batch_ids:
             mask = coords_k[:, 0] == batch_id
             scene_feats_k = feats_k[mask]
             scene_seg_feats_k = compute_segment_feats(scene_feats_k, segs_k[int(batch_id)].to("cuda:0"))
-            seg_feats_k = torch.cat((seg_feats_k, scene_seg_feats_k), dim=0)
-            
-        proj_feats_k = proj_head_k(seg_feats_k.unsqueeze(1)).squeeze(1)
-        
-    loss = calc_info_nce(pred_feats_q, proj_feats_k)
+            seg_feats_k_list.append(scene_seg_feats_k)
+
+        # パディングを適用してテンソルの形状を統一
+        padded_seg_feats_k = torch.nn.utils.rnn.pad_sequence(seg_feats_k_list, batch_first=True, padding_value=0.0)
+        lengths_k = [x.size(0) for x in seg_feats_k_list]
+        max_seg_num_k = max(lengths_k)
+
+        # マスクを作成
+        mask_k = torch.arange(max_seg_num_k).expand(len(lengths_k), max_seg_num_k).to(padded_seg_feats_k.device) >= torch.tensor(lengths_k).unsqueeze(1).to(padded_seg_feats_k.device)
+
+        # プロジェクションヘッドに入力
+        proj_feats_k = proj_head_k(padded_seg_feats_k, enc_mask=mask_k)
+
+        # プレディクターに入力
+        pred_feats_k = predictor(proj_feats_k, enc_mask=mask_k)
+
+    # ロスを計算
+    loss = calc_info_nce(pred_feats_q, pred_feats_k, mask_q, mask_k)
     torch.cuda.empty_cache()
     return loss
 
@@ -430,7 +456,7 @@ def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, 
     model_q.train()
     loss_display = 0.0
     time_curr = time.time()
-    for batch_idx, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch)):
+    for batch_idx, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch), total=len(train_loader)):
         iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
 
         coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
@@ -452,6 +478,7 @@ def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, 
         loss_sem.backward()
         # if x:
         optimizer.step()
+        wandb.log({'epoch': epoch, 'lr': optimizer.param_groups[0]['lr']})
         scheduler.step()
 
         torch.cuda.empty_cache()
