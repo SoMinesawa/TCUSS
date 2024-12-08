@@ -14,7 +14,7 @@ import time
 import random
 
 # from models.fpn import Res16FPNBase
-from kmeans_gpu import KMeans as KMeans_gpu
+from lib.kmeans_torch import KMeans as KMeans_gpu
 from sklearn.cluster import KMeans as KMeans_sklearn
 
 def get_sp_feature(args, loader, model, current_growsp):
