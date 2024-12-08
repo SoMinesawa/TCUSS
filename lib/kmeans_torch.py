@@ -88,7 +88,7 @@ class KMeans(nn.Module):
         vec_a = vec_a.to(dtype=torch.float64)
         vec_b = vec_b.to(dtype=torch.float64)
         # (vec_a - vec_b)^2 = vec_a^2 + vec_b.T^2 - 2 vec_a @ vec_b.T
-        return (2 * vec_a @ vec_b.T - (vec_a**2).sum(dim=1, keepdim=True) - (vec_b.T**2).sum(dim=0, keepdim=True)).to(dtype=torch.float32)
+        return (2 * vec_a @ vec_b.T - (vec_a**2).sum(dim=1, keepdim=True) - (vec_b.T**2).sum(dim=0, keepdim=True))
 
     @classmethod
     def max_sim(cls, vec_a, vec_b, distance):
