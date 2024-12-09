@@ -21,7 +21,7 @@ python test_SemanticKITTI.py \
 cd ~/repos/semantic-kitti-api && \
 python evaluate_semantics.py -d "$DATASET_PATH" -p "$MODEL_DIR/pred_result/" && \
 cd "$MODEL_DIR/pred_result" && \
-zip -r "$SUBMISSION_NAME" . && \
+zip -r -q "$SUBMISSION_NAME" . && \
 python ~/repos/semantic-kitti-api/validate_submission.py "$MODEL_DIR/pred_result/$SUBMISSION_NAME" "$DATASET_PATH" && \
 cd ~/repos/TCUSS && \
 scp -P 2222 -i ~/.ssh/id_ishikawa "$MODEL_DIR/pred_result/$SUBMISSION_NAME" somin@localhost:"C:\Users\somin\Downloads"
