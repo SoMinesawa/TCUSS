@@ -114,8 +114,6 @@ def main(args, logger):
     
     if args.resume:
         resume_epoch = wandb.run.summary.get("epoch", 0)
-        for i in range(args.cluster_interval, resume_epoch-1, args.cluster_interval):
-            _ = np.random.choice(19130, args.select_num, replace=False)
         print(f'Resume from epoch {resume_epoch}')
     
     '''Random select 1500 scans to train, will redo in each round'''
@@ -136,6 +134,12 @@ def main(args, logger):
         model_q.load_state_dict(checkpoint['model_q_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'np_random_state' in checkpoint:
+            np.random.set_state(checkpoint['np_random_state'])
+        if 'torch_random_state' in checkpoint:
+            torch.set_rng_state(checkpoint['torch_random_state'])
+        if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
+            torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
     
     classifier = None
 
@@ -192,6 +196,9 @@ def main(args, logger):
                 'model_q_state_dict': model_q.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'np_random_state': np.random.get_state(),
+                'torch_random_state': torch.get_rng_state(),
+                'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
             }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
@@ -244,6 +251,12 @@ def main(args, logger):
             optimizer_contrast.load_state_dict(checkpoint['optimizer_contrast_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             # scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
+            if 'np_random_state' in checkpoint:
+                np.random.set_state(checkpoint['np_random_state'])
+            if 'torch_random_state' in checkpoint:
+                torch.set_rng_state(checkpoint['torch_random_state'])
+            if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
+                torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
 
         for epoch in range(1, args.max_epoch[1]+1):
             epoch += start_grow_epoch
@@ -297,6 +310,9 @@ def main(args, logger):
                 'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 # 'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
+                'np_random_state': np.random.get_state(),
+                'torch_random_state': torch.get_rng_state(),
+                'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
             }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
