@@ -113,7 +113,8 @@ def main(args, logger):
     model_q = model_q.to("cuda:0")
     
     if args.resume:
-        resume_epoch = wandb.run.summary.get("epoch", 0)
+        last_epoch = wandb.run.summary.get("epoch", 0)
+        resume_epoch = ((last_epoch-1) // args.cluster_interval) * args.cluster_interval + 1
         print(f'Resume from epoch {resume_epoch}')
     
     '''Random select 1500 scans to train, will redo in each round'''
@@ -159,13 +160,7 @@ def main(args, logger):
                 cluster_loader.dataset.random_select_sample(scene_idx)
 
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
-            
-            if classifier is None: # for resume
-                scene_idx = np.random.choice(19130, args.select_num, replace=False)
-                train_loader.dataset.random_select_sample(scene_idx)
-                cluster_loader.dataset.random_select_sample(scene_idx)
-
-                classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
+                
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
             # 要変更
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
@@ -191,15 +186,16 @@ def main(args, logger):
             # if iterations > args.max_iter[0]:
             #     # start_grow_epoch = epoch
             #     break
-            torch.save({
-                'epoch': epoch,
-                'model_q_state_dict': model_q.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'np_random_state': np.random.get_state(),
-                'torch_random_state': torch.get_rng_state(),
-                'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-            }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
+            if epoch % args.cluster_interval==0:
+                torch.save({
+                    'epoch': epoch,
+                    'model_q_state_dict': model_q.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'np_random_state': np.random.get_state(),
+                    'torch_random_state': torch.get_rng_state(),
+                    'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
     if args.run_stage == 0 or args.run_stage == 2:
@@ -268,16 +264,12 @@ def main(args, logger):
                 scene_idx = np.random.choice(19130, args.select_num, replace=False)
                 train_loader.dataset.random_select_sample(scene_idx)
                 cluster_loader.dataset.random_select_sample(scene_idx)
+                temporal_loader.dataset._random_select_samples()
 
                 classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
                 wandb.log({'epoch': epoch, 'current_growsp': current_growsp})
+                
             train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer_contrast, epoch, scheduler_contrast, current_growsp)
-            if classifier is None: # for resume
-                scene_idx = np.random.choice(19130, args.select_num, replace=False)
-                train_loader.dataset.random_select_sample(scene_idx)
-                cluster_loader.dataset.random_select_sample(scene_idx)
-
-                classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
             train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
             momentum_update_model(model_q, model_k)
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
@@ -299,21 +291,22 @@ def main(args, logger):
                         sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
                         wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
 
-            torch.save({
-                'epoch': epoch,
-                'model_q_state_dict': model_q.state_dict(),
-                'model_k_state_dict': model_k.state_dict(),
-                'proj_head_q_state_dict': proj_head_q.state_dict(),
-                'proj_head_k_state_dict': proj_head_k.state_dict(),
-                'predictor_state_dict': predictor.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                # 'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
-                'np_random_state': np.random.get_state(),
-                'torch_random_state': torch.get_rng_state(),
-                'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-            }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
+            if epoch % args.cluster_interval==0:
+                torch.save({
+                    'epoch': epoch,
+                    'model_q_state_dict': model_q.state_dict(),
+                    'model_k_state_dict': model_k.state_dict(),
+                    'proj_head_q_state_dict': proj_head_q.state_dict(),
+                    'proj_head_k_state_dict': proj_head_k.state_dict(),
+                    'predictor_state_dict': predictor.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    # 'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
+                    'np_random_state': np.random.get_state(),
+                    'torch_random_state': torch.get_rng_state(),
+                    'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
 def cluster(args, logger, cluster_loader:DataLoader, model_q:Res16FPNBase, epoch:int, start_grow_epoch:int=None, is_Growing:bool=False):

@@ -246,8 +246,6 @@ class KITTItemporal(Dataset):
         self.args = args
         self.n_clusters = 0
         self.seq_to_scan_num = {0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201}
-        scan_range = list(range(-1*self.args.scan_window+1, self.args.scan_window))
-        scan_range.remove(0)
         
         self.file = []
         seq_list = np.sort(os.listdir(self.args.data_path))
@@ -257,15 +255,18 @@ class KITTItemporal(Dataset):
                 for f in np.sort(os.listdir(seq_path)):
                     self.file.append(os.path.join(seq_path, f))
 
-        self.scene_locates, self.scene_diff_locates, self.window_start_locates = self._random_select_samples(scan_range) # [(seq, idx), ...]
+        self.scene_locates, self.scene_diff_locates, self.window_start_locates = (None, None, None) # [(seq, idx), ...]
+        self._random_select_samples() 
         
         self.trans_coords = trans_coords(shift_ratio=50)  ### 50%
         self.rota_coords = rota_coords(rotation_bound = ((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
         self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
         
         
-    def _random_select_samples(self, scan_range:List[int]) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
-        scene_idx = np.random.choice(19130, self.args.select_num, replace=False).tolist()
+    def _random_select_samples(self):
+        scan_range = list(range(-1*self.args.scan_window+1, self.args.scan_window))
+        scan_range.remove(0)
+        scene_idx = np.random.choice(19130, self.args.select_num//2, replace=False).tolist()
         scene_locates = []
         for idx in scene_idx:
             scan_num = 0
@@ -275,7 +276,7 @@ class KITTItemporal(Dataset):
                     break
                 scan_num += seq_scan_num
         
-        scene_diff = np.random.choice(scan_range, self.args.select_num, replace=True).tolist()
+        scene_diff = np.random.choice(scan_range, self.args.select_num//2, replace=True).tolist()
         window_pattern = [random.randint(0, self.args.scan_window-abs(diff)-1) for diff in scene_diff]
         scene_diff_locates = []
         window_start_locates = []
@@ -295,7 +296,9 @@ class KITTItemporal(Dataset):
                 window_idx = self.seq_to_scan_num[seq] - self.args.scan_window
             window_start_locates.append((seq, window_idx))
     
-        return scene_locates, scene_diff_locates, window_start_locates
+        self.scene_locates = scene_locates
+        self.scene_diff_locates = scene_diff_locates
+        self.window_start_locates = window_start_locates
 
 
     def __getitem__(self, index):
