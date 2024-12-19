@@ -66,6 +66,94 @@ class cfl_collate_fn_temporal:
         return coords_q_batch, coords_k_batch, segs_q, segs_k
     
 
+# 実際に使用している引数
+# train: coords, pseudo_labels, inds
+# cluster: coords, feats, normals, labels, inds, region, index
+# 以上より、trainで使われていない変数は返さない
+class cfl_collate_fn_tcuss:
+    def __init__(self):
+        self.growsp_t1_collate_fn = cfl_collate_fn()
+        self.growsp_t2_collate_fn = cfl_collate_fn()
+        self.tarl_collate_fn = cfl_collate_fn_temporal()
+
+    def __call__(self, list_data):
+        # Split the data into growsp_t1, growsp_t2, and tarl components
+        if list_data[0][2] is None:
+            growsp_t1_data, growsp_t2_data, _ = list(zip(*list_data))
+
+            # Process each type of data using the corresponding collate function
+            (coords_t1_batch, feats_t1_batch, normal_t1_batch, labels_t1_batch,
+            inverse_t1_batch, pseudo_t1_batch, inds_t1_batch, region_t1_batch, index_t1) = self.growsp_t1_collate_fn(growsp_t1_data)
+            (coords_t2_batch, feats_t2_batch, normal_t2_batch, labels_t2_batch,
+            inverse_t2_batch, pseudo_t2_batch, inds_t2_batch, region_t2_batch, index_t2) = self.growsp_t2_collate_fn(growsp_t2_data)
+
+            # Combine results into a unified output
+            return [
+                [coords_t1_batch, pseudo_t1_batch, inds_t1_batch],
+                [coords_t2_batch, pseudo_t2_batch, inds_t2_batch],
+                None
+            ]
+        else:
+            growsp_t1_data, growsp_t2_data, tarl_data = list(zip(*list_data))
+
+            # Process each type of data using the corresponding collate function
+            (coords_q_batch, coords_k_batch, segs_q, segs_k) = self.tarl_collate_fn(tarl_data)
+            (coords_t1_batch, feats_t1_batch, normal_t1_batch, labels_t1_batch,
+            inverse_t1_batch, pseudo_t1_batch, inds_t1_batch, region_t1_batch, index_t1) = self.growsp_t1_collate_fn(growsp_t1_data)
+            (coords_t2_batch, feats_t2_batch, normal_t2_batch, labels_t2_batch,
+            inverse_t2_batch, pseudo_t2_batch, inds_t2_batch, region_t2_batch, index_t2) = self.growsp_t2_collate_fn(growsp_t2_data)
+
+            # Combine results into a unified output
+            return [
+                [coords_t1_batch, pseudo_t1_batch, inds_t1_batch],
+                [coords_t2_batch, pseudo_t2_batch, inds_t2_batch],
+                [coords_q_batch, coords_k_batch, segs_q, segs_k]
+            ]
+
+
+
+class KITTItcuss(Dataset):
+    def __init__(self, args):
+        self.args = args
+        self.phase = 0
+        self.kittitrain_t1 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
+        self.kittitrain_t2 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
+        self.kittitemporal = KITTItemporal(args)
+        
+        self.scene_idx_all = None
+        self.random_select_sample()
+            
+            
+    def __len__(self):
+        return self.kittitemporal.__len__()
+    
+    
+    def __getitem__(self, index):
+        growsp_t1 = self.kittitrain_t1.__getitem__(index)
+        growsp_t2 = self.kittitrain_t2.__getitem__(index)
+        if self.phase == 0:
+            tcuss = None
+        else:
+            tcuss = self.kittitemporal.__getitem__(index)
+        return growsp_t1, growsp_t2, tcuss
+
+
+    def random_select_sample(self):
+        self.kittitemporal._random_select_samples()
+        scene_idx_t1 = [self.kittitemporal._tuple_to_scene_idx(tup) for tup in self.kittitemporal.scene_locates]
+        scene_idx_t2 = [self.kittitemporal._tuple_to_scene_idx(tup) for tup in self.kittitemporal.scene_diff_locates]
+        self.kittitrain_t1.scene_idx = scene_idx_t1
+        self.kittitrain_t2.scene_idx = scene_idx_t2
+        self.kittitrain_t1.random_select_sample(scene_idx_t1)
+        self.kittitrain_t2.random_select_sample(scene_idx_t2)
+        scene_idx_all = []
+        for i in range(len(scene_idx_t1)):
+            scene_idx_all.append(scene_idx_t1[i])
+            scene_idx_all.append(scene_idx_t2[i])
+        self.scene_idx_all = scene_idx_all
+
+        
+        
 class KITTItrain(Dataset):
     def __init__(self, args, scene_idx, split='train'):
         self.args = args
@@ -233,9 +321,8 @@ class KITTItrain(Dataset):
         else:
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
-            file_path = self.args.pseudo_label_path + '/' + scene_name + '.npy'
+            file_path = os.path.join(self.args.pseudo_label_path, scene_name + '.npy')
             pseudo = np.array(np.load(file_path), dtype=np.long)
-
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
 
@@ -244,7 +331,7 @@ class KITTItrain(Dataset):
 class KITTItemporal(Dataset):
     def __init__(self, args):
         self.args = args
-        self.n_clusters = 0
+        self.n_clusters = None
         self.seq_to_scan_num = {0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201}
         
         self.file = []
@@ -256,8 +343,6 @@ class KITTItemporal(Dataset):
                     self.file.append(os.path.join(seq_path, f))
 
         self.scene_locates, self.scene_diff_locates, self.window_start_locates = (None, None, None) # [(seq, idx), ...]
-        self._random_select_samples() 
-        
         self.trans_coords = trans_coords(shift_ratio=50)  ### 50%
         self.rota_coords = rota_coords(rotation_bound = ((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
         self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
@@ -304,16 +389,15 @@ class KITTItemporal(Dataset):
     def __getitem__(self, index):
         seq_t1, idx_t1 = self.scene_locates[index]
         seq_t2, idx_t2 = self.scene_diff_locates[index]
-        coords_t1, labels_t1, *_ = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
-        coords_t2, labels_t2, *_ = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
-        
+        coords_t1, labels_t1, _, _, _, region_num_t1 = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
+        coords_t2, labels_t2, _, _, _, region_num_t2 = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
         scene_idx_in_window = [(self.window_start_locates[index][0], self.window_start_locates[index][1]+i) for i in range(self.args.scan_window)]
-        coords_tn, labels_tn, unique_map_tn, inverse_map_tn, mask_tn = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
+        coords_tn, labels_tn, unique_map_tn, _, mask_tn, _ = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
         if self.args.vis:
             for i, coord in enumerate(coords_tn):
                 np.save(f'tmp/data/coords_{i}.npy', coord)
         agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn)
-        agg_segs = self._clusterize_pcds(agg_coords, agg_ground_labels)
+        agg_segs = self._clusterize_pcds(agg_coords, agg_ground_labels, region_num_t1, region_num_t2)
         segs_tn = []
         for elements_num in elements_nums:
             segs_tn.append(agg_segs[:elements_num])
@@ -360,11 +444,14 @@ class KITTItemporal(Dataset):
         return points_set, ground_label, element_nums
         
     
-    def _clusterize_pcds(self, agg_coords, agg_ground_labels):
+    def _clusterize_pcds(self, agg_coords, agg_ground_labels, region_num_t1, region_num_t2):
         mask_ground = agg_ground_labels == 1
         mask_ground = mask_ground.flatten()
         non_ground_coords = agg_coords[~mask_ground]
-        labels = get_kmeans_labels(self.n_clusters-1, non_ground_coords).detach().cpu().numpy()
+        if region_num_t1 == None :
+            labels = get_kmeans_labels(self.n_clusters-1, non_ground_coords).detach().cpu().numpy()
+        else:
+            labels = get_kmeans_labels(min(region_num_t1, region_num_t2)-1, non_ground_coords).detach().cpu().numpy()
         agg_segs = np.zeros_like(agg_ground_labels).flatten()
         agg_segs[~mask_ground] = labels
         agg_segs[mask_ground] = self.n_clusters-1
@@ -384,6 +471,14 @@ class KITTItemporal(Dataset):
         
         mask = np.sqrt(((coords*self.args.voxel_size)**2).sum(-1))< self.args.r_crop
         coords, feats, labels = coords[mask], feats[mask], labels[mask] # (41342, x) -> (39521, x)
+
+        region_num = None
+        if (self.n_clusters is None) and aug: # run_stage=0のとき
+            region_file = self._tuple_to_sp_path((seq, idx))
+            region = np.load(region_file) # (123008,)
+            region = region[unique_map] # (41342,)
+            region = region[mask] # (39521,)
+            region_num = len(np.unique(region))
         
         if aug:
             coords = self._augs(coords)
@@ -391,7 +486,7 @@ class KITTItemporal(Dataset):
         else:
             coords = coords_original[unique_map][mask]
         
-        return coords, labels, unique_map, inverse_map, mask # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。 # labelsはvis用
+        return coords, labels, unique_map, inverse_map, mask, region_num # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。 # labelsはvis用
     
     
     def _load_ply(self, seq:int, idx:int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -484,8 +579,8 @@ class KITTItemporal(Dataset):
     def _tuple_to_path(self, tup:Tuple[int, int]) -> str:
         return os.path.join(self.args.data_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.ply')
 
-    # def _tuple_to_sp_path(self, tup:Tuple[int, int]) -> str:
-    #     return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
+    def _tuple_to_sp_path(self, tup:Tuple[int, int]) -> str:
+        return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
 
     # def _tuple_to_psuedo_path(self, tup:Tuple[int, int]) -> str:
     #     return os.path.join(self.args.pseudo_label_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.npy')
@@ -499,6 +594,15 @@ class KITTItemporal(Dataset):
     def _tuple_to_patchwork_path(self, tup:Tuple[int, int]) -> str:
         return os.path.join(self.args.patchwork_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.label')
 
+    def _tuple_to_scene_idx(self, tup: Tuple[int, int]) -> int:
+        seq, idx = tup
+        scene_idx = 0
+        for s in self.seq_to_scan_num.keys():
+            if s < seq:
+                scene_idx += self.seq_to_scan_num[s]
+        scene_idx += idx
+        return scene_idx
+    
     def __len__(self):
         return len(self.scene_locates)
     
@@ -542,9 +646,10 @@ class KITTIval(Dataset):
                 for f in np.sort(os.listdir(seq_path)):
                     self.file.append(os.path.join(seq_path, f))
                     self.name.append(os.path.join(seq_path, f)[0:-4].replace(self.args.data_path, ''))
-        # random_indices = random.sample(range(len(self.file)), 10)
-        # self.file = [self.file[i] for i in random_indices]
-        # self.name = [self.name[i] for i in random_indices]
+        if args.eval_select_num < len(self.file):
+            random_indices = random.sample(range(len(self.file)), args.eval_select_num)
+            self.file = [self.file[i] for i in random_indices]
+            self.name = [self.name[i] for i in random_indices]
 
     def augment_coords_to_feats(self, coords, feats, labels=None):
         coords_center = coords.mean(0, keepdims=True)

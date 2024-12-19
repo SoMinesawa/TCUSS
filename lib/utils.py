@@ -9,7 +9,10 @@ from typing import Optional
 from tqdm import tqdm
 import wandb
 from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
-from torchclustermetrics import silhouette
+try:
+    from torchclustermetrics import silhouette
+except :
+    pass
 import time
 import random
 
@@ -508,8 +511,10 @@ def get_kmeans_labels(n_clusters, pcds, max_iter=300):
             print("kmeans-gpu ValueError so use sklearn")
             pcds = pcds.cpu().numpy()
             np.save("kmeans_error.npy", pcds)
-            labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0, n_jobs=5).fit_predict(pcds))
-    
+            try:
+                labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0).fit_predict(pcds))
+            except:
+                labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0, n_jobs=5).fit_predict(pcds))
     lbls = labels.float().squeeze(0).cuda()
     del labels, model, pcds
     torch.cuda.empty_cache()
@@ -548,6 +553,7 @@ def calc_cluster_metrics(X, labels):
     
     return sl_score, db_score, ch_score, t
     
+
 
 
 if __name__ == '__main__':

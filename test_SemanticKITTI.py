@@ -4,7 +4,6 @@ from datasets.SemanticKITTI import KITTItest, cfl_collate_fn_test
 import numpy as np
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
-from sklearn.utils.linear_assignment_ import linear_assignment  # pip install scikit-learn==0.22.2
 from models.fpn import Res16FPN18
 from lib.utils import get_fixclassifier, get_kmeans_labels
 import argparse
@@ -12,6 +11,21 @@ import random
 import os
 import yaml
 from tqdm import tqdm
+
+try:
+    # 古い scikit-learn がある場合（バージョン0.22.2等）
+    from sklearn.utils.linear_assignment_ import linear_assignment
+    def assignment_function(cost_matrix):
+        # sklearn版は直接 (N, 2) で返る
+        return linear_assignment(cost_matrix)
+except ModuleNotFoundError:
+    # scikit-learn版が無い or 新しい scikit-learn（linear_assignment_ が削除済み）の場合
+    from scipy.optimize import linear_sum_assignment
+    def assignment_function(cost_matrix):
+        # scipy版は (row_idx, col_idx) のタプル
+        row_idx, col_idx = linear_sum_assignment(cost_matrix)
+        # 同じ形状 (N, 2) に変形して返す
+        return np.stack([row_idx, col_idx], axis=1)
 ###
 
 data_config = os.path.join('data_prepare', 'semantic-kitti.yaml')
@@ -144,9 +158,7 @@ def eval(epoch, args):
     histogram = np.bincount(sem_num * all_no_ignore_labels[mask] + all_no_ignore_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
     # np.save('histogram.npy', histogram)
     # '''Hungarian Matching'''
-    m = linear_assignment(histogram.max() - histogram)
-    # m = linear_assignment(histogram)
-    print(m)
+    m = assignment_function(histogram.max() - histogram)
     o_Acc = histogram[m[:, 0], m[:, 1]].sum() / histogram.sum()*100.
     m_Acc = np.mean(histogram[m[:, 0], m[:, 1]] / histogram.sum(1))*100
     hist_new = np.zeros((sem_num, sem_num))

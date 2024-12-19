@@ -5,7 +5,7 @@ import time
 import os
 import numpy as np
 import random
-from datasets.SemanticKITTI import KITTItrain, cfl_collate_fn, KITTItemporal, cfl_collate_fn_temporal
+from datasets.SemanticKITTI import KITTItrain, cfl_collate_fn, KITTItemporal, KITTItcuss, cfl_collate_fn_tcuss
 import torch
 import MinkowskiEngine as ME
 import torch.nn.functional as F
@@ -43,7 +43,6 @@ def parse_args():
     ####
     parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
     parser.add_argument('--workers', type=int, default=16, help='how many workers for loading data')
-    parser.add_argument('--temporal_workers', type=int, default=16, help='how many workers for loading data')
     parser.add_argument('--cluster_workers', type=int, default=16, help='how many workers for loading data in clustering')
     parser.add_argument('--seed', type=int, default=2022, help='random seed')
     parser.add_argument('--log-interval', type=int, default=80, help='log interval')
@@ -61,15 +60,13 @@ def parse_args():
     parser.add_argument('--c_rgb', type=float, default=5, help='weight for RGB in clustering primitives')
     parser.add_argument('--c_shape', type=float, default=5, help='weight for PFH in clustering primitives')
     parser.add_argument('--select_num', type=int, default=1500, help='scene number selected in each round')
+    parser.add_argument('--eval_select_num', type=int, default=4071, help='scene number selected in evaluation')
     parser.add_argument('--r_crop', type=float, default=50, help='cropping radius in training')
     parser.add_argument('--cluster_interval', type=int, default=10, help='cluster interval')
     parser.add_argument('--eval_interval', type=int, default=1, help='eval interval')
     parser.add_argument('--silhouette', action='store_true', help='more eval metrics for kmeans')
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--scan_window', type=int, default=12, help='scan window size')
-    parser.add_argument('--contrast_select_num', type=int, default=1500, help='contrastive select number')
-    parser.add_argument('--contrast_lr', type=float, default=0.0002, help='contrastive learning rate')  # TARLでは0.0002
-    parser.add_argument('--run_stage', type=int, default=0, help='Stage to train  0 or 1 or 2 (0=all)')
     parser.add_argument('--lmb', type=float, default=0.5, help='lambda for contrastive learning')
     parser.add_argument('--vis', action='store_true', help='visualize')
     parser.add_argument('--resume', action='store_true', help='resume training')
@@ -79,234 +76,118 @@ def parse_args():
 
 
 def main(args, logger):
-    
-    if (args.resume and args.run_stage == 2):
-        raise ValueError('Cannot resume training in stage 2')
-    
     run = wandb.init(
         project="TCUSS",
-        config={
-            "contrast_select_num": args.contrast_select_num,
-            "contrast_lr": args.contrast_lr,
-            "scan_window": args.scan_window,
-            "select_num": args.select_num,
-            "max_epoch_1": args.max_epoch[0],
-            "max_epoch_2": args.max_epoch[1],
-            "cluster_interval": args.cluster_interval,
-            "batch_size_growsp": args.batch_size[0],
-            "batch_size_tarl": args.batch_size[1],
-            "lr": args.lr,
-            "workers": args.workers,
-            "temporal_workers": args.temporal_workers,
-            "cluster_workers": args.cluster_workers,
-            "run_stage": args.run_stage,
-            "cluster_interval": args.cluster_interval,
-            "resume": args.resume,
-        },
+        config=vars(args),
         name = args.name if args.name else None,
         resume= 'must' if args.resume else 'never',
-        id = args.wandb_run_id if args.resume else None,
-        fork_from= f'x' if args.run_stage==2 else None # TODO: write
+        id = args.wandb_run_id if args.resume else None
     )
     
     model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
+    model_k = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
+    proj_head_q = TransformerProjector(d_model=args.feats_dim, num_layer=1)
+    proj_head_k = TransformerProjector(d_model=args.feats_dim, num_layer=1)
+    predictor = TransformerProjector(d_model=args.feats_dim, num_layer=1)
     model_q = model_q.to("cuda:0")
-    
+    model_k = model_k.to("cuda:0")
+    proj_head_q = proj_head_q.to("cuda:0")
+    proj_head_k = proj_head_k.to("cuda:0")
+    predictor = predictor.to("cuda:0")
+    copy_minkowski_network_params(model_q, model_k)
+    for param_q, param_k in zip(proj_head_q.parameters(), proj_head_k.parameters()):
+        param_k.data.copy_(param_q.data)
+        param_k.requires_grad = False
+        
+    resume_epoch = None
     if args.resume:
         last_epoch = wandb.run.summary.get("epoch", 0)
         resume_epoch = ((last_epoch-1) // args.cluster_interval) * args.cluster_interval + 1
         print(f'Resume from epoch {resume_epoch}')
     
+    
     '''Random select 1500 scans to train, will redo in each round'''
     scene_idx = np.random.choice(19130, args.select_num, replace=False).tolist()## SemanticKITTI totally has 19130 training samples
-    
-    trainset = KITTItrain(args, scene_idx, 'train')
-    train_loader = DataLoader(trainset, batch_size=args.batch_size[0], shuffle=True, collate_fn=cfl_collate_fn(), num_workers=args.workers, pin_memory=True, worker_init_fn=worker_init_fn)
-
+    trainset = KITTItcuss(args)
+    train_loader = DataLoader(trainset, batch_size=args.batch_size[0], shuffle=True, collate_fn=cfl_collate_fn_tcuss(), num_workers=args.workers, pin_memory=True, worker_init_fn=worker_init_fn)
     clusterset = KITTItrain(args, scene_idx, 'train')
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
+    optimizer = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     
-    optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=args.max_epoch[0], steps_per_epoch=len(train_loader))
-    loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).to("cuda:0")
-
-    if args.resume:
-        checkpoint = torch.load(join(args.save_path, f'checkpoint_epoch_{resume_epoch-1}.pth'))
-        model_q.load_state_dict(checkpoint['model_q_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if 'np_random_state' in checkpoint:
-            np.random.set_state(checkpoint['np_random_state'])
-        if 'torch_random_state' in checkpoint:
-            torch.set_rng_state(checkpoint['torch_random_state'])
-        if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
-            torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
+    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=len(train_loader)) for epoch in args.max_epoch]
     
-    classifier = None
-
-    start_grow_epoch = args.max_epoch[0]
-    if args.run_stage == 0 or args.run_stage == 1:
-        # start_grow_epoch = 0
-        '''Train and Cluster'''
-        '''Superpoints will not Grow in 1st Stage'''
-        is_Growing = False
-        for epoch in range(1, args.max_epoch[0]+1):
-            if args.resume and epoch < resume_epoch:
-                continue
-            '''Take 10 epochs as a round'''
-            if (epoch-1) % args.cluster_interval==0:
-                scene_idx = np.random.choice(19130, args.select_num, replace=False)
-                train_loader.dataset.random_select_sample(scene_idx)
-                cluster_loader.dataset.random_select_sample(scene_idx)
-
-                classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
-                
-            train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
-            # 要変更
-            torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
-            torch.save(classifier.state_dict(), join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'))
-            
-            if epoch % args.eval_interval==0:
-                with torch.no_grad():
-                    
-                    o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
-                    logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
-                    d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
-                    d.update(IoU_dict)
-                    wandb.log(d)
-                    if args.silhouette:
-                        # SPCの評価
-                        feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
-                        sp_feats = torch.cat(feats, dim=0)
-                        primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
-                        sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
-                        wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
-
-            # iterations = (epoch+10) * len(train_loader)
-            # if iterations > args.max_iter[0]:
-            #     # start_grow_epoch = epoch
-            #     break
-            if epoch % args.cluster_interval==0:
-                torch.save({
-                    'epoch': epoch,
-                    'model_q_state_dict': model_q.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'np_random_state': np.random.get_state(),
-                    'torch_random_state': torch.get_rng_state(),
-                    'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-                }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
-
-
-    if args.run_stage == 0 or args.run_stage == 2:
-        '''Superpoints will grow in 2nd Stage'''
-        logger.info('#################################')
-        logger.info('### Superpoints Begin Growing ###')
-        logger.info('#################################')
-        
-        if args.run_stage == 2: # TODO: change
-            checkpoint = torch.load(join(args.load_path, 'model_checkpoint_stage1.pth'))
-            start_grow_epoch = args.max_epoch[0]
+    momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
+    
+    is_Growing = False
+    for i, (epoch, scheduler) in enumerate(zip(args.max_epoch, schedulers)):
+        train_loader.dataset.phase = i
+        main_half(args, i, train_loader, cluster_loader, is_Growing, resume_epoch, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer, scheduler, logger)
         is_Growing = True
-        current_growsp = args.growsp_start
-        optimizer = torch.optim.AdamW(model_q.parameters(), lr=args.lr)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(train_loader))
-        loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).to("cuda:0")
+
+
+def main_half(args, phase, train_loader, cluster_loader, is_Growing, resume_epoch, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer, scheduler, logger):
+    start_epoch = 0 if phase==0 else args.max_epoch[0]
+    end_epoch = args.max_epoch[0] if phase==0 else sum(args.max_epoch)
+    for epoch in range(start_epoch+1, end_epoch+1):
+        if args.resume:
+            if epoch < resume_epoch:
+                continue    
+            elif epoch == resume_epoch:
+                checkpoint = torch.load(join(args.save_path, f'checkpoint_epoch_{resume_epoch-1}.pth'))
+                model_q.load_state_dict(checkpoint['model_q_state_dict'])
+                model_k.load_state_dict(checkpoint['model_k_state_dict'])
+                proj_head_q.load_state_dict(checkpoint['proj_head_q_state_dict'])
+                proj_head_k.load_state_dict(checkpoint['proj_head_k_state_dict'])
+                predictor.load_state_dict(checkpoint['predictor_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if f'scheduler_{phase}_state_dict' in checkpoint:
+                    scheduler.load_state_dict(checkpoint[f'scheduler_{phase}_state_dict'])
+                if 'np_random_state' in checkpoint:
+                    np.random.set_state(checkpoint['np_random_state'])
+                if 'torch_random_state' in checkpoint:
+                    torch.set_rng_state(checkpoint['torch_random_state'])
+                if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
+                    torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
+        if (epoch-1) % args.cluster_interval==0:
+            train_loader.dataset.random_select_sample()
+            scene_idx = train_loader.dataset.scene_idx_all
+            cluster_loader.dataset.random_select_sample(scene_idx)
+            classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, args.max_epoch[0], is_Growing)
         
-        # for contrastive learning
-        proj_head_q = TransformerProjector(d_model=args.feats_dim, num_layer=1)
-        model_k = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
-        proj_head_k = TransformerProjector(d_model=args.feats_dim, num_layer=1)
-
-        copy_minkowski_network_params(model_q, model_k)
-
-        for param_q, param_k in zip(proj_head_q.parameters(), proj_head_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
-
-        predictor = TransformerProjector(d_model=args.feats_dim, num_layer=1)
-        proj_head_q = proj_head_q.to("cuda:0")
-        model_k = model_k.to("cuda:0")
-        proj_head_k = proj_head_k.to("cuda:0")
-        predictor = predictor.to("cuda:0")
-        optimizer_contrast = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.contrast_lr, weight_decay=args.weight_decay)
+        train_loader.dataset.kittitemporal.n_clusters = current_growsp
+        train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, classifier, optimizer, epoch, scheduler)
         
-        temporalset = KITTItemporal(args)
-        temporal_loader = DataLoader(temporalset, batch_size=args.batch_size[1], shuffle=True, collate_fn=cfl_collate_fn_temporal(), num_workers=args.temporal_workers, pin_memory=True, worker_init_fn=worker_init_fn)
-        # scheduler_contrast = torch.optim.lr_scheduler.OneCycleLR(optimizer_contrast, max_lr=args.lr, epochs=args.max_epoch[1], steps_per_epoch=len(temporal_loader))
-        scheduler_contrast = None
-        
-        classifier = None
-        if (args.resume and resume_epoch-1 > args.max_epoch[0]): # 2回もloadしないように
-            model_q.load_state_dict(checkpoint['model_q_state_dict']) # 別にしなくてもいいけどね
-            model_k.load_state_dict(checkpoint['model_k_state_dict'])
-            proj_head_q.load_state_dict(checkpoint['proj_head_q_state_dict'])
-            proj_head_k.load_state_dict(checkpoint['proj_head_k_state_dict'])
-            predictor.load_state_dict(checkpoint['predictor_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            optimizer_contrast.load_state_dict(checkpoint['optimizer_contrast_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            # scheduler_contrast.load_state_dict(checkpoint['scheduler_contrast_state_dict'])
-            if 'np_random_state' in checkpoint:
-                np.random.set_state(checkpoint['np_random_state'])
-            if 'torch_random_state' in checkpoint:
-                torch.set_rng_state(checkpoint['torch_random_state'])
-            if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
-                torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
-
-        for epoch in range(1, args.max_epoch[1]+1):
-            epoch += start_grow_epoch
-            if args.resume and epoch < resume_epoch:
-                continue
-
-            '''Take 10 epochs as a round'''
-            if (epoch-1) % args.cluster_interval==0:
-                scene_idx = np.random.choice(19130, args.select_num, replace=False)
-                train_loader.dataset.random_select_sample(scene_idx)
-                cluster_loader.dataset.random_select_sample(scene_idx)
-                temporal_loader.dataset._random_select_samples()
-
-                classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, start_grow_epoch, is_Growing)
-                wandb.log({'epoch': epoch, 'current_growsp': current_growsp})
-                
-            train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer_contrast, epoch, scheduler_contrast, current_growsp)
-            train(train_loader, logger, model_q, optimizer, loss, epoch, scheduler, classifier)
-            momentum_update_model(model_q, model_k)
+        # eval
+        if epoch % args.eval_interval==0:
             torch.save(model_q.state_dict(), join(args.save_path,  'model_' + str(epoch) + '_checkpoint.pth'))
             torch.save(classifier.state_dict(), join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth'))
-
-            if epoch% args.eval_interval==0:
-                with torch.no_grad():
-                    o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
-                    logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
-                    d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
-                    d.update(IoU_dict)
-                    wandb.log(d)
-                    
-                    if args.silhouette:
-                        # SPCの評価
-                        feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
-                        sp_feats = torch.cat(feats, dim=0)
-                        primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
-                        sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
-                        wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
-
-            if epoch % args.cluster_interval==0:
-                torch.save({
-                    'epoch': epoch,
-                    'model_q_state_dict': model_q.state_dict(),
-                    'model_k_state_dict': model_k.state_dict(),
-                    'proj_head_q_state_dict': proj_head_q.state_dict(),
-                    'proj_head_k_state_dict': proj_head_k.state_dict(),
-                    'predictor_state_dict': predictor.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'optimizer_contrast_state_dict': optimizer_contrast.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    # 'scheduler_contrast_state_dict': scheduler_contrast.state_dict(),
-                    'np_random_state': np.random.get_state(),
-                    'torch_random_state': torch.get_rng_state(),
-                    'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-                }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
+            with torch.no_grad():
+                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
+                logger.info('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
+                d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
+                d.update(IoU_dict)
+                wandb.log(d)
+                if args.silhouette:
+                    # SPCの評価
+                    feats, *_ = get_kittisp_feature(args, cluster_loader, model_q, current_growsp, epoch)
+                    sp_feats = torch.cat(feats, dim=0)
+                    primitive_labels = get_kmeans_labels(args.primitive_num, sp_feats).to('cpu').detach().numpy() # Semantic Primitive Clustering (SPC)
+                    sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
+                    wandb.log({'epoch': epoch, 'SPC/Silhouette': sl_score, 'SPC/Davies-Bouldin': db_score, 'SPC/Calinski-Harabasz': ch_score, 'SPC/time': t})
+        if epoch % args.cluster_interval==0:
+            torch.save({
+                'epoch': epoch,
+                'model_q_state_dict': model_q.state_dict(),
+                'model_k_state_dict': model_k.state_dict(),
+                'proj_head_q_state_dict': proj_head_q.state_dict(),
+                'proj_head_k_state_dict': proj_head_k.state_dict(),
+                'predictor_state_dict': predictor.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                f'scheduler_{phase}_state_dict': scheduler.state_dict(),
+                'np_random_state': np.random.get_state(),
+                'torch_random_state': torch.get_rng_state(),
+                'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            }, join(args.save_path, f'checkpoint_epoch_{epoch}.pth'))
 
 
 def cluster(args, logger, cluster_loader:DataLoader, model_q:Res16FPNBase, epoch:int, start_grow_epoch:int=None, is_Growing:bool=False):
@@ -374,34 +255,59 @@ def cluster(args, logger, cluster_loader:DataLoader, model_q:Res16FPNBase, epoch
     return classifier.to("cuda:0"), current_growsp
 
 
-def train_contrast(args, logger, temporal_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, optimizer, epoch, scheduler, current_growsp):
-    temporal_loader.dataset.n_clusters = current_growsp
+def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, classifier, optimizer, epoch, scheduler):
     model_q.train()
     model_k.train()
     proj_head_q.train()
     proj_head_k.train()
     predictor.train()
-    loss_display = 0.0
-    time_curr = time.time()
-    for data in tqdm(temporal_loader, desc='Contrast Epoch: {}'.format(epoch), total=len(temporal_loader)):
-
-        coords_q, coords_k, segs_q, segs_k = data
-
-        loss = train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor)
-        loss += train_contrast_half(coords_k, coords_q, segs_k, segs_q, model_q, model_k, proj_head_q, proj_head_k, predictor)
+    loss_growsp_display = 0.0
+    loss_tarl_display = 0.0
+    for data in tqdm(train_loader, desc='Train Epoch: {}'.format(epoch), total=len(train_loader)):
+        growsp_t1_data, growsp_t2_data, tarl_data = data
+        # growsp用の関数作るか、dataとmodel_qだけ入力して、lossを計算する
+        growsp_t1_loss = train_growsp(args, growsp_t1_data, model_q, classifier)
+        growsp_t2_loss = train_growsp(args, growsp_t2_data, model_q, classifier)
+        if tarl_data is not None:
+            tarl_loss = train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor)
+        else:
+            tarl_loss = torch.tensor(0.0, device="cuda")
+        growsp_loss = growsp_t1_loss + growsp_t2_loss
+        loss = growsp_loss + (args.lmb * tarl_loss)
         
+        loss_growsp_display += growsp_loss.item()
+        loss_tarl_display += tarl_loss.item()
         optimizer.zero_grad()
-        loss_display += loss.item()
-        loss = loss * args.lmb
         loss.backward()
         optimizer.step()
-        wandb.log({'epoch': epoch, 'contrast_lr': optimizer.param_groups[0]['lr']})
-        # scheduler.step()
+        wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr']})
+        if scheduler is not None:
+            scheduler.step()
         momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
-
         torch.cuda.empty_cache()
         torch.cuda.synchronize(torch.device("cuda"))
-    wandb.log({'epoch': epoch, 'loss_contrast': loss_display, 'loss_contrast x lmb': loss_display*args.lmb})
+        
+    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_growsp x lmb': loss_growsp_display*args.lmb})
+
+
+def train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor):
+    coords_q, coords_k, segs_q, segs_k = tarl_data
+    loss = train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor)
+    loss += train_contrast_half(coords_k, coords_q, segs_k, segs_q, model_q, model_k, proj_head_q, proj_head_k, predictor)
+    return loss
+    
+
+def train_growsp(args, growsp_data, model_q, classifier):
+    loss = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).to("cuda:0")
+    coords, pseudo_labels, inds = growsp_data
+    in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
+    feats = model_q(in_field)
+    feats = feats[inds.long()]
+    feats = F.normalize(feats, dim=-1)
+    pseudo_labels_comp = pseudo_labels.long().to("cuda:0")
+    logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
+    loss_sem = loss(logits * 5, pseudo_labels_comp).mean()
+    return loss_sem
 
 
 def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor):
@@ -428,6 +334,7 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
 
     # プレディクターに入力
     pred_feats_q = predictor(proj_feats_q, enc_mask=mask_q)
+    pred_feats_q = F.normalize(pred_feats_q, dim=-1)
 
     with torch.no_grad():
         in_field_k = ME.TensorField(coords_k[:, 1:] * args.voxel_size, coords_k, device=0)
@@ -450,60 +357,13 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
 
         # プロジェクションヘッドに入力
         proj_feats_k = proj_head_k(padded_seg_feats_k, enc_mask=mask_k)
-
-        # プレディクターに入力
-        pred_feats_k = predictor(proj_feats_k, enc_mask=mask_k)
+        proj_feats_k = F.normalize(proj_feats_k, dim=-1)
 
     # ロスを計算
-    loss = calc_info_nce(pred_feats_q, pred_feats_k, mask_q, mask_k)
+    loss = calc_info_nce(pred_feats_q, proj_feats_k, mask_q, mask_k)
     torch.cuda.empty_cache()
     return loss
-
-
-def train(train_loader, logger, model_q, optimizer=None, loss=None, epoch=None, scheduler=None, classifier=None):
-    # train_loader.dataset.mode = 'train'
-    model_q.train()
-    loss_display = 0.0
-    time_curr = time.time()
-    for batch_idx, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch), total=len(train_loader)):
-        iteration = (epoch - 1) * len(train_loader) + batch_idx+1#从1开始
-
-        coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index = data
-        if args.vis:
-            print('coords', coords)
-        in_field = ME.TensorField(coords[:, 1:]*args.voxel_size, coords, device=0)
-        feats = model_q(in_field)
-
-        feats = feats[inds.long()]
-        feats = F.normalize(feats, dim=-1)
-        #
-        pseudo_labels_comp = pseudo_labels.long().to("cuda:0")
-        logits = F.linear(F.normalize(feats), F.normalize(classifier.weight))
-        loss_sem = loss(logits * 5, pseudo_labels_comp).mean()
-
-        loss_display += loss_sem.item()
-        optimizer.zero_grad()
-        # loss_sem /= 5
-        loss_sem.backward()
-        # if x:
-        optimizer.step()
-        wandb.log({'epoch': epoch, 'lr': optimizer.param_groups[0]['lr']})
-        scheduler.step()
-
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(torch.device("cuda"))
-
-        if (batch_idx+1) % args.log_interval == 0:
-            time_used = time.time() - time_curr
-            # loss_display /= args.log_interval # TODO: ここで割るのは合っているか？
-            logger.info(
-                'Train Epoch: {} [{}/{} ({:.0f}%)]{}, Loss: {:.10f}, lr: {:.3e}, Elapsed time: {:.4f}s({} iters)'.format(
-                    epoch, (batch_idx+1), len(train_loader), 100. * (batch_idx+1) / len(train_loader),
-                    iteration, loss_display, scheduler.get_lr()[0], time_used, args.log_interval))
-            time_curr = time.time()
-            # loss_display = 0
-    wandb.log({'epoch': epoch, 'train_loss': loss_display})
-        
+    
 
 from torch.optim.lr_scheduler import LambdaLR
 
