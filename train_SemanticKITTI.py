@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=16, help='how many workers for loading data')
     parser.add_argument('--cluster_workers', type=int, default=16, help='how many workers for loading data in clustering')
     parser.add_argument('--seed', type=int, default=2022, help='random seed')
-    parser.add_argument('--log-interval', type=int, default=80, help='log interval')
+    parser.add_argument('--log-interval', type=int, default=1000000, help='log interval')
     parser.add_argument('--batch_size', type=int, nargs='+', default=[16, 16], help='batchsize in training[GrowSP, TARL]')
     parser.add_argument('--voxel_size', type=float, default=0.15, help='voxel size in SparseConv')
     parser.add_argument('--input_dim', type=int, default=3, help='network input dimension')### 6 for XYZGB
@@ -82,7 +82,8 @@ def main(args, logger):
         config=vars(args),
         name = args.name if args.name else None,
         resume= 'must' if args.resume else 'never',
-        id = args.wandb_run_id if args.resume else None
+        id = args.wandb_run_id if args.resume else None,
+        settings=wandb.Settings(code_dir=".")
     )
     
     model_q = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args)
@@ -115,7 +116,7 @@ def main(args, logger):
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
     optimizer = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     
-    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=len(train_loader)//args.accum_step) for epoch in args.max_epoch]
+    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=(len(train_loader)//args.accum_step)+1) for epoch in args.max_epoch]
     
     momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
     
@@ -271,15 +272,15 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
         growsp_t1_loss = train_growsp(args, growsp_t1_data, model_q, classifier)
         growsp_t2_loss = train_growsp(args, growsp_t2_data, model_q, classifier)
         if tarl_data is not None:
-            tarl_loss = train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor)
+            tarl_loss = train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor) / args.accum_step
         else:
             tarl_loss = torch.tensor(0.0, device="cuda")
-        growsp_loss = growsp_t1_loss + growsp_t2_loss
+        growsp_loss = (growsp_t1_loss + growsp_t2_loss) / args.accum_step
         loss = growsp_loss + (args.lmb * tarl_loss)
         loss_growsp_display += growsp_loss.item()
         loss_tarl_display += tarl_loss.item()
         loss.backward()
-        if i % args.accum_step == 0:
+        if (i % args.accum_step == 0) or (i == len(train_loader)-1):
             optimizer.step()
             wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr']})
             if scheduler is not None:
@@ -362,7 +363,7 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
 
     # ロスを計算
     loss = calc_info_nce(pred_feats_q, proj_feats_k, mask_q, mask_k)
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
     return loss
     
 
