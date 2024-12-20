@@ -321,7 +321,7 @@ class KITTItrain(Dataset):
         else:
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
-            file_path = os.path.join(self.args.pseudo_label_path, scene_name + '.npy')
+            file_path = os.path.join(self.args.pseudo_label_path, scene_name.lstrip("/") + '.npy')
             pseudo = np.array(np.load(file_path), dtype=np.long)
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index

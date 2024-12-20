@@ -72,6 +72,7 @@ def parse_args():
     parser.add_argument('--resume', action='store_true', help='resume training')
     parser.add_argument('--wandb_run_id', type=str, help='wandb run id')
     parser.add_argument('--weight_decay', type=float, default=1e-2, help='weight decay')
+    parser.add_argument('--accum_step', type=int, default=1, help='gradient accumulation step')
     return parser.parse_args()
 
 
@@ -114,7 +115,7 @@ def main(args, logger):
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
     optimizer = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     
-    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=len(train_loader)) for epoch in args.max_epoch]
+    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=len(train_loader)//args.accum_step) for epoch in args.max_epoch]
     
     momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
     
@@ -261,9 +262,10 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
     proj_head_q.train()
     proj_head_k.train()
     predictor.train()
+    optimizer.zero_grad()
     loss_growsp_display = 0.0
     loss_tarl_display = 0.0
-    for data in tqdm(train_loader, desc='Train Epoch: {}'.format(epoch), total=len(train_loader)):
+    for i, data in tqdm(enumerate(train_loader), desc='Train Epoch: {}'.format(epoch), total=len(train_loader)):
         growsp_t1_data, growsp_t2_data, tarl_data = data
         # growsp用の関数作るか、dataとmodel_qだけ入力して、lossを計算する
         growsp_t1_loss = train_growsp(args, growsp_t1_data, model_q, classifier)
@@ -274,19 +276,18 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
             tarl_loss = torch.tensor(0.0, device="cuda")
         growsp_loss = growsp_t1_loss + growsp_t2_loss
         loss = growsp_loss + (args.lmb * tarl_loss)
-        
         loss_growsp_display += growsp_loss.item()
         loss_tarl_display += tarl_loss.item()
-        optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
-        wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr']})
-        if scheduler is not None:
-            scheduler.step()
-        momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(torch.device("cuda"))
-        
+        if i % args.accum_step == 0:
+            optimizer.step()
+            wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr']})
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+            momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(torch.device("cuda"))
     wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_growsp x lmb': loss_growsp_display*args.lmb})
 
 
