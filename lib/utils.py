@@ -419,70 +419,41 @@ def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
 
 
 @torch.no_grad()
-def copy_minkowski_network_params(source_model, target_model):
-    # モデルが同じ構造を持っていることを確認
-    assert type(source_model) == type(target_model), "モデルの型が一致しません"
-
-    # ソースモデルの状態辞書を取得
-    source_state_dict = source_model.state_dict()
-
-    # ターゲットモデルの状態辞書を取得
-    target_state_dict = target_model.state_dict()
-
-    # パラメータをコピー
-    for name, param in source_state_dict.items():
-        if name in target_state_dict:
-            if isinstance(param, ME.SparseTensor):
-                # SparseTensorの場合、特別な処理が必要
-                target_state_dict[name] = ME.SparseTensor(
-                    features=param.F.clone().detach(),
-                    coordinates=param.C.clone().detach(),
-                    tensor_stride=param.tensor_stride
-                )
-            else:
-                # 通常のテンソルの場合、単純にコピー
-                target_state_dict[name].copy_(param.detach())
-
-    # 更新された状態辞書をターゲットモデルにロード
-    target_model.load_state_dict(target_state_dict)
-    return source_model, target_model
-
+def copy_minkowski_network_params(source_model: nn.Module, target_model: nn.Module):
+    """
+    source_model のパラメータを target_model に丸ごとコピーする.
+    MinkowskiEngine であっても, 学習パラメータ (weight/bias) は普通の torch.Tensor なので、
+    SparseTensor を無視して, 単純にパラメータをコピーすればOK.
+    """
+    for p_src, p_tgt in zip(source_model.parameters(), target_model.parameters()):
+        p_tgt.data.copy_(p_src.data)
 
 @torch.no_grad()
-def momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k, momentum:int=0.999):
+def momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k, momentum=0.999):
     """
-    Momentum update of the key encoder
+    MoCoスタイルのMomentum Update:
+      - model_qの学習パラメータを参照し,
+      - model_kのパラメータを momentum * k + (1 - momentum) * q で更新する
+      - proj_head_q, proj_head_k についても同様
     """
+    # model本体 (model_q, model_k) のパラメータ更新
     momentum_update_model(model_q, model_k, momentum)
+    # proj_head (proj_head_q, proj_head_k) のパラメータ更新
+    momentum_update_model(proj_head_q, proj_head_k, momentum)
 
-    for param_q, param_k in zip(proj_head_q.parameters(), proj_head_k.parameters()):
-        param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
-        
-        
+
 @torch.no_grad()
-def momentum_update_model(model_q, model_k, momentum:int=0.999):
+def momentum_update_model(model_q: nn.Module, model_k: nn.Module, momentum: float = 0.999):
     """
-    Momentum update of the key encoder
+    model_q の学習パラメータを使って model_k をMomentum Updateする
+    ただし, SparseTensor など学習パラメータでないものは更新しない.
     """
-    model_q_dict = model_q.state_dict()
-    model_k_dict = model_k.state_dict()
-
-    for name, param_q in model_q_dict.items():
-        if name in model_k_dict:
-            if isinstance(param_q, ME.SparseTensor):
-                # SparseTensorの場合、特別な処理が必要
-                param_k = model_k_dict[name]
-                new_F = param_k.F * momentum + param_q.F.detach() * (1 - momentum)
-                model_k_dict[name] = ME.SparseTensor(
-                    features=new_F,
-                    coordinates=param_k.C, # coordinatesは共通でいいのか？
-                    tensor_stride=param_k.tensor_stride
-                )
-            else:
-                # 通常のテンソルの場合、単純に更新
-                model_k_dict[name] = model_k_dict[name] * momentum + param_q * (1 - momentum)
-
-    model_k.load_state_dict(model_k_dict)
+    # model_q.parameters() と model_k.parameters() を順番にたどる
+    for param_q, param_k in zip(model_q.parameters(), model_k.parameters()):
+        # param_q, param_k はともに nn.Parameter (torch.Tensor)
+        # MinkowskiEngineのMinkowskiConvolutionなどでも weight/bias はTorch Tensor
+        # SparseTensorはそもそも model_q.parameters() には含まれないはず
+        param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
     
 
 def get_kmeans_labels(n_clusters, pcds, max_iter=300):
@@ -508,9 +479,9 @@ def get_kmeans_labels(n_clusters, pcds, max_iter=300):
         # distances = torch.cdist(pcds, centroids)
         # labels = torch.argmin(distances, dim=1)
         except ValueError:
-            print("kmeans-gpu ValueError so use sklearn")
+            # print("kmeans-gpu ValueError so use sklearn")
             pcds = pcds.cpu().numpy()
-            np.save("kmeans_error.npy", pcds)
+            # np.save("kmeans_error.npy", pcds)
             try:
                 labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0).fit_predict(pcds))
             except:

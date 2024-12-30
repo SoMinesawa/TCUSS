@@ -200,8 +200,8 @@ class KMeans(nn.Module):
             return closest, centroids
         else:
             missing_clusters = set(range(self.n_clusters)) - set(unique_clusters.cpu().numpy())
-            print(f"Warning: Only {len(unique_clusters)} clusters found out of {self.n_clusters}")
-            print(f"Missing clusters: {sorted(missing_clusters)}")
+            # print(f"Warning: Only {len(unique_clusters)} clusters found out of {self.n_clusters}")
+            # print(f"Missing clusters: {sorted(missing_clusters)}")
             raise ValueError("KMeans failed to find all clusters")
 
 

@@ -322,6 +322,8 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
         scene_feats_q = feats_q[mask]
         scene_seg_feats_q = compute_segment_feats(scene_feats_q, segs_q[int(batch_id)].to("cuda:0"))
         seg_feats_q_list.append(scene_seg_feats_q)
+        # point_cloud_data = torch.cat((coords_q[mask][:, 1:], segs_q[int(batch_id)].unsqueeze(1)), dim=1)
+        # np.savetxt("coords_q.csv", point_cloud_data.cpu().detach().numpy(), delimiter=",")
 
     # パディングを適用してテンソルの形状を統一
     padded_seg_feats_q = torch.nn.utils.rnn.pad_sequence(seg_feats_q_list, batch_first=True, padding_value=0.0)
@@ -348,6 +350,8 @@ def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, pr
             scene_feats_k = feats_k[mask]
             scene_seg_feats_k = compute_segment_feats(scene_feats_k, segs_k[int(batch_id)].to("cuda:0"))
             seg_feats_k_list.append(scene_seg_feats_k)
+            # point_cloud_data = torch.cat((coords_k[mask][:, 1:], segs_k[int(batch_id)].unsqueeze(1)), dim=1)
+            # np.savetxt("coords_k.csv", point_cloud_data.cpu().detach().numpy(), delimiter=",")
 
         # パディングを適用してテンソルの形状を統一
         padded_seg_feats_k = torch.nn.utils.rnn.pad_sequence(seg_feats_k_list, batch_first=True, padding_value=0.0)
