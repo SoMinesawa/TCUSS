@@ -20,6 +20,7 @@ import wandb
 import torch.multiprocessing as multiprocessing
 from lib.helper_ply import read_ply
 from tqdm import tqdm
+from math import ceil
 
 
 def parse_args():
@@ -116,7 +117,7 @@ def main(args, logger):
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
     optimizer = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     
-    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=(len(train_loader)//args.accum_step)+1) for epoch in args.max_epoch]
+    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=ceil(len(train_loader) / args.accum_step)) for epoch in args.max_epoch]
     
     momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
     
@@ -280,7 +281,7 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
         loss_growsp_display += growsp_loss.item()
         loss_tarl_display += tarl_loss.item()
         loss.backward()
-        if (i % args.accum_step == 0) or (i == len(train_loader)-1):
+        if ((i+1) % args.accum_step == 0) or (i == len(train_loader)-1):
             optimizer.step()
             wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr']})
             if scheduler is not None:
@@ -289,7 +290,7 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
             momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
-    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_growsp x lmb': loss_growsp_display*args.lmb})
+    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_tarl x lmb': loss_tarl_display*args.lmb})
 
 
 def train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor):
@@ -392,7 +393,10 @@ class PolyLR(LambdaStepLR):
     super(PolyLR, self).__init__(optimizer, lambda s: (1 - s / (max_iter + 1))**power, last_step)
 
 def worker_init_fn(worker_id):
-    gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択(GPU0はmodel用)
+    if torch.cuda.device_count()-1 == 0:
+        gpu_id = 0
+    else:
+        gpu_id = ( worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択(GPU0はmodel用)
     torch.cuda.set_device(gpu_id)
     # WorkerごとにユニークなシードをNumPyに設定
     worker_seed = torch.initial_seed() % 2**32
