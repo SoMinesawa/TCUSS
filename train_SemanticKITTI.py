@@ -158,7 +158,7 @@ def main_half(args, phase, train_loader, cluster_loader, is_Growing, resume_epoc
             classifier, current_growsp = cluster(args, logger, cluster_loader, model_q, epoch, args.max_epoch[0], is_Growing)
         
         train_loader.dataset.kittitemporal.n_clusters = current_growsp
-        train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, classifier, optimizer, epoch, scheduler)
+        train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, classifier, optimizer, epoch, scheduler, current_growsp)
         
         # eval
         if epoch % args.eval_interval==0:
@@ -258,7 +258,7 @@ def cluster(args, logger, cluster_loader:DataLoader, model_q:Res16FPNBase, epoch
     return classifier.to("cuda:0"), current_growsp
 
 
-def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, classifier, optimizer, epoch, scheduler):
+def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predictor, classifier, optimizer, epoch, scheduler, current_growsp):
     model_q.train()
     model_k.train()
     proj_head_q.train()
@@ -273,7 +273,7 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
         growsp_t1_loss = train_growsp(args, growsp_t1_data, model_q, classifier)
         growsp_t2_loss = train_growsp(args, growsp_t2_data, model_q, classifier)
         if tarl_data is not None:
-            tarl_loss = train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor) / args.accum_step
+            tarl_loss = train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp) / args.accum_step
         else:
             tarl_loss = torch.tensor(0.0, device="cuda")
         growsp_loss = (growsp_t1_loss + growsp_t2_loss) / args.accum_step
@@ -293,10 +293,10 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
     wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_tarl x lmb': loss_tarl_display*args.lmb})
 
 
-def train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor):
+def train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp):
     coords_q, coords_k, segs_q, segs_k = tarl_data
-    loss = train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor)
-    loss += train_contrast_half(coords_k, coords_q, segs_k, segs_q, model_q, model_k, proj_head_q, proj_head_k, predictor)
+    loss = train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp)
+    loss += train_contrast_half(coords_k, coords_q, segs_k, segs_q, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp)
     return loss
     
 
@@ -313,61 +313,59 @@ def train_growsp(args, growsp_data, model_q, classifier):
     return loss_sem
 
 
-def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor):
+def train_contrast_half(coords_q, coords_k, segs_q, segs_k, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp):
     in_field_q = ME.TensorField(coords_q[:, 1:] * args.voxel_size, coords_q, device=0)
+    # checkpoint = torch.load(join(f'/mnt/urashima/users/minesawa/semantickitti/seg_feat/checkpoint_epoch_220.pth'))
+    # checkpoint = torch.load(join(f'/mnt/urashima/users/minesawa/semantickitti/growsp_model/model_350_checkpoint.pth'))
+    # model_q.load_state_dict(checkpoint['model_q_state_dict'])
+    # model_q.load_state_dict(checkpoint)
     feats_q = model_q(in_field_q)
     batch_ids = torch.unique(coords_q[:, 0])
-    seg_feats_q_list = []
+    seg_feats_q_list, mask_q_list = [], []
     for batch_id in batch_ids:
         mask = coords_q[:, 0] == batch_id
         scene_feats_q = feats_q[mask]
-        scene_seg_feats_q = compute_segment_feats(scene_feats_q, segs_q[int(batch_id)].to("cuda:0"))
+        scene_segs_q = segs_q[int(batch_id)].to("cuda:0")
+        scene_seg_feats_q, mask_q = compute_segment_feats(scene_feats_q, scene_segs_q, max_seg_num=current_growsp)
         seg_feats_q_list.append(scene_seg_feats_q)
+        mask_q_list.append(mask_q)
         # point_cloud_data = torch.cat((coords_q[mask][:, 1:], segs_q[int(batch_id)].unsqueeze(1)), dim=1)
         # np.savetxt("coords_q.csv", point_cloud_data.cpu().detach().numpy(), delimiter=",")
 
-    # パディングを適用してテンソルの形状を統一
-    padded_seg_feats_q = torch.nn.utils.rnn.pad_sequence(seg_feats_q_list, batch_first=True, padding_value=0.0)
-    lengths_q = [x.size(0) for x in seg_feats_q_list]
-    max_seg_num = max(lengths_q)
-
-    # マスクを作成
-    mask_q = torch.arange(max_seg_num).expand(len(lengths_q), max_seg_num).to(padded_seg_feats_q.device) >= torch.tensor(lengths_q).unsqueeze(1).to(padded_seg_feats_q.device)
-
+    padded_seg_feats_q = torch.stack(seg_feats_q_list, dim=0)
+    batch_mask_q = torch.stack(mask_q_list, dim=0)
+    
     # プロジェクションヘッドに入力
-    proj_feats_q = proj_head_q(padded_seg_feats_q, enc_mask=mask_q)
+    proj_feats_q = proj_head_q(padded_seg_feats_q, enc_mask=batch_mask_q)
 
     # プレディクターに入力
-    pred_feats_q = predictor(proj_feats_q, enc_mask=mask_q)
+    pred_feats_q = predictor(proj_feats_q, enc_mask=batch_mask_q)
     pred_feats_q = F.normalize(pred_feats_q, dim=-1)
 
     with torch.no_grad():
         in_field_k = ME.TensorField(coords_k[:, 1:] * args.voxel_size, coords_k, device=0)
         feats_k = model_k(in_field_k)
         batch_ids = torch.unique(coords_k[:, 0])
-        seg_feats_k_list = []
+        seg_feats_k_list , mask_k_list = [], []
         for batch_id in batch_ids:
             mask = coords_k[:, 0] == batch_id
             scene_feats_k = feats_k[mask]
-            scene_seg_feats_k = compute_segment_feats(scene_feats_k, segs_k[int(batch_id)].to("cuda:0"))
+            scene_segs_k = segs_k[int(batch_id)].to("cuda:0")
+            scene_seg_feats_k, mask_k = compute_segment_feats(scene_feats_k, scene_segs_k, max_seg_num=current_growsp)
             seg_feats_k_list.append(scene_seg_feats_k)
+            mask_k_list.append(mask_k)
             # point_cloud_data = torch.cat((coords_k[mask][:, 1:], segs_k[int(batch_id)].unsqueeze(1)), dim=1)
             # np.savetxt("coords_k.csv", point_cloud_data.cpu().detach().numpy(), delimiter=",")
 
-        # パディングを適用してテンソルの形状を統一
-        padded_seg_feats_k = torch.nn.utils.rnn.pad_sequence(seg_feats_k_list, batch_first=True, padding_value=0.0)
-        lengths_k = [x.size(0) for x in seg_feats_k_list]
-        max_seg_num_k = max(lengths_k)
-
-        # マスクを作成
-        mask_k = torch.arange(max_seg_num_k).expand(len(lengths_k), max_seg_num_k).to(padded_seg_feats_k.device) >= torch.tensor(lengths_k).unsqueeze(1).to(padded_seg_feats_k.device)
+        padded_seg_feats_k = torch.stack(seg_feats_k_list, dim=0)
+        batch_mask_k = torch.stack(mask_k_list, dim=0)
 
         # プロジェクションヘッドに入力
-        proj_feats_k = proj_head_k(padded_seg_feats_k, enc_mask=mask_k)
+        proj_feats_k = proj_head_k(padded_seg_feats_k, enc_mask=batch_mask_k)
         proj_feats_k = F.normalize(proj_feats_k, dim=-1)
 
     # ロスを計算
-    loss = calc_info_nce(pred_feats_q, proj_feats_k, mask_q, mask_k)
+    loss = calc_info_nce(pred_feats_q, proj_feats_k, batch_mask_q, batch_mask_k)
     # torch.cuda.empty_cache()
     return loss
     

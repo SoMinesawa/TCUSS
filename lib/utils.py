@@ -5,7 +5,7 @@ import numpy as np
 import os
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
-from typing import Optional
+from typing import Optional, Tuple
 from tqdm import tqdm
 import wandb
 from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
@@ -350,39 +350,54 @@ def compute_hist(normal, bins=10, min=-1, max=1):
     return hist
     
 
-def compute_segment_feats(feats, segs):
-    
-    mask = segs != -1
-    feats = feats[mask]
-    segs = segs[mask]
-    
-    # segsのユニークな要素とそのインデックスを取得
-    unique_segs, inverse_indices = torch.unique(segs, return_inverse=True)
+def compute_segment_feats(feats: torch.Tensor,
+                          segs: torch.Tensor,
+                          max_seg_num: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    各セグメントごとの特徴量を平均し、固定サイズのテンソルを返す。
+    パディング部分のマスクも同時に返す。
 
-    # segsのユニークな数（k）
-    seg_num = unique_segs.size(0)
-    
-    # 各セグメントに対応するfeatsの総和を保持するテンソルを初期化 (k, D)
-    seg_feats_sum = torch.zeros(seg_num, feats.size(1), device=feats.device)
-    
-    # 各セグメントに対応する要素数をカウントするためのテンソルを初期化 (k,)
-    seg_counts = torch.zeros(seg_num, device=feats.device)
-    
-    # seg_feats_sumにfeatsを各セグメントごとに足し合わせる
-    seg_feats_sum = seg_feats_sum.index_add(0, inverse_indices.squeeze(), feats)
-    
-    # 各セグメントごとの要素数をカウント
-    seg_counts = seg_counts.index_add(0, inverse_indices.squeeze(), torch.ones_like(segs, dtype=torch.float))
-    
-    # seg_feats_sumをセグメントごとの要素数で割って平均を計算
-    seg_feats = seg_feats_sum / seg_counts[:, None]
-    
-    return seg_feats
+    Args:
+        feats: 形状 [N, D] の特徴量テンソル (N: ポイント数, D: 特徴次元)
+        segs: 形状 [N] のセグメントIDテンソル (-1 は無効)
+        max_seg_num: 出力するセグメント数の最大値 (例: current_growsp)
+
+    Returns:
+        seg_feats: 形状 [max_seg_num, D] のテンソル
+            存在するセグメントIDの位置に平均特徴量が入り、
+            存在しないセグメントIDの位置は 0 で埋められる。
+        mask: 形状 [max_seg_num] の boolean テンソル
+            セグメントが存在する位置は True、存在しない位置は False。
+    """
+    # 1. 無効データ (-1) を除外
+    valid_mask = segs != -1
+    feats = feats[valid_mask]
+    segs = segs[valid_mask]
+
+    # 2. 初期化
+    seg_feats_sum = torch.zeros(max_seg_num, feats.shape[1], device=feats.device)
+    seg_counts = torch.zeros(max_seg_num, device=feats.device)
+
+    # 3. 特徴量の合計とセグメントごとのカウント
+    seg_feats_sum.index_add_(0, segs, feats)
+    seg_counts.index_add_(0, segs, torch.ones_like(segs, dtype=torch.float, device=feats.device))
+
+    # 4. 平均計算 (ゼロ除算を防ぐ)
+    seg_feats = torch.where(
+        seg_counts.unsqueeze(-1) > 0,
+        seg_feats_sum / seg_counts.unsqueeze(-1),
+        torch.zeros_like(seg_feats_sum)
+    )
+
+    # 5. 存在しないセグメントのマスク
+    mask = seg_counts <= 0
+
+    return seg_feats, mask
 
 
 def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
-    batch_size, max_len_q, dim = seg_feats_q.size()
-    _, max_len_k, _ = seg_feats_k.size()
+    assert seg_feats_q.size() == seg_feats_k.size()
+    batch_size, seg_num, dim = seg_feats_q.size()
     
     # マスクを展開してブール型に変換（パディング部分がFalse、データ部分がTrue）
     mask_q = ~mask_q  # パディング部分がFalse、データ部分がTrue
@@ -391,31 +406,41 @@ def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
     losses = []
     for i in range(batch_size):
         # 有効なシーケンス長を取得 ok
-        valid_feats_q = seg_feats_q[i][mask_q[i, :max_len_q]]
-        valid_feats_k = seg_feats_k[i][mask_k[i, :max_len_k]]
+        valid_feats_q = seg_feats_q[i][mask_q[i]]
+        valid_feats_k = seg_feats_k[i][mask_k[i]]
         
         # コサイン類似度の計算 ok
         sims = F.cosine_similarity(valid_feats_q.unsqueeze(1), valid_feats_k.unsqueeze(0), dim=2) / temperature
+        torch.save(sims, f"tmp/data/sims_220_{i}.pth")
+        # torch.save(sims, "tmp/data/sims_450_growsp.pth")
         
-        # ラベルを作成
-        num_pos = min(valid_feats_q.size(0), valid_feats_k.size(0))
-        labels = torch.arange(num_pos).to(sims.device)
+        labels_row = create_label(mask_q[i], mask_k[i], device=sims.device)
+        labels_col = create_label(mask_k[i], mask_q[i], device=sims.device)
         
         # 損失の計算
-        if num_pos > 0:
-            loss_row = F.cross_entropy(sims[:num_pos], labels)
-            loss_col = F.cross_entropy(sims.t()[:num_pos], labels)
-            loss = (loss_row + loss_col) / 2
-            losses.append(loss)
-        else:
-            # 有効なデータがない場合は損失をゼロとする
-            losses.append(torch.tensor(0.0, device=sims.device))
+        loss_row = F.cross_entropy(sims, labels_row, ignore_index=-100)
+        loss_col = F.cross_entropy(sims.t(), labels_col, ignore_index=-100)
+        loss = (loss_row + loss_col) / 2
+        losses.append(loss)
     
+    exit()
     # バッチ全体の損失を平均
     total_loss = torch.stack(losses).mean()
     return total_loss
 
 
+def create_label(mask_row, mask_column, device):
+    label_row = torch.nonzero(mask_row, as_tuple=False).view(-1)
+    label_column = torch.nonzero(mask_column, as_tuple=False).view(-1)
+    result = torch.tensor([x if x in label_column else -100 for x in label_row]).to(device)
+    # 検索用のマスクを生成
+    index_map = torch.full_like(result, -1).to(device)
+    for idx, value in enumerate(label_column):
+        index_map[result == value] = idx
+
+    # 結果を保持するテンソルを生成
+    result = torch.where(index_map >= 0, index_map, result).to(device)
+    return result
 
 
 @torch.no_grad()
@@ -528,24 +553,49 @@ def calc_cluster_metrics(X, labels):
 
 
 if __name__ == '__main__':
-    # テスト用のデータを生成して動作確認を行う
-    import matplotlib.pyplot as plt
-    from sklearn.datasets import make_blobs
-    n_samples = 500
-    n_features = 2
-    n_clusters = 3
+    import sys
 
-    # サンプルデータを生成
-    X, _ = make_blobs(n_samples=n_samples, n_features=n_features, centers=n_clusters, random_state=42)
-    print(X.shape)
+    if len(sys.argv) > 1 and sys.argv[1] == '1':
+        # テスト用のデータを生成して動作確認を行う
+        import matplotlib.pyplot as plt
+        from sklearn.datasets import make_blobs
+        n_samples = 500
+        n_features = 2
+        n_clusters = 3
 
-    # KMeansラベル取得
-    labels = get_kmeans_labels(n_clusters, X).cpu().numpy()
+        # サンプルデータを生成
+        X, _ = make_blobs(n_samples=n_samples, n_features=n_features, centers=n_clusters, random_state=42)
+        print(X.shape)
 
-    # 結果を散布図で確認
-    plt.scatter(X[:, 0], X[:, 1], c=labels, cmap='viridis')
-    plt.title("KMeans Clustering Result")
-    plt.xlabel("Feature 1")
-    plt.ylabel("Feature 2")
-    plt.colorbar(label="Cluster Label")
-    plt.savefig("a.png")
+        # KMeansラベル取得
+        labels = get_kmeans_labels(n_clusters, X).cpu().numpy()
+
+        # 結果を散布図で確認
+        plt.scatter(X[:, 0], X[:, 1], c=labels, cmap='viridis')
+        plt.title("KMeans Clustering Result")
+        plt.xlabel("Feature 1")
+        plt.ylabel("Feature 2")
+        plt.colorbar(label="Cluster Label")
+        plt.savefig("a.png")
+    elif len(sys.argv) > 1 and sys.argv[1] == '2':
+        # compute_segment_feats関数のテスト
+        import torch
+
+        # ダミーデータの生成
+        feats = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        segs = torch.tensor([0, 2, 0, -1])
+        max_seg_num = 3
+
+        # compute_segment_feats関数の呼び出し
+        seg_feats, mask = compute_segment_feats(feats, segs, max_seg_num)
+
+        # 結果の表示
+        print("Segment Features:\n", seg_feats)
+        print("Mask:\n", mask)
+    elif len(sys.argv) > 1 and sys.argv[1] == '3':
+        # create_label関数のテスト
+        import torch
+        label1 = torch.tensor([True, False, True, False, True])
+        label2 = torch.tensor([True, True, False, False, True, True])
+        print(create_label(label1, label2))
+        print(create_label(label2, label1))

@@ -457,7 +457,7 @@ class KITTItemporal(Dataset):
         agg_segs[mask_ground] = self.n_clusters-1
         if self.args.vis:
             np.save('tmp/data/agg_segs.npy', agg_segs)
-        return agg_segs
+        return agg_segs.astype(np.int64)
         
         
     def _get_item_one_scene(self, seq:int, idx:int, aug:bool=True):
