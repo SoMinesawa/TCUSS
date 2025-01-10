@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument('--conv1_kernel_size', type=int, default=5, help='kernel size of 1st conv layers')
     ####
     parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
+    parser.add_argument('--tarl_lr', type=float, default=0.0002, help='learning rate for TARL')
     parser.add_argument('--workers', type=int, default=16, help='how many workers for loading data')
     parser.add_argument('--cluster_workers', type=int, default=16, help='how many workers for loading data in clustering')
     parser.add_argument('--seed', type=int, default=2022, help='random seed')
@@ -68,7 +69,7 @@ def parse_args():
     parser.add_argument('--silhouette', action='store_true', help='more eval metrics for kmeans')
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--scan_window', type=int, default=12, help='scan window size')
-    parser.add_argument('--lmb', type=float, default=0.5, help='lambda for contrastive learning')
+    # parser.add_argument('--lmb', type=float, default=0.5, help='lambda for contrastive learning')
     parser.add_argument('--vis', action='store_true', help='visualize')
     parser.add_argument('--resume', action='store_true', help='resume training')
     parser.add_argument('--wandb_run_id', type=str, help='wandb run id')
@@ -277,20 +278,21 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
         else:
             tarl_loss = torch.tensor(0.0, device="cuda")
         growsp_loss = (growsp_t1_loss + growsp_t2_loss) / args.accum_step
-        loss = growsp_loss + (args.lmb * tarl_loss)
+        lmb = args.tarl_lr / optimizer.param_groups[0]['lr']
+        loss = growsp_loss + (lmb * tarl_loss)
         loss_growsp_display += growsp_loss.item()
         loss_tarl_display += tarl_loss.item()
         loss.backward()
         if ((i+1) % args.accum_step == 0) or (i == len(train_loader)-1):
             optimizer.step()
-            wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr']})
+            wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr'], 'lmb': lmb})
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
             momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
-    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_tarl x lmb': loss_tarl_display*args.lmb})
+    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_tarl x lmb': loss_tarl_display*lmb})
 
 
 def train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp):

@@ -125,7 +125,7 @@ class KITTItcuss(Dataset):
             
             
     def __len__(self):
-        return self.kittitemporal.__len__()
+        return self.kittitemporal.__len__() # 1500 -> 750
     
     
     def __getitem__(self, index):

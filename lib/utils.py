@@ -411,8 +411,6 @@ def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
         
         # コサイン類似度の計算 ok
         sims = F.cosine_similarity(valid_feats_q.unsqueeze(1), valid_feats_k.unsqueeze(0), dim=2) / temperature
-        # torch.save(sims, f"tmp/data/sims_220_{i}.pth")
-        # torch.save(sims, "tmp/data/sims_450_growsp.pth")
         
         labels_row = create_label(mask_q[i], mask_k[i], device=sims.device)
         labels_col = create_label(mask_k[i], mask_q[i], device=sims.device)
@@ -423,7 +421,6 @@ def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
         loss = (loss_row + loss_col) / 2
         losses.append(loss)
     
-    # exit()
     # バッチ全体の損失を平均
     total_loss = torch.stack(losses).mean()
     return total_loss
