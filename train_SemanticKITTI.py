@@ -27,13 +27,13 @@ def parse_args():
     '''PARAMETERS'''
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
     parser.add_argument('--name', type=str, required=True, help='name of the experiment')
-    parser.add_argument('--data_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp',
+    parser.add_argument('--data_path', type=str, default='data/users/minesawa/semantickitti/growsp',
                         help='point cloud data path')
-    parser.add_argument('--sp_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_sp',
+    parser.add_argument('--sp_path', type=str, default='data/users/minesawa/semantickitti/growsp_sp',
                         help='initial sp path')
-    parser.add_argument('--original_data_path', type=str, default='/mnt/data/dataset/semantickitti/dataset/sequences')
-    parser.add_argument('--patchwork_path', type=str, default='/mnt/data/users/minesawa/semantickitti/patchwork')
-    parser.add_argument('--save_path', type=str, default='/mnt/data/users/minesawa/semantickitti/growsp_model', help='model savepath')
+    parser.add_argument('--original_data_path', type=str, default='data/dataset/semantickitti/dataset/sequences')
+    parser.add_argument('--patchwork_path', type=str, default='data/users/minesawa/semantickitti/patchwork')
+    parser.add_argument('--save_path', type=str, default='data/users/minesawa/semantickitti/growsp_model', help='model savepath')
     parser.add_argument('--pseudo_label_path', default='pseudo_label_kitti/', type=str, help='pseudo label save path') # 同時に複数実行する場合のみ、被らないように変更する必要がある
     ##
     parser.add_argument('--max_epoch', type=int, nargs='+', default=[100, 350], help='max epoch for non-growing and growing stage')

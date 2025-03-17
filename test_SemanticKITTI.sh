@@ -3,19 +3,19 @@
 # Check if required arguments are provided
 if [ "$#" -ne 2 ]; then
     echo "Usage: $0 <model_dir> <submission_name>"
-    echo "Example: $0 /mnt/urashima/users/minesawa/semantickitti/growsp_model_original growsp.zip"
+    echo "Example: $0 data/users/minesawa/semantickitti/growsp_model_original growsp.zip"
     exit 1
 fi
 
 # Assign command line arguments to variables
 MODEL_DIR="$1"
 SUBMISSION_NAME="$2"
-DATASET_PATH="/mnt/urashima/dataset/semantickitti/dataset/"
+DATASET_PATH="data/dataset/semantickitti/dataset/"
 
 # Execute commands in sequence
 python test_SemanticKITTI.py \
-    --data_path /mnt/urashima/users/minesawa/semantickitti/growsp \
-    --sp_path /mnt/urashima/users/minesawa/semantickitti/growsp_sp \
+    --data_path data/users/minesawa/semantickitti/growsp \
+    --sp_path data/users/minesawa/semantickitti/growsp_sp \
     --save_path "$MODEL_DIR" \
     --debug && \
 cd ~/repos/semantic-kitti-api && \

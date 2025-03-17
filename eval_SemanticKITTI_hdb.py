@@ -16,11 +16,11 @@ import os
 ###
 def parse_args():
     parser = argparse.ArgumentParser(description='PyTorch Unsuper_3D_Seg')
-    parser.add_argument('--data_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp',
+    parser.add_argument('--data_path', type=str, default='data/users/minesawa/semantickitti/growsp',
                         help='pont cloud data path')
-    parser.add_argument('--sp_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp_sp',
+    parser.add_argument('--sp_path', type=str, default='data/users/minesawa/semantickitti/growsp_sp',
                         help='initial sp path')
-    parser.add_argument('--save_path', type=str, default='/mnt/urashima/users/minesawa/semantickitti/growsp_model',
+    parser.add_argument('--save_path', type=str, default='data/users/minesawa/semantickitti/growsp_model',
                         help='model savepath')
     ###
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='batchnorm parameters')
