@@ -1,68 +1,76 @@
-## TCUSS: Temporal Consistent Unsupervised Semantic Segmentation of 3D Point Clouds
+# TCUSS: Temporal Consistent Unsupervised Semantic Segmentation of 3D Point Clouds
+![実行結果](images/result_example_image.png)
+先行研究(GrowSP)との比較。上がGrowSP、中央がTCUSS、下がGround-Truth。
 
-再現実験（GrowSP:itachi）
-コマンドは適宜 CUDA_VISIBLE_DEVICES=xをつけること。
+## プロジェクト概要
+
+TCUSSは、点群のみを入力としたUnsupervised Semantic Segmentationの新しい手法です。GrowSPの学習機構に、運転シーンの3D点群に特化した対照学習手法であるTARLを導入することで、運転シーン向けに最適化されています。TCUSSのモチベーションを簡潔にまとめると次のとおりです。
+
+
+- 運転シーンにおける点群データの特徴
+  - 時系列データ：10Hzのセンサーで自車を中心とした周囲環境を点群に変換
+  - 難点：自車の動きや移動する物体の存在により、物体の見え方がフレームごとに大きく異なる
+- GrowSPとその限界
+  - Superpointと呼ばれる小さな点の集合を基に、学習の間で逐次的に統合していく
+  - 単一のフレーム毎に学習しているため、時系列情報を活用できず、物体の見え方の変化に対応しにくい
+- TARL
+  - 運転シーンに特有の物体の見え方の変化に影響されない一貫した特徴量を学習する手法
+  - 対照学習によって、時刻が近い2つの点群からそれぞれ抽出される特徴量 F^{t_1} と F^{t_2} を、同じ物体の場合のみ近づけるように特徴量抽出器を学習する
+- → GrowSPにTARLの学習機構を導入
+
+## 使用方法
+### train
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python train_SemanticKITTI.py \
+  --name experiment_name \
+  --save_path data/users/minesawa/semantickitti/experiment_name \
+  --workers 8 --cluster_workers 8 \
+  --batch_size 16 16 
 ```
-python train_SemanticKITTI.py --data_path data/users/minesawa/semantickitti/growsp --sp_path data/users/minesawa/semantickitti/growsp_sp --save_path data/users/minesawa/semantickitti/growsp_model_original
+
+### eval
+
+```bash
+python eval_SemanticKITTI.py \
+  --data_path data/users/minesawa/semantickitti/growsp \
+  --sp_path data/users/minesawa/semantickitti/growsp_sp \
+  --save_path data/users/minesawa/semantickitti/experiment_name
 ```
 
-```
-python train_SemanticKITTI.py --run_stage 1
-```
+### submit
 
-```
-python eval_SemanticKITTI.py --data_path data/users/minesawa/semantickitti/growsp --sp_path data/users/minesawa/semantickitti/growsp_sp --save_path data/users/minesawa/semantickitti/growsp_model
+```bash
+./test_SemanticKITTI.sh data/users/minesawa/semantickitti/experiment_name submission_name.zip
 ```
 
+## 主要パラメータ
 
-## submitまとめたコマンド
-./test_SemanticKITTI.sh data/users/minesawa/semantickitti/growsp_model_original growsp.zip
+| パラメータ名 | 説明 |
+|------------|------|
+| --name | 実験名 |
+| --save_path | モデル保存パス |
+| --data_path | 点群データパス |
+| --sp_path | 初期スーパーポイントパス |
+| --workers | データローディング用ワーカー数 |
+| --cluster_workers | クラスタリング用ワーカー数 |
+| --batch_size | 学習時のバッチサイズ [GrowSP, TARL] |
+| --max_epoch | 最大エポック数 [非成長段階, 成長段階] |
+| --select_num | 各ラウンドで選択されるシーン数 |
+| --eval_select_num | 評価時に選択されるシーン数 |
+| --cluster_interval | クラスタリングの間隔 |
 
-### temp
-#### invしなかった場合
-val + test → こっちで提出してみるか
-[[ 0  7]
- [ 1 16]
- [ 2 13]
- [ 3  9]
- [ 4 12]
- [ 5  3]
- [ 6 14]
- [ 7  5]
- [ 8 18]
- [ 9  1]
- [10 10]
- [11  8]
- [12  4]
- [13  0]
- [14  2]
- [15 15]
- [16  6]
- [17 17]
- [18 11]]
-Acc avg 0.441
-IoU avg 0.115
-mean IoU,mean accuracy,car,bicycle,motorcycle,truck,other-vehicle,person,bicyclist,motorcyclist,road,parking,sidewalk,other-ground,building,fence,vegetation,trunk,terrain,pole,traffic-sign
-12.7,48.4,84.4,0.0,0.0,0.0,0.8,0.1,0.0,0.0,34.8,0.0,4.3,2.2,46.8,2.5,38.7,2.3,23.2,0.1,0.4
+## プロジェクト構造
 
+- `train_SemanticKITTI.py`: メイン学習スクリプト
+- `eval_SemanticKITTI.py`: 評価スクリプト
+- `test_SemanticKITTI.py`: テスト用スクリプト
+- `test_SemanticKITTI.sh`: テストと提出自動化シェルスクリプト
+- `datasets/SemanticKITTI.py`: SemanticKITTIデータセット処理
+- `models/`: ネットワークモデル定義
+- `lib/`: ユーティリティ関数群
 
+## 参考文献
+[GrowSP](https://openaccess.thecvf.com/content/CVPR2023/papers/Zhang_GrowSP_Unsupervised_Semantic_Segmentation_of_3D_Point_Clouds_CVPR_2023_paper.pdf)
 
-### vis
-CUDA_VISIBLE_DEVICES=3 WANDB_MODE=disabled python train_SemanticKITTI.py --data_path data/users/minesawa/semantickitti/growsp --sp_path data/users/minesawa/semantickitti/growsp_sp --save_path data/users/minesawa/semantickitti/tmp_model --growsp_start 80 --growsp_end 30 --run_stage 2 --vis
-
-CUDA_VISIBLE_DEVICES=1 python train_SemanticKITTI_no_backprop.py --data_path data/users/minesawa/semantickitti/growsp --sp_path data/users/minesawa/semantickitti/growsp_sp --save_path data/users/minesawa/semantickitti/tcuss_model_no_backprop --workers 4 --temporal_workers 8 --cluster_workers 4
-
-CUDA_VISIBLE_DEVICES=1 python train_SemanticKITTI_no_backprop.py --data_path data/users/minesawa/semantickitti/growsp --sp_path data/users/minesawa/semantickitti/growsp_sp --save_path data/users/minesawa/semantickitti/tcuss_model_no_backprop --workers 8 --temporal_workers 8 --cluster_workers 8 --batch_size 64 64行けるか？？？
-
-
-### poseidon
-CUDA_VISIBLE_DEVICES=0 python train_SemanticKITTI.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_default_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
-CUDA_VISIBLE_DEVICES=1 python train_SemanticKITTI_no_backprop.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_no_backprop_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
-CUDA_VISIBLE_DEVICES=2 python train_SemanticKITTI_growsp.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/growsp_model_more_metric_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
-CUDA_VISIBLE_DEVICES=3 python train_SemanticKITTI_hdb.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_hdb --workers 8 --temporal_workers 4 --cluster_workers 8 --hdb
-
-CUDA_VISIBLE_DEVICES=0 python train_SemanticKITTI.py --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/tcuss_model_default_poseidon --workers 8 --temporal_workers 4 --cluster_workers 8
-CUDA_VISIBLE_DEVICES=0,1 python train_SemanticKITTI_onlyTARL.py --name onlyTARL_noScheduler --data_path /mnt/data/users/minesawa/semantickitti/growsp --sp_path /mnt/data/users/minesawa/semantickitti/growsp_sp --save_path /mnt/data/users/minesawa/semantickitti/onlyTARL_noScheduler --workers 16 --temporal_workers 6 --cluster_workers 16 --batch_size 16 16
-
-python train_SemanticKITTI.py --name newloss --data_path ~/dataset/semantickitti/growsp --sp_path ~/dataset/semantickitti/growsp_sp --patchwork_path ~/dataset/semantickitti/patchwork --save_path data/users/minesawa/semantickitti/newloss --workers 32 --temporal_workers 12 --cluster_workers 32 --batch_size 64 64
-### for debug
+[TARL](https://openaccess.thecvf.com/content/CVPR2023/papers/Nunes_Temporal_Consistent_3D_LiDAR_Representation_Learning_for_Semantic_Perception_in_CVPR_2023_paper.pdf)
