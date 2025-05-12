@@ -266,6 +266,7 @@ class KITTItrain(Dataset):
 
         # ''' Take Mixup as an Augmentation'''
         inds = np.arange(coords.shape[0])
+        '''Start Mixup(if you want to use Mixup, comment out the following)'''
         mix = random.randint(0, len(self.name)-1)
 
         data_mix = read_ply(self.file_selected[mix])

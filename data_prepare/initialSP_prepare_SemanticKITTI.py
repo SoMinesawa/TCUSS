@@ -32,6 +32,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--input_path', type=str, default='data/SemanticKITTI/dataset/sequences', help='raw data path')
 parser.add_argument('--sp_path', type=str, default='data/SemanticKITTI/initial_superpoints/sequences')
+parser.add_argument('--distance_threshold', type=float, default=0.1, help='distance threshold for RANSAC')
 args = parser.parse_args()
 
 vis = True
@@ -40,7 +41,7 @@ vis = True
 def ransac(xyz):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
-    plane_model, inliers = pcd.segment_plane(distance_threshold=0.1, ransac_n=3, num_iterations=1000)
+    plane_model, inliers = pcd.segment_plane(distance_threshold=args.distance_threshold, ransac_n=3, num_iterations=1000)
     return np.array(inliers)
 
 
@@ -73,7 +74,7 @@ def construct_superpoints(path):
     sp_labels[road_index] = other_region_idx.max() + 1
     #
     if not os.path.exists(join(args.sp_path, f.parts[-2])):
-        os.makedirs(join(args.sp_path, f.parts[-2]), exist_ok=True)
+      os.makedirs(join(args.sp_path, f.parts[-2]), exist_ok=True)
     np.save(join(args.sp_path, name[:-4]+'_superpoint.npy'), sp_labels)
 
     if vis:
@@ -94,7 +95,6 @@ def construct_superpoints(path):
             sp_mask = sp == sp_labels
             sp2gt[sp_mask] = stats.mode(labels[sp_mask])[0][0]
 
-    print('completed scene: {}, used time: {:.2f}s'.format(name, time.time() - time_start))
     return (labels, sp2gt)
 
 
@@ -111,7 +111,7 @@ for seq_id in tqdm(seq_list):
     else:
         for f in np.sort(os.listdir(seq_path)):
             test_path_list.append(os.path.join(seq_path, f))
-pool = ProcessPoolExecutor(max_workers=8)
+pool = ProcessPoolExecutor(max_workers=16)
 from concurrent.futures import as_completed
 
 # プログレスバーを表示しながら並列処理を実行

@@ -42,8 +42,8 @@ def parse_args():
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='batchnorm parameters')
     parser.add_argument('--conv1_kernel_size', type=int, default=5, help='kernel size of 1st conv layers')
     ####
-    parser.add_argument('--lr', type=float, default=1e-2, help='learning rate')
-    parser.add_argument('--tarl_lr', type=float, default=0.0002, help='learning rate for TARL')
+    parser.add_argument('--lr', type=float, default=1e-2, help='learning rate for backbone network')
+    parser.add_argument('--tarl_lr', type=float, default=0.0002, help='learning rate for transformer projector and predictor')
     parser.add_argument('--workers', type=int, default=16, help='how many workers for loading data')
     parser.add_argument('--cluster_workers', type=int, default=16, help='how many workers for loading data in clustering')
     parser.add_argument('--seed', type=int, default=2022, help='random seed')
@@ -65,7 +65,7 @@ def parse_args():
     parser.add_argument('--eval_select_num', type=int, default=4071, help='scene number selected in evaluation')
     parser.add_argument('--r_crop', type=float, default=50, help='cropping radius in training')
     parser.add_argument('--cluster_interval', type=int, default=10, help='cluster interval')
-    parser.add_argument('--eval_interval', type=int, default=1, help='eval interval')
+    parser.add_argument('--eval_interval', type=int, default=10, help='eval interval')
     parser.add_argument('--silhouette', action='store_true', help='more eval metrics for kmeans')
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--scan_window', type=int, default=12, help='scan window size')
@@ -116,9 +116,19 @@ def main(args, logger):
     train_loader = DataLoader(trainset, batch_size=args.batch_size[0], shuffle=True, collate_fn=cfl_collate_fn_tcuss(), num_workers=args.workers, pin_memory=True, worker_init_fn=worker_init_fn)
     clusterset = KITTItrain(args, scene_idx, 'train')
     cluster_loader = DataLoader(clusterset, batch_size=1, collate_fn=cfl_collate_fn(), num_workers=args.cluster_workers, pin_memory=True)
-    optimizer = torch.optim.AdamW(list(model_q.parameters())+list(proj_head_q.parameters())+list(predictor.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     
-    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, epochs=epoch, steps_per_epoch=ceil(len(train_loader) / args.accum_step)) for epoch in args.max_epoch]
+    # パラメータグループを分けて異なる学習率を設定
+    backbone_params = list(model_q.parameters())
+    transformer_params = list(proj_head_q.parameters()) + list(predictor.parameters())
+    
+    param_groups = [
+        {'params': backbone_params, 'lr': args.lr},
+        {'params': transformer_params, 'lr': args.tarl_lr}
+    ]
+    
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    
+    schedulers = [torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[args.lr, args.tarl_lr], epochs=epoch, steps_per_epoch=ceil(len(train_loader) / args.accum_step)) for epoch in args.max_epoch]
     
     momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
     
@@ -278,21 +288,24 @@ def train(args, train_loader, model_q, model_k, proj_head_q, proj_head_k, predic
         else:
             tarl_loss = torch.tensor(0.0, device="cuda")
         growsp_loss = (growsp_t1_loss + growsp_t2_loss) / args.accum_step
-        lmb = args.tarl_lr / optimizer.param_groups[0]['lr']
-        loss = growsp_loss + (lmb * tarl_loss)
+        loss = growsp_loss + tarl_loss
         loss_growsp_display += growsp_loss.item()
         loss_tarl_display += tarl_loss.item()
         loss.backward()
         if ((i+1) % args.accum_step == 0) or (i == len(train_loader)-1):
             optimizer.step()
-            wandb.log({'epoch': epoch, 'tcuss_lr': optimizer.param_groups[0]['lr'], 'lmb': lmb})
+            wandb.log({
+                'epoch': epoch, 
+                'backbone_lr': optimizer.param_groups[0]['lr'], 
+                'transformer_lr': optimizer.param_groups[1]['lr']
+            })
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
             momentum_update_key_encoder(model_q, model_k, proj_head_q, proj_head_k)
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
-    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'loss_tarl x lmb': loss_tarl_display*lmb})
+    wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display})
 
 
 def train_tarl(args, tarl_data, model_q, model_k, proj_head_q, proj_head_k, predictor, current_growsp):
