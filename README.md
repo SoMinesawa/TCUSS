@@ -29,6 +29,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python train_SemanticKITTI.py \
   --batch_size 16 16 
 ```
 
+### debug
+```bash
+WANDB_MODE=disabled python train_SemanticKITTI.py --name debug --save_path data/users/minesawa/semantickitti/debug --workers 0 --cluster_workers 0 --batch_size 16 16 --select_num 128 --eval_select_num 16 --max_epoch 2 2 --cluster_interval 1
+```
+
 ### eval
 
 ```bash

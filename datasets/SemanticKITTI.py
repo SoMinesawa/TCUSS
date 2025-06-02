@@ -9,10 +9,11 @@ import open3d as o3d
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
 from tqdm import tqdm
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional, Union, Any
                 
                 
 class cfl_collate_fn:
+    """データセットの出力を適切なフォーマットに変換するコレート関数"""
 
     def __call__(self, list_data):
         coords, feats, normals, labels, inverse_map, pseudo, inds, region, index = list(zip(*list_data))
@@ -32,7 +33,7 @@ class cfl_collate_fn:
             accm_num += coords[batch_id].shape[0]
 
         # Concatenate all lists
-        coords_batch = torch.cat(coords_batch, 0).float()#.int()
+        coords_batch = torch.cat(coords_batch, 0).float()
         feats_batch = torch.cat(feats_batch, 0).float()
         normal_batch = torch.cat(normal_batch, 0).float()
         labels_batch = torch.cat(labels_batch, 0).float()
@@ -45,6 +46,7 @@ class cfl_collate_fn:
 
 
 class cfl_collate_fn_temporal:
+    """時間的な情報を含むデータセットの出力を適切なフォーマットに変換するコレート関数"""
 
     def __call__(self, list_data):
         coords_q, coords_k, segs_q, segs_k = list(zip(*list_data))
@@ -66,44 +68,44 @@ class cfl_collate_fn_temporal:
         return coords_q_batch, coords_k_batch, segs_q, segs_k
     
 
-# 実際に使用している引数
-# train: coords, pseudo_labels, inds
-# cluster: coords, feats, normals, labels, inds, region, index
-# 以上より、trainで使われていない変数は返さない
 class cfl_collate_fn_tcuss:
+    """TCUSS学習に使用する複合的なデータセットの出力を適切なフォーマットに変換するコレート関数"""
+    
     def __init__(self):
         self.growsp_t1_collate_fn = cfl_collate_fn()
         self.growsp_t2_collate_fn = cfl_collate_fn()
         self.tarl_collate_fn = cfl_collate_fn_temporal()
 
     def __call__(self, list_data):
-        # Split the data into growsp_t1, growsp_t2, and tarl components
+        # TCUSSフェーズに応じて処理を分岐
         if list_data[0][2] is None:
+            # TARLなしの場合の処理
             growsp_t1_data, growsp_t2_data, _ = list(zip(*list_data))
 
-            # Process each type of data using the corresponding collate function
+            # 各コレート関数を使用して処理
             (coords_t1_batch, feats_t1_batch, normal_t1_batch, labels_t1_batch,
             inverse_t1_batch, pseudo_t1_batch, inds_t1_batch, region_t1_batch, index_t1) = self.growsp_t1_collate_fn(growsp_t1_data)
             (coords_t2_batch, feats_t2_batch, normal_t2_batch, labels_t2_batch,
             inverse_t2_batch, pseudo_t2_batch, inds_t2_batch, region_t2_batch, index_t2) = self.growsp_t2_collate_fn(growsp_t2_data)
 
-            # Combine results into a unified output
+            # 出力を統合
             return [
                 [coords_t1_batch, pseudo_t1_batch, inds_t1_batch],
                 [coords_t2_batch, pseudo_t2_batch, inds_t2_batch],
                 None
             ]
         else:
+            # TARLありの場合の処理
             growsp_t1_data, growsp_t2_data, tarl_data = list(zip(*list_data))
 
-            # Process each type of data using the corresponding collate function
+            # 各コレート関数を使用して処理
             (coords_q_batch, coords_k_batch, segs_q, segs_k) = self.tarl_collate_fn(tarl_data)
             (coords_t1_batch, feats_t1_batch, normal_t1_batch, labels_t1_batch,
             inverse_t1_batch, pseudo_t1_batch, inds_t1_batch, region_t1_batch, index_t1) = self.growsp_t1_collate_fn(growsp_t1_data)
             (coords_t2_batch, feats_t2_batch, normal_t2_batch, labels_t2_batch,
             inverse_t2_batch, pseudo_t2_batch, inds_t2_batch, region_t2_batch, index_t2) = self.growsp_t2_collate_fn(growsp_t2_data)
 
-            # Combine results into a unified output
+            # 出力を統合
             return [
                 [coords_t1_batch, pseudo_t1_batch, inds_t1_batch],
                 [coords_t2_batch, pseudo_t2_batch, inds_t2_batch],
@@ -111,8 +113,9 @@ class cfl_collate_fn_tcuss:
             ]
 
 
-
 class KITTItcuss(Dataset):
+    """TCUSS学習用の複合データセット"""
+    
     def __init__(self, args):
         self.args = args
         self.phase = 0
@@ -123,12 +126,10 @@ class KITTItcuss(Dataset):
         self.scene_idx_all = None
         self.random_select_sample()
             
-            
-    def __len__(self):
-        return self.kittitemporal.__len__() # 1500 -> 750
+    def __len__(self) -> int:
+        return self.kittitemporal.__len__()
     
-    
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Tuple:
         growsp_t1 = self.kittitrain_t1.__getitem__(index)
         growsp_t2 = self.kittitrain_t2.__getitem__(index)
         if self.phase == 0:
@@ -137,8 +138,8 @@ class KITTItcuss(Dataset):
             tcuss = self.kittitemporal.__getitem__(index)
         return growsp_t1, growsp_t2, tcuss
 
-
     def random_select_sample(self):
+        """ランダムにサンプルを選択"""
         self.kittitemporal._random_select_samples()
         scene_idx_t1 = [self.kittitemporal._tuple_to_scene_idx(tup) for tup in self.kittitemporal.scene_locates]
         scene_idx_t2 = [self.kittitemporal._tuple_to_scene_idx(tup) for tup in self.kittitemporal.scene_diff_locates]
@@ -152,9 +153,10 @@ class KITTItcuss(Dataset):
             scene_idx_all.append(scene_idx_t2[i])
         self.scene_idx_all = scene_idx_all
 
-        
-        
+
 class KITTItrain(Dataset):
+    """学習用のKITTIデータセット"""
+    
     def __init__(self, args, scene_idx, split='train'):
         self.args = args
         self.label_to_names = {0: 'unlabeled',
@@ -196,8 +198,8 @@ class KITTItrain(Dataset):
                         self.file.append(os.path.join(seq_path, f))
                     scene_idx = range(len(self.file))
 
-        '''Initial Augmentations'''
-        self.trans_coords = trans_coords(shift_ratio=50)  ### 50%
+        '''初期の拡張処理設定'''
+        self.trans_coords = trans_coords(shift_ratio=50)  # 50%
         self.rota_coords = rota_coords(rotation_bound = ((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
         self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
 
@@ -330,6 +332,8 @@ class KITTItrain(Dataset):
 
 
 class KITTItemporal(Dataset):
+    """時間的な情報を含むKITTIデータセット"""
+    
     def __init__(self, args):
         self.args = args
         self.n_clusters = None
