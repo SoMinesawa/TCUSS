@@ -25,7 +25,7 @@ TCUSSは、点群のみを入力としたUnsupervised Semantic Segmentationの�
 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_SemanticKITTI.py \
   --name experiment_name \
   --save_path data/users/minesawa/semantickitti/experiment_name \
-  --workers 8 --cluster_workers 8 \
+  --workers 16 \
   --batch_size 16 16 
 ```
 

@@ -48,8 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='バッチ正規化のパラメータ')
     parser.add_argument('--conv1_kernel_size', type=int, default=5, help='第1畳み込み層のカーネルサイズ')
     ####
-    parser.add_argument('--workers', type=int, default=10, help='データローディング用ワーカー数')
-    parser.add_argument('--cluster_workers', type=int, default=10, help='クラスタリング用ワーカー数')
+    parser.add_argument('--workers', type=int, default=24, help='データローディング用ワーカー数')
+    parser.add_argument('--cluster_workers', type=int, default=24, help='クラスタリング用ワーカー数')
     parser.add_argument('--seed', type=int, default=2022, help='乱数シード')
     parser.add_argument('--voxel_size', type=float, default=0.15, help='SparseConvのボクセルサイズ')
     parser.add_argument('--input_dim', type=int, default=3, help='ネットワーク入力次元')
@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--feats_dim', type=int, default=128, help='出力特徴次元')
     parser.add_argument('--ignore_label', type=int, default=-1, help='無効ラベル')
     parser.add_argument('--debug', action='store_true', help='デバッグモード')
+    parser.add_argument('--use_best', action='store_true', help='bestモデル（best_model.pth, best_classifier.pth）を使用')
     return parser.parse_args()
 
 
@@ -237,6 +238,109 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
     return o_Acc, m_Acc, m_IoU, s, IoU_dict
 
 
+def eval_best(args: argparse.Namespace) -> Tuple[float, float, float, str, Dict[str, float]]:
+    """bestモデルを評価する関数
+    
+    Args:
+        args: コマンドライン引数
+    
+    Returns:
+        o_Acc: 全体の精度
+        m_Acc: 平均精度
+        m_IoU: 平均IoU
+        s: IoU情報の文字列
+        IoU_dict: クラスごとのIoU辞書
+    """
+    # bestモデルのパスを確認
+    best_model_path = os.path.join(args.save_path, 'best_model.pth')
+    best_classifier_path = os.path.join(args.save_path, 'best_classifier.pth')
+    
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(f"bestモデルファイルが見つかりません: {best_model_path}")
+    if not os.path.exists(best_classifier_path):
+        raise FileNotFoundError(f"best分類器ファイルが見つかりません: {best_classifier_path}")
+    
+    print(f"Loading best model from: {best_model_path}")
+    print(f"Loading best classifier from: {best_classifier_path}")
+    
+    # モデルを読み込み
+    model = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
+    model.load_state_dict(torch.load(best_model_path))
+    model.eval()
+
+    # 分類器を読み込み
+    cls = torch.nn.Linear(args.feats_dim, args.primitive_num, bias=False).cuda()
+    cls.load_state_dict(torch.load(best_classifier_path))
+    cls.eval()
+
+    # プリミティブ中心をクラスタリング
+    primitive_centers = cls.weight.data  # [500, 128]
+    print('Merging Primitives')
+    cluster_pred = get_kmeans_labels(n_clusters=args.semantic_class, pcds=primitive_centers).to('cpu').detach().numpy()
+    
+    # クラス中心を計算
+    centroids = torch.zeros((args.semantic_class, args.feats_dim))
+    for cluster_idx in range(args.semantic_class):
+        indices = cluster_pred == cluster_idx
+        cluster_avg = primitive_centers[indices].mean(0, keepdims=True)
+        centroids[cluster_idx] = cluster_avg
+    
+    centroids = F.normalize(centroids, dim=1)
+    classifier = get_fixclassifier(in_channel=args.feats_dim, centroids_num=args.semantic_class, centroids=centroids).cuda()
+    classifier.eval()
+
+    # テストデータセットを作成
+    test_dataset = KITTItest(args)
+    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=cfl_collate_fn_test(), num_workers=args.cluster_workers, pin_memory=True)
+
+    # 評価を実行
+    preds, no_ignore_preds, labels, no_ignore_labels, save_paths = eval_once(args, model, test_loader, classifier)
+    
+    # 結果を連結
+    all_preds = torch.cat(preds).numpy()
+    all_no_ignore_preds = torch.cat(no_ignore_preds).numpy()
+    all_labels = torch.cat(labels).numpy()
+    all_no_ignore_labels = torch.cat(no_ignore_labels).numpy()
+
+    # 教師なし評価：予測をGTにマッチング
+    sem_num = args.semantic_class
+    mask = (all_no_ignore_labels >= 0) & (all_no_ignore_labels < sem_num)
+    histogram = np.bincount(sem_num * all_no_ignore_labels[mask] + all_no_ignore_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
+    
+    # ハンガリアンマッチング
+    m = assignment_function(histogram.max() - histogram)
+    o_Acc = histogram[m[:, 0], m[:, 1]].sum() / histogram.sum() * 100.
+    m_Acc = np.mean(histogram[m[:, 0], m[:, 1]] / histogram.sum(1)) * 100
+    hist_new = np.zeros((sem_num, sem_num))
+    for idx in range(sem_num):
+        hist_new[:, idx] = histogram[:, m[idx, 1]]
+
+    # 予測結果を保存
+    for no_ignore_pred, save_path in zip(no_ignore_preds, save_paths):
+        no_ignore_pred = no_ignore_pred.numpy().astype(np.int64)
+        no_ignore_pred_copy = no_ignore_pred.copy()
+        for row in m:
+            no_ignore_pred_copy[no_ignore_pred == row[1]] = row[0]
+        no_ignore_pred_copy = no_ignore_pred_copy + 1
+        no_ignore_pred_inv = np.vectorize(learning_map_inv.get)(no_ignore_pred_copy).astype(np.uint32)
+        no_ignore_pred_inv.tofile(save_path)
+    
+    # 最終評価指標を計算
+    tp = np.diag(hist_new)
+    fp = np.sum(hist_new, 0) - tp
+    fn = np.sum(hist_new, 1) - tp
+    IoUs = (100 * tp) / (tp + fp + fn + 1e-8)
+    m_IoU = np.nanmean(IoUs)
+    IoU_list = []
+    class_name_IoU_list = ["IoU_unlabeled", "IoU_car", "IoU_bicycle", "IoU_motorcycle", "IoU_truck", "IoU_other-vehicle", "IoU_person", "IoU_bicyclist", "IoU_motorcyclist", "IoU_road", "IoU_parking", "IoU_sidewalk", "IoU_other-ground", "IoU_building", "IoU_fence", "IoU_vegetation", "IoU_trunck", "IoU_terrian", "IoU_pole", "IoU_traffic-sign"]
+    s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
+    for IoU in IoUs:
+        s += '{:5.2f} '.format(IoU)
+        IoU_list.append(IoU)
+    IoU_dict = dict(zip(class_name_IoU_list, IoU_list))
+    return o_Acc, m_Acc, m_IoU, s, IoU_dict
+
+
 def extract_epoch_from_filename(filename: str) -> Optional[int]:
     """ファイル名からエポック番号を抽出する関数
     
@@ -260,8 +364,13 @@ if __name__ == '__main__':
     # シードを設定
     set_seed(args.seed)
     
+    # bestモデルを使用する場合
+    if args.use_best:
+        o_Acc, m_Acc, m_IoU, s, IoU_dict = eval_best(args)
+        print('Best Model: oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(o_Acc, m_Acc, m_IoU))
+        print(s)
     # デバッグモードの場合は最新のチェックポイントのみ評価
-    if args.debug:
+    elif args.debug:
         checkpoint_files = [f for f in os.listdir(args.save_path) if f.endswith('_checkpoint.pth') and f.startswith('model_')]
         epoch_numbers = [extract_epoch_from_filename(f) for f in checkpoint_files]
         epoch_numbers = sorted([e for e in epoch_numbers if e is not None], reverse=True)
@@ -274,10 +383,16 @@ if __name__ == '__main__':
         else:
             print("No checkpoint files found.")
     else:
-        # 通常モードでは全てのチェックポイントを評価
+        # 通常モードでは最新のチェックポイントを評価
         checkpoint_files = [f for f in os.listdir(args.save_path) if f.endswith('_checkpoint.pth') and f.startswith('model_')]
         epoch_numbers = [extract_epoch_from_filename(f) for f in checkpoint_files]
         epoch_numbers = sorted([e for e in epoch_numbers if e is not None])
+        
+        # 最新のnum_latest_epochs個のepochのみを評価対象とする
+        num_latest_epochs = 5  # 評価する最新epoch数
+        epoch_numbers = epoch_numbers[-num_latest_epochs:] if len(epoch_numbers) > num_latest_epochs else epoch_numbers
+        
+        print(f"Evaluating latest {len(epoch_numbers)} epochs: {epoch_numbers}")
         
         best_miou = 0
         best_epoch = 0

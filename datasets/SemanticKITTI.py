@@ -10,6 +10,8 @@ from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional, Union, Any
+# import cuml  # GPU版（コメントアウト）
+import hdbscan  # CPU版を使用
                 
                 
 class cfl_collate_fn:
@@ -132,10 +134,8 @@ class KITTItcuss(Dataset):
     def __getitem__(self, index: int) -> Tuple:
         growsp_t1 = self.kittitrain_t1.__getitem__(index)
         growsp_t2 = self.kittitrain_t2.__getitem__(index)
-        if self.phase == 0:
-            tcuss = None
-        else:
-            tcuss = self.kittitemporal.__getitem__(index)
+        # phase 0でもTARL学習を行うように変更
+        tcuss = self.kittitemporal.__getitem__(index)
         return growsp_t1, growsp_t2, tcuss
 
     def random_select_sample(self):
@@ -339,6 +339,9 @@ class KITTItemporal(Dataset):
         self.n_clusters = None
         self.seq_to_scan_num = {0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201}
         
+        # 外れ値IDを追跡するための属性
+        self.current_outlier_ids = {}  # バッチごとの外れ値IDを保存
+        
         self.file = []
         seq_list = np.sort(os.listdir(self.args.data_path))
         for seq_id in seq_list:
@@ -402,7 +405,12 @@ class KITTItemporal(Dataset):
             for i, coord in enumerate(coords_tn):
                 np.save(f'tmp/data/coords_{i}.npy', coord)
         agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn)
-        agg_segs = self._clusterize_pcds(agg_coords, agg_ground_labels, region_num_t1, region_num_t2)
+        agg_segs, outlier_id = self._clusterize_pcds(agg_coords, agg_ground_labels, region_num_t1, region_num_t2)
+        
+        # 外れ値IDを特別なマーカー(-2)に変換
+        if outlier_id is not None:
+            agg_segs[agg_segs == outlier_id] = -2
+        
         segs_tn = []
         for elements_num in elements_nums:
             segs_tn.append(agg_segs[:elements_num])
@@ -411,15 +419,6 @@ class KITTItemporal(Dataset):
         idx_t2_in_window = scene_idx_in_window.index((seq_t2, idx_t2))
         segs_t1 = segs_tn[idx_t1_in_window]
         segs_t2 = segs_tn[idx_t2_in_window]
-        if self.args.vis:
-            for i, (seg, label) in enumerate(zip(segs_tn, labels_tn)):
-                np.save(f'tmp/data/segs_{i}.npy', seg)
-                np.save(f'tmp/data/labels_{i}.npy', label)
-            np.save('tmp/data/segs_t1.npy', segs_t1)
-            np.save('tmp/data/segs_t2.npy', segs_t2)
-            np.save('tmp/data/coords_t1.npy', coords_t1)
-            np.save('tmp/data/coords_t2.npy', coords_t2)
-            exit()
             
         return coords_t1, coords_t2, segs_t1, segs_t2
 
@@ -443,26 +442,75 @@ class KITTItemporal(Dataset):
             element_nums.append(coords.shape[0])
         last_pose = poses[scene_idx_in_window[-1][1]]
         points_set = self._undo_transform(points_set, last_pose)
-        if self.args.vis:
-            np.save('tmp/data/agg_points.npy', points_set)
-            np.save('tmp/data/agg_labels.npy', label_set.squeeze())
         return points_set, ground_label, element_nums
         
     
     def _clusterize_pcds(self, agg_coords, agg_ground_labels, region_num_t1, region_num_t2):
+        """
+        Clusterize point clouds using hdbscan library instead of k-means
+        
+        Args:
+            agg_coords: Aggregated coordinates
+            agg_ground_labels: Ground labels (1 for ground, 0 for non-ground)
+            region_num_t1: Number of regions at time t1
+            region_num_t2: Number of regions at time t2
+            
+        Returns:
+            agg_segs: Segmentation labels
+            outlier_id: ID assigned to hdbscan outlier points (None if no outliers)
+        """
+        
+        # 地面マスクの作成（元のコードと同様）
         mask_ground = agg_ground_labels == 1
         mask_ground = mask_ground.flatten()
         non_ground_coords = agg_coords[~mask_ground]
-        if region_num_t1 == None :
-            labels = get_kmeans_labels(self.n_clusters-1, non_ground_coords).detach().cpu().numpy()
+        
+        outlier_id = None  # hdbscanの外れ値IDを追跡
+        
+        if len(non_ground_coords) > 0:
+            # hdbscanライブラリを使用（CPU版）
+            # clusterer = hdbscan.HDBSCAN(algorithm='best', alpha=1., approx_min_span_tree=True,
+            #                     gen_min_span_tree=True, leaf_size=100,
+            #                     metric='euclidean', min_cluster_size=20, min_samples=None
+            #                 )
+            clusterer = hdbscan.HDBSCAN(
+                algorithm='best',
+                metric='euclidean',
+                min_cluster_size=100,
+                min_samples=20,
+                alpha=1.0,
+                cluster_selection_epsilon=0.8, # こいつ重要かも 0.6だとちょっと分けすぎで、0.8だと訳なさすぎる
+                cluster_selection_method='eom',
+                leaf_size=100,
+                approx_min_span_tree=True,
+                gen_min_span_tree=True
+            )
+            # print(f"non_ground_coords shape: {non_ground_coords.shape}")
+            labels = clusterer.fit_predict(non_ground_coords)
+            
+            # CPU版のhdbscanは直接NumPy配列を返すので、変換不要
+            
+            # ノイズポイント（-1ラベル）を適切に処理
+            # 元のk-meansは常に非負のラベルを返すので、-1を最大ラベル+1に変更
+            if (labels == -1).any():
+                max_valid_label = labels[labels >= 0].max() if (labels >= 0).any() else -1
+                outlier_id = max_valid_label + 1  # hdbscanの外れ値IDを記録
+                labels[labels == -1] = outlier_id
+            
+            # 地面ラベルのための値を動的に決定
+            dynamic_ground_label = labels.max() + 1 if len(labels) > 0 else 0
+            
         else:
-            labels = get_kmeans_labels(min(region_num_t1, region_num_t2)-1, non_ground_coords).detach().cpu().numpy()
+            labels = np.array([])
+            dynamic_ground_label = 0
+            
+        # セグメンテーション配列の作成（元のコードと同様）
         agg_segs = np.zeros_like(agg_ground_labels).flatten()
         agg_segs[~mask_ground] = labels
-        agg_segs[mask_ground] = self.n_clusters-1
-        if self.args.vis:
-            np.save('tmp/data/agg_segs.npy', agg_segs)
-        return agg_segs.astype(np.int64)
+        agg_segs[mask_ground] = dynamic_ground_label  # 地面ラベルを動的に決定
+        
+            
+        return agg_segs.astype(np.int64), outlier_id
         
         
     def _get_item_one_scene(self, seq:int, idx:int, aug:bool=True):

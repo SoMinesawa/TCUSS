@@ -71,6 +71,13 @@ class TCUSSTrainer:
         self.current_growsp = None
         self.resume_epoch = None
         
+        # 早期停止関連の変数
+        self.best_metric_score = float('-inf')  # best_val
+        self.patience_counter = 0  # wait
+        self.early_stopped = False
+        self.best_epoch = 0
+        self.loss_history = []  # train_lossの履歴
+    
     def setup_optimizer(self):
         """オプティマイザの設定"""
         # パラメータグループを分けて異なる学習率を設定
@@ -140,6 +147,16 @@ class TCUSSTrainer:
             if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
                 torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
             
+            # early stopping状態の復元
+            if 'best_metric_score' in checkpoint:
+                self.best_metric_score = checkpoint['best_metric_score']
+                self.patience_counter = checkpoint['patience_counter']
+                self.early_stopped = checkpoint['early_stopped']
+                self.best_epoch = checkpoint['best_epoch']
+                self.loss_history = checkpoint['loss_history']
+                self.logger.info(f'early stopping状態を復元: best_score={self.best_metric_score:.4f}, '
+                                f'patience={self.patience_counter}, best_epoch={self.best_epoch}')
+            
             return self.resume_epoch
         else:
             self.logger.warning(f'チェックポイントファイル {checkpoint_path} が見つかりません')
@@ -158,7 +175,13 @@ class TCUSSTrainer:
             f'scheduler_{phase}_state_dict': self.schedulers[phase].state_dict(),
             'np_random_state': np.random.get_state(),
             'torch_random_state': torch.get_rng_state(),
-            'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            'torch_cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            # early stopping状態の保存
+            'best_metric_score': self.best_metric_score,
+            'patience_counter': self.patience_counter,
+            'early_stopped': self.early_stopped,
+            'best_epoch': self.best_epoch,
+            'loss_history': self.loss_history
         }
         
         torch.save(checkpoint, join(self.config.save_path, f'checkpoint_epoch_{epoch}.pth'))
@@ -178,7 +201,7 @@ class TCUSSTrainer:
         # トレーニング開始
         is_growing = False
         for i, (epoch, scheduler) in enumerate(zip(self.config.max_epoch, self.schedulers)):
-            train_loader.dataset.phase = i
+            train_loader.dataset.phase = i # iではなくフェーズを0に固定すれば、それだけでGrowSPのみのトレーニングになる（今のコードでは違うけど）
             self.train_phase(i, train_loader, cluster_loader, is_growing)
             is_growing = True
     
@@ -212,6 +235,11 @@ class TCUSSTrainer:
             # 評価
             if epoch % self.config.eval_interval == 0:
                 self.evaluate(epoch)
+                
+            # 早期停止チェック
+            if self.early_stopped:
+                self.logger.info(f'早期停止によりトレーニングを終了します (エポック {epoch})')
+                break
             
             # チェックポイントの保存
             if epoch % self.config.cluster_interval == 0:
@@ -249,14 +277,16 @@ class TCUSSTrainer:
             
             # 合計損失の計算
             growsp_loss = (growsp_t1_loss + growsp_t2_loss) / self.config.accum_step
-            loss = growsp_loss + tarl_loss
+            loss = growsp_loss + self.config.lmb * tarl_loss
+            # loss = tarl_loss
             
             # 損失の表示用に加算
             loss_growsp_display += growsp_loss.item()
             loss_tarl_display += tarl_loss.item()
             
             # バックプロパゲーション
-            loss.backward()
+            if loss.grad_fn is not None:
+                loss.backward()
             
             # 勾配の蓄積ステップに達したか、最後のバッチの場合
             if ((i+1) % self.config.accum_step == 0) or (i == len(train_loader)-1):
@@ -285,7 +315,9 @@ class TCUSSTrainer:
                 torch.cuda.synchronize(torch.device("cuda"))
         
         # エポック全体の損失をログに記録
-        wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display})
+        train_loss = loss_growsp_display + self.config.lmb * loss_tarl_display
+        self.loss_history.append(train_loss)
+        wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, 'loss_tarl': loss_tarl_display, 'train_loss': train_loss})
     
     def train_growsp(self, growsp_data):
         """GrowSPのトレーニング"""
@@ -314,6 +346,40 @@ class TCUSSTrainer:
         """TARLのトレーニング"""
         coords_q, coords_k, segs_q, segs_k = tarl_data
         
+        # デバッグモードでTARLデータを保存
+        if self.config.debug:
+            print('TARLデータを保存します')
+            debug_dir = os.path.join(self.config.save_path, 'debug_tarl')
+            if not os.path.exists(debug_dir):
+                os.makedirs(debug_dir)
+            
+            # ファイル名の生成
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            
+            # バッチIDを取得
+            batch_ids = torch.unique(coords_q[:, 0])
+            if len(batch_ids) > 0:
+                # 最初のバッチを選択
+                batch_id = batch_ids[0].item()
+                
+                # クエリデータの抽出と保存
+                mask_q = coords_q[:, 0] == batch_id
+                points_q = coords_q[mask_q, 1:].detach().cpu().numpy() * self.config.voxel_size
+                seg_q = segs_q[int(batch_id)].cpu().numpy()
+                
+                # キーデータの抽出と保存
+                mask_k = coords_k[:, 0] == batch_id
+                points_k = coords_k[mask_k, 1:].detach().cpu().numpy() * self.config.voxel_size
+                seg_k = segs_k[int(batch_id)].cpu().numpy()
+                
+                # データ保存
+                np.save(os.path.join(debug_dir, f'points_q_{timestamp}.npy'), points_q)
+                np.save(os.path.join(debug_dir, f'segs_q_{timestamp}.npy'), seg_q)
+                np.save(os.path.join(debug_dir, f'points_k_{timestamp}.npy'), points_k)
+                np.save(os.path.join(debug_dir, f'segs_k_{timestamp}.npy'), seg_k)
+                
+                self.logger.info(f'TARLデータを保存しました: {debug_dir}')
+            exit()
         # 順方向と逆方向の損失を計算して合計
         loss = self.train_contrast_half(coords_q, coords_k, segs_q, segs_k)
         loss += self.train_contrast_half(coords_k, coords_q, segs_k, segs_q)
@@ -328,6 +394,7 @@ class TCUSSTrainer:
         
         # バッチIDの取得
         batch_ids = torch.unique(coords_q[:, 0])
+        
         seg_feats_q_list, mask_q_list = [], []
         
         # バッチごとの処理
@@ -335,20 +402,16 @@ class TCUSSTrainer:
             mask = coords_q[:, 0] == batch_id
             scene_feats_q = feats_q[mask]
             scene_segs_q = segs_q[int(batch_id)].to("cuda:0")
-            scene_seg_feats_q, mask_q = compute_segment_feats(scene_feats_q, scene_segs_q, max_seg_num=self.current_growsp)
+            scene_seg_feats_q, mask_q = compute_segment_feats(
+                scene_feats_q, scene_segs_q, max_seg_num=None, 
+                ignore_hdbscan_outliers=self.config.ignore_hdbscan_outliers
+            )
             seg_feats_q_list.append(scene_seg_feats_q)
             mask_q_list.append(mask_q)
         
         # 特徴とマスクのスタック
-        padded_seg_feats_q = torch.stack(seg_feats_q_list, dim=0)
-        batch_mask_q = torch.stack(mask_q_list, dim=0)
-        
-        # プロジェクションヘッドに入力
-        proj_feats_q = self.proj_head_q(padded_seg_feats_q, enc_mask=batch_mask_q)
-        
-        # プレディクターに入力
-        pred_feats_q = self.predictor(proj_feats_q, enc_mask=batch_mask_q)
-        pred_feats_q = F.normalize(pred_feats_q, dim=-1)
+        # バッチ内で最大セグメント数を計算
+        max_seg_num_in_batch = max(seg_feats.size(0) for seg_feats in seg_feats_q_list)
         
         # キーモデルでの特徴抽出（勾配計算なし）
         with torch.no_grad():
@@ -365,14 +428,78 @@ class TCUSSTrainer:
                 scene_feats_k = feats_k[mask]
                 scene_segs_k = segs_k[int(batch_id)].to("cuda:0")
                 scene_seg_feats_k, mask_k = compute_segment_feats(
-                    scene_feats_k, scene_segs_k, max_seg_num=self.current_growsp
+                    scene_feats_k, scene_segs_k, max_seg_num=None,
+                    ignore_hdbscan_outliers=self.config.ignore_hdbscan_outliers
                 )
                 seg_feats_k_list.append(scene_seg_feats_k)
                 mask_k_list.append(mask_k)
             
-            # 特徴とマスクのスタック
-            padded_seg_feats_k = torch.stack(seg_feats_k_list, dim=0)
-            batch_mask_k = torch.stack(mask_k_list, dim=0)
+            # クエリ側とキー側の最大セグメント数を統一
+            max_seg_num_k_in_batch = max(seg_feats.size(0) for seg_feats in seg_feats_k_list)
+            final_max_seg_num = max(max_seg_num_in_batch, max_seg_num_k_in_batch)
+        
+        # クエリ側パディング処理
+        padded_seg_feats_q_list = []
+        padded_mask_q_list = []
+        
+        for seg_feats, mask in zip(seg_feats_q_list, mask_q_list):
+            current_seg_num = seg_feats.size(0)
+            if current_seg_num < final_max_seg_num:
+                # 不足分をゼロパディング
+                padding_size = final_max_seg_num - current_seg_num
+                padded_feats = torch.cat([
+                    seg_feats,
+                    torch.zeros(padding_size, seg_feats.size(1), device=seg_feats.device)
+                ], dim=0)
+                padded_mask = torch.cat([
+                    mask,
+                    torch.ones(padding_size, dtype=torch.bool, device=mask.device)  # パディング部分はTrue（存在しない）
+                ], dim=0)
+            else:
+                padded_feats = seg_feats
+                padded_mask = mask
+            
+            padded_seg_feats_q_list.append(padded_feats)
+            padded_mask_q_list.append(padded_mask)
+        
+        padded_seg_feats_q = torch.stack(padded_seg_feats_q_list, dim=0)
+        batch_mask_q = torch.stack(padded_mask_q_list, dim=0)
+        
+        # プロジェクションヘッドに入力
+        proj_feats_q = self.proj_head_q(padded_seg_feats_q, enc_mask=batch_mask_q)
+        
+        # プレディクターに入力
+        pred_feats_q = self.predictor(proj_feats_q, enc_mask=batch_mask_q)
+        pred_feats_q = F.normalize(pred_feats_q, dim=-1)
+        
+        # キー側の特徴抽出は既に上で実行済み
+        with torch.no_grad():
+            # キー側パディング処理
+            padded_seg_feats_k_list = []
+            padded_mask_k_list = []
+            
+            for seg_feats, mask in zip(seg_feats_k_list, mask_k_list):
+                current_seg_num = seg_feats.size(0)
+                if current_seg_num < final_max_seg_num:
+                    # 不足分をゼロパディング
+                    padding_size = final_max_seg_num - current_seg_num
+                    padded_feats = torch.cat([
+                        seg_feats,
+                        torch.zeros(padding_size, seg_feats.size(1), device=seg_feats.device)
+                    ], dim=0)
+                    padded_mask = torch.cat([
+                        mask,
+                        torch.ones(padding_size, dtype=torch.bool, device=mask.device)  # パディング部分はTrue（存在しない）
+                    ], dim=0)
+                else:
+                    padded_feats = seg_feats
+                    padded_mask = mask
+                
+                padded_seg_feats_k_list.append(padded_feats)
+                padded_mask_k_list.append(padded_mask)
+            
+            padded_seg_feats_k = torch.stack(padded_seg_feats_k_list, dim=0)
+            batch_mask_k = torch.stack(padded_mask_k_list, dim=0)
             
             # プロジェクションヘッドに入力
             proj_feats_k = self.proj_head_k(padded_seg_feats_k, enc_mask=batch_mask_k)
@@ -488,6 +615,10 @@ class TCUSSTrainer:
             d.update(IoU_dict)
             wandb.log(d)
             
+            # 早期停止判定
+            if self.config.early_stopping and not self.early_stopped:
+                self._check_early_stopping(epoch, m_IoU)
+            
             # シルエットスコアの計算（オプション）
             if self.config.silhouette:
                 # SPCの評価
@@ -510,3 +641,87 @@ class TCUSSTrainer:
                     'SPC/Calinski-Harabasz': ch_score, 
                     'SPC/time': t
                 }) 
+
+    def _check_early_stopping(self, epoch: int, val_miou: float):
+        """早期停止判定を行う（新仕様）"""
+        # lmb依存の収束判定しきい値
+        loss_plateau = 0.003 if self.config.lmb <= 1.0 else 0.005 if self.config.lmb <= 2.0 else 0.01
+        
+        # 改善判定
+        if val_miou > self.best_metric_score + self.config.early_stopping_min_delta:
+            # 改善
+            self.best_metric_score = val_miou
+            self.best_epoch = epoch
+            self.patience_counter = 0
+            
+            # ベストモデルの保存
+            torch.save(
+                self.model_q.state_dict(), 
+                join(self.config.save_path, 'best_model.pth')
+            )
+            torch.save(
+                self.classifier.state_dict(), 
+                join(self.config.save_path, 'best_classifier.pth')
+            )
+            
+            self.logger.info(f'新しい最良val_mIoU: {val_miou:.4f} (エポック {epoch})')
+            wandb.log({
+                'epoch': epoch,
+                'best_val_miou': self.best_metric_score,
+                'best_epoch': self.best_epoch
+            })
+        else:
+            # 停滞
+            self.patience_counter += 1
+            self.logger.info(f'val_mIoU改善なし。停滞回数: {self.patience_counter}/{self.config.early_stopping_patience}')
+            
+            if self.patience_counter >= self.config.early_stopping_patience:
+                # 収束・過学習判定
+                should_stop = False
+                stop_reason = ""
+                
+                # train_loss相対変化率の計算（十分な履歴がある場合）
+                if len(self.loss_history) >= self.config.rel_drop_window:
+                    recent_loss = self.loss_history[-1]
+                    past_loss = self.loss_history[-self.config.rel_drop_window]
+                    rel_drop = (past_loss - recent_loss) / past_loss
+                    
+                    if rel_drop < loss_plateau:
+                        # 収束判定
+                        should_stop = True
+                        stop_reason = f"train_loss収束 (rel_drop={rel_drop:.6f} < {loss_plateau:.6f})"
+                
+                # 過学習判定
+                if val_miou < self.best_metric_score - self.config.overfit_drop:
+                    should_stop = True
+                    stop_reason = f"過学習検出 (val_mIoU={val_miou:.4f} < {self.best_metric_score:.4f} - {self.config.overfit_drop:.2f})"
+                
+                if should_stop:
+                    # ベストモデルをロードして早期停止
+                    self._load_best_model()
+                    self.early_stopped = True
+                    self.logger.info(f'早期停止: {stop_reason}. 最良エポック{self.best_epoch}のモデルをロード')
+                    wandb.log({
+                        'epoch': epoch,
+                        'early_stopped': True,
+                        'early_stop_reason': stop_reason,
+                        'early_stop_epoch': epoch,
+                        'best_final_epoch': self.best_epoch,
+                        'best_final_val_miou': self.best_metric_score
+                    })
+                else:
+                    # 継続 (wait = PATIENCE_VAL - 1)
+                    self.patience_counter = self.config.early_stopping_patience - 1
+                    self.logger.info("収束・過学習条件未達成。学習継続")
+                    
+    def _load_best_model(self):
+        """ベストモデルをロードする"""
+        best_model_path = join(self.config.save_path, 'best_model.pth')
+        best_classifier_path = join(self.config.save_path, 'best_classifier.pth')
+        
+        if os.path.exists(best_model_path) and os.path.exists(best_classifier_path):
+            self.model_q.load_state_dict(torch.load(best_model_path))
+            self.classifier.load_state_dict(torch.load(best_classifier_path))
+            self.logger.info(f'ベストモデル（エポック {self.best_epoch}）をロードしました')
+        else:
+            self.logger.warning('ベストモデルファイルが見つかりません') 

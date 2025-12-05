@@ -15,10 +15,8 @@ from lib.trainer import TCUSSTrainer
 
 def worker_init_fn(worker_id):
     """データローダーワーカーの初期化関数"""
-    if torch.cuda.device_count()-1 == 0:
-        gpu_id = 0
-    else:
-        gpu_id = (worker_id % (torch.cuda.device_count()-1)) + 1  # GPUをラウンドロビンで選択(GPU0はmodel用)
+    # GPU 0もデータ作成に使用するように変更
+    gpu_id = worker_id % torch.cuda.device_count()  # GPU0も含めたラウンドロビン
     torch.cuda.set_device(gpu_id)
     # WorkerごとにユニークなシードをNumPyに設定
     worker_seed = torch.initial_seed() % 2**32

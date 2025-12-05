@@ -30,10 +30,13 @@ class TCUSSConfig:
     tarl_lr: float = 0.0002  # Transformerプロジェクタとプレディクタの学習率
     weight_decay: float = 1e-2  # 重み減衰
     accum_step: int = 1  # 勾配蓄積ステップ
+    # TARL設定
+    lmb: float = 1.0  # TARL損失の重み
+    ignore_hdbscan_outliers: bool = True  # hdbscanの外れ値を学習から除外するかどうか
     
     # データロード設定
-    workers: int = 16  # データローディング用ワーカー数
-    cluster_workers: int = 16  # クラスタリング用ワーカー数
+    workers: int = 24  # データローディング用ワーカー数
+    cluster_workers: int = 24  # クラスタリング用ワーカー数
     batch_size: List[int] = field(default_factory=lambda: [16, 16])  # バッチサイズ [GrowSP, TARL]
     
     # 実験設定
@@ -65,6 +68,16 @@ class TCUSSConfig:
     cluster_interval: int = 10  # クラスタリング間隔
     eval_interval: int = 10  # 評価間隔
     silhouette: bool = False  # kmeansの追加評価指標
+    
+    # 早期停止設定
+    early_stopping: bool = True  # 早期停止を有効にするかどうか
+    early_stopping_patience: int = 3  # val停滞許容回数 (PATIENCE_VAL)
+    early_stopping_min_delta: float = 0.15  # val改善とみなす最小増分 (MIN_DELTA_VAL)
+    early_stopping_metric: str = 'val_mIoU'  # 早期停止の評価指標
+    early_stopping_mode: str = 'max'  # 早期停止のモード
+    rel_drop_window: int = 15  # train_loss収束判定用窓幅
+    overfit_drop: float = 0.30  # val過学習判定差分
+    # lmb依存の収束判定しきい値は動的に計算
     
     # デバッグ設定
     debug: bool = False  # デバッグモード
@@ -120,10 +133,11 @@ class TCUSSConfig:
         parser.add_argument('--tarl_lr', type=float, default=0.0002, help='Transformerプロジェクタとプレディクタの学習率')
         parser.add_argument('--weight_decay', type=float, default=1e-2, help='重み減衰')
         parser.add_argument('--accum_step', type=int, default=1, help='勾配蓄積ステップ')
+        parser.add_argument('--lmb', type=float, default=1.0, help='TARL損失の重み')
         
         # データロード設定
-        parser.add_argument('--workers', type=int, default=16, help='データローディング用ワーカー数')
-        parser.add_argument('--cluster_workers', type=int, default=16, help='クラスタリング用ワーカー数')
+        parser.add_argument('--workers', type=int, default=24, help='データローディング用ワーカー数')
+        parser.add_argument('--cluster_workers', type=int, default=24, help='クラスタリング用ワーカー数')
         parser.add_argument('--batch_size', type=int, nargs='+', default=[16, 16], 
                             help='バッチサイズ [GrowSP, TARL]')
         
@@ -157,6 +171,15 @@ class TCUSSConfig:
         parser.add_argument('--cluster_interval', type=int, default=10, help='クラスタリング間隔')
         parser.add_argument('--eval_interval', type=int, default=10, help='評価間隔')
         parser.add_argument('--silhouette', action='store_true', help='kmeansの追加評価指標')
+        
+        # 早期停止設定
+        parser.add_argument('--early_stopping', action='store_true', help='早期停止を有効にするかどうか')
+        parser.add_argument('--early_stopping_patience', type=int, default=3, help='val停滞許容回数 (PATIENCE_VAL)')
+        parser.add_argument('--early_stopping_min_delta', type=float, default=0.15, help='val改善とみなす最小増分 (MIN_DELTA_VAL)')
+        parser.add_argument('--early_stopping_metric', type=str, default='val_mIoU', help='早期停止の評価指標')
+        parser.add_argument('--early_stopping_mode', type=str, default='max', help='早期停止のモード')
+        parser.add_argument('--rel_drop_window', type=int, default=15, help='train_loss収束判定用窓幅')
+        parser.add_argument('--overfit_drop', type=float, default=0.30, help='val過学習判定差分')
         
         # デバッグ設定
         parser.add_argument('--debug', action='store_true', help='デバッグモード')

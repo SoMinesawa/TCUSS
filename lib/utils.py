@@ -352,44 +352,67 @@ def compute_hist(normal, bins=10, min=-1, max=1):
 
 def compute_segment_feats(feats: torch.Tensor,
                           segs: torch.Tensor,
-                          max_seg_num: int) -> Tuple[torch.Tensor, torch.Tensor]:
+                          max_seg_num: int,
+                          ignore_hdbscan_outliers: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    各セグメントごとの特徴量を平均し、固定サイズのテンソルを返す。
-    パディング部分のマスクも同時に返す。
-
+    セグメントごとの特徴量を計算する関数
+    
     Args:
-        feats: 形状 [N, D] の特徴量テンソル (N: ポイント数, D: 特徴次元)
-        segs: 形状 [N] のセグメントIDテンソル (-1 は無効)
-        max_seg_num: 出力するセグメント数の最大値 (例: current_growsp)
-
+        feats: 特徴量テンソル (N, D)
+        segs: セグメントIDテンソル (N,) 
+              -1は無効データ、-2はhdbscanの外れ値を表す
+        max_seg_num: 最大セグメント数（Noneの場合は動的に決定）
+        ignore_hdbscan_outliers: hdbscanの外れ値(-2)を除外するかどうか
+        
     Returns:
-        seg_feats: 形状 [max_seg_num, D] のテンソル
-            存在するセグメントIDの位置に平均特徴量が入り、
-            存在しないセグメントIDの位置は 0 で埋められる。
-        mask: 形状 [max_seg_num] の boolean テンソル
-            セグメントが存在する位置は True、存在しない位置は False。
+        seg_feats: セグメントごとの特徴量 (actual_max_seg_num, D)
+        mask: セグメントの存在マスク (actual_max_seg_num,)
+            セグメントが存在する位置は False、存在しない位置は True。
     """
     # 1. 無効データ (-1) を除外
     valid_mask = segs != -1
     feats = feats[valid_mask]
     segs = segs[valid_mask]
+    
+    # 2. hdbscanの外れ値 (-2) を除外
+    if ignore_hdbscan_outliers:
+        non_outlier_mask = segs != -2
+        feats = feats[non_outlier_mask]
+        segs = segs[non_outlier_mask]
+    
+    # 3. max_seg_numを動的に決定（外れ値を除外した後の最大ID+1）
+    if len(segs) > 0:
+        actual_max_seg_num = int(segs.max().item()) + 1
+    else:
+        actual_max_seg_num = 1  # デフォルト値
+    
+    # 4. max_seg_numが指定されている場合は、より大きい方を使用
+    if max_seg_num is not None:
+        actual_max_seg_num = max(actual_max_seg_num, max_seg_num)
+    
+    # 5. セグメントIDが範囲内にあることを確認し、範囲外のものを除外
+    if len(segs) > 0:
+        valid_range_mask = (segs >= 0) & (segs < actual_max_seg_num)
+        feats = feats[valid_range_mask]
+        segs = segs[valid_range_mask]
+    
+    # 6. 初期化
+    seg_feats_sum = torch.zeros(actual_max_seg_num, feats.shape[1], device=feats.device)
+    seg_counts = torch.zeros(actual_max_seg_num, device=feats.device)
 
-    # 2. 初期化
-    seg_feats_sum = torch.zeros(max_seg_num, feats.shape[1], device=feats.device)
-    seg_counts = torch.zeros(max_seg_num, device=feats.device)
+    # 7. 特徴量の合計とセグメントごとのカウント
+    if len(segs) > 0:
+        seg_feats_sum.index_add_(0, segs, feats)
+        seg_counts.index_add_(0, segs, torch.ones_like(segs, dtype=torch.float, device=feats.device))
 
-    # 3. 特徴量の合計とセグメントごとのカウント
-    seg_feats_sum.index_add_(0, segs, feats)
-    seg_counts.index_add_(0, segs, torch.ones_like(segs, dtype=torch.float, device=feats.device))
-
-    # 4. 平均計算 (ゼロ除算を防ぐ)
+    # 8. 平均計算 (ゼロ除算を防ぐ)
     seg_feats = torch.where(
         seg_counts.unsqueeze(-1) > 0,
         seg_feats_sum / seg_counts.unsqueeze(-1),
         torch.zeros_like(seg_feats_sum)
     )
 
-    # 5. 存在しないセグメントのマスク
+    # 9. 存在しないセグメントのマスク
     mask = seg_counts <= 0
 
     return seg_feats, mask
@@ -427,17 +450,36 @@ def calc_info_nce(seg_feats_q, seg_feats_k, mask_q, mask_k, temperature=0.07):
 
 
 def create_label(mask_row, mask_column, device):
-    label_row = torch.nonzero(mask_row, as_tuple=False).view(-1)
-    label_column = torch.nonzero(mask_column, as_tuple=False).view(-1)
-    result = torch.tensor([x if x in label_column else -100 for x in label_row]).to(device)
-    # 検索用のマスクを生成
-    index_map = torch.full_like(result, -1).to(device)
-    for idx, value in enumerate(label_column):
-        index_map[result == value] = idx
+    """
+    mask_row   : BoolTensor [S_row]  True ＝有効
+    mask_col   : BoolTensor [S_col]  True ＝有効
 
-    # 結果を保持するテンソルを生成
-    result = torch.where(index_map >= 0, index_map, result).to(device)
-    return result
+    戻り値
+      Tensor [#row_valid]  各行 seg が列側に存在すればその列インデックス，
+                          無ければ -100 (ignore_index)
+    すべて GPU 上で完結する実装。
+   """
+    # 有効 segID の取得 (GPU Tensor)
+    row_ids = torch.nonzero(mask_row, as_tuple=False).view(-1)   # (L_q)
+    col_ids = torch.nonzero(mask_column, as_tuple=False).view(-1) # (L_k)
+
+    # デフォルトは -100
+    target = torch.full((row_ids.size(0),), -100, device=device, dtype=torch.long)
+
+    if col_ids.numel() == 0 or row_ids.numel() == 0:
+        return target
+
+    # ブロードキャスト比較で一致行列を作成 (L_q × L_k)
+    eq_mat = row_ids[:, None] == col_ids[None, :]  # bool
+
+    # 行ごとに一致があるか
+    has_match = eq_mat.any(dim=1)
+    if has_match.any():
+        # 最初に True になる列インデックスを取得
+        col_indices = eq_mat.float().argmax(dim=1)
+    target[has_match] = col_indices[has_match]
+
+    return target
 
 
 @torch.no_grad()

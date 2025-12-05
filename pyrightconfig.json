@@ -1,0 +1,10 @@
+{
+    "exclude": [
+        "data"
+    ],
+    "ignore": [
+        "data"
+    ],
+    "reportMissingImports": true,
+    "reportMissingTypeStubs": false
+}

@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--bn_momentum', type=float, default=0.02, help='バッチ正規化のパラメータ')
     parser.add_argument('--conv1_kernel_size', type=int, default=5, help='第1畳み込み層のカーネルサイズ')
     ####
-    parser.add_argument('--workers', type=int, default=10, help='データローディング用ワーカー数')
-    parser.add_argument('--cluster_workers', type=int, default=10, help='クラスタリング用ワーカー数')
+    parser.add_argument('--workers', type=int, default=24, help='データローディング用ワーカー数')
+    parser.add_argument('--cluster_workers', type=int, default=24, help='クラスタリング用ワーカー数')
     parser.add_argument('--seed', type=int, default=2022, help='乱数シード')
     parser.add_argument('--voxel_size', type=float, default=0.15, help='SparseConvのボクセルサイズ')
     parser.add_argument('--input_dim', type=int, default=3, help='ネットワーク入力次元')
@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--feats_dim', type=int, default=128, help='出力特徴次元')
     parser.add_argument('--ignore_label', type=int, default=-1, help='無効ラベル')
     parser.add_argument('--eval_epoch', type=int, help='評価する特定のエポック（指定しない場合は全エポック）')
+    parser.add_argument('--eval_select_num', type=int, default=4071, help='評価に使用するデータ数')
+    parser.add_argument('--eval_backward_num', type=int, default=1, help='eval_epoch指定時に逆順で評価するエポック数')
     return parser.parse_args()
 
 def set_seed(seed: int) -> None:
@@ -185,7 +187,7 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
     m_IoU = np.nanmean(IoUs)
     IoU_list = []
     class_name_IoU_list = ["IoU_unlabeled", "IoU_car", "IoU_bicycle", "IoU_motorcycle", "IoU_truck", "IoU_other-vehicle", "IoU_person", "IoU_bicyclist", "IoU_motorcyclist", "IoU_road", "IoU_parking", "IoU_sidewalk", "IoU_other-ground", "IoU_building", "IoU_fence", "IoU_vegetation", "IoU_trunck", "IoU_terrian", "IoU_pole", "IoU_traffic-sign"]
-    s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
+    s = '| mIoU {:5.2f} | '.format(m_IoU)
     for IoU in IoUs:
         s += '{:5.2f} '.format(IoU)
         IoU_list.append(IoU)
@@ -206,6 +208,61 @@ def extract_epoch_from_filename(filename: str) -> Optional[int]:
     if match:
         return int(match.group(1))
     return None
+
+
+def find_epochs_backward(start_epoch: int, eval_backward_num: int, available_epochs: List[int]) -> List[int]:
+    """指定されたエポックから逆順に存在するエポックを指定数見つける関数
+    
+    Args:
+        start_epoch: 開始エポック
+        eval_backward_num: 見つけるエポック数
+        available_epochs: 利用可能なエポックのリスト
+    
+    Returns:
+        見つかったエポックのリスト
+    """
+    found_epochs = []
+    current_epoch = start_epoch
+    
+    while len(found_epochs) < eval_backward_num and current_epoch >= 0:
+        if current_epoch in available_epochs:
+            found_epochs.append(current_epoch)
+        current_epoch -= 1
+    
+    return found_epochs
+
+
+def calculate_statistics(results: List[Tuple[int, float, float, float]]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """評価結果の統計を計算する関数
+    
+    Args:
+        results: (epoch, oAcc, mAcc, mIoU) のリスト
+    
+    Returns:
+        means: 平均値の辞書
+        stds: 標準偏差の辞書
+    """
+    if not results:
+        return {}, {}
+    
+    epochs = [r[0] for r in results]
+    o_accs = [r[1] for r in results]
+    m_accs = [r[2] for r in results]
+    m_ious = [r[3] for r in results]
+    
+    means = {
+        'oAcc': float(np.mean(o_accs)),
+        'mAcc': float(np.mean(m_accs)),
+        'mIoU': float(np.mean(m_ious))
+    }
+    
+    stds = {
+        'oAcc': float(np.std(o_accs, ddof=1)) if len(o_accs) > 1 else 0.0,
+        'mAcc': float(np.std(m_accs, ddof=1)) if len(m_accs) > 1 else 0.0,
+        'mIoU': float(np.std(m_ious, ddof=1)) if len(m_ious) > 1 else 0.0
+    }
+    
+    return means, stds
 
 
 if __name__ == '__main__':
@@ -238,13 +295,51 @@ if __name__ == '__main__':
     
     # 特定のエポックが指定されている場合
     if args.eval_epoch is not None:
-        if args.eval_epoch in epoch_numbers:
-            print(f"指定されたエポック {args.eval_epoch} を評価します")
-            o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(args.eval_epoch, args)
-            print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(args.eval_epoch, o_Acc, m_Acc, m_IoU))
-            print(s)
+        if args.eval_backward_num == 1:
+            # 単一エポック評価（従来の動作）
+            if args.eval_epoch in epoch_numbers:
+                print(f"指定されたエポック {args.eval_epoch} を評価します")
+                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(args.eval_epoch, args)
+                print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(args.eval_epoch, o_Acc, m_Acc, m_IoU))
+                print(s)
+            else:
+                print(f"エラー: エポック {args.eval_epoch} のチェックポイントが見つかりません")
         else:
-            print(f"エラー: エポック {args.eval_epoch} のチェックポイントが見つかりません")
+            # 複数エポック逆順評価
+            target_epochs = find_epochs_backward(args.eval_epoch, args.eval_backward_num, epoch_numbers)
+            
+            if not target_epochs:
+                print(f"エラー: エポック {args.eval_epoch} から逆順に評価可能なチェックポイントが見つかりません")
+            elif len(target_epochs) < args.eval_backward_num:
+                print(f"警告: 要求された {args.eval_backward_num} エポック中、{len(target_epochs)} エポックのみ見つかりました")
+                print(f"評価対象エポック: {target_epochs}")
+            else:
+                print(f"エポック {args.eval_epoch} から逆順に {args.eval_backward_num} エポックを評価します")
+                print(f"評価対象エポック: {target_epochs}")
+            
+            # 複数エポックの評価を実行
+            multi_results = []
+            for epoch in target_epochs:
+                print(f"\n--- エポック {epoch} の評価開始 ---")
+                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
+                multi_results.append((epoch, o_Acc, m_Acc, m_IoU))
+                print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, m_Acc, m_IoU))
+                print(s)
+            
+            # 統計計算と表示
+            if len(multi_results) > 0:
+                means, stds = calculate_statistics(multi_results)
+                
+                print(f"\n========== {len(multi_results)} エポック評価統計 ==========")
+                print(f"評価したエポック: {[r[0] for r in multi_results]}")
+                print(f"oAcc - 平均: {means['oAcc']:.2f}, 標準偏差: {stds['oAcc']:.2f}")
+                print(f"mAcc - 平均: {means['mAcc']:.2f}, 標準偏差: {stds['mAcc']:.2f}")
+                print(f"mIoU - 平均: {means['mIoU']:.2f}, 標準偏差: {stds['mIoU']:.2f}")
+                
+                # 個別結果の表示
+                print("\n個別結果:")
+                for epoch, o_Acc, m_Acc, m_IoU in multi_results:
+                    print(f"Epoch {epoch}: oAcc {o_Acc:.2f}, mAcc {m_Acc:.2f}, mIoU {m_IoU:.2f}")
     else:
         # 通常モードでは全てのチェックポイントを評価
         print(f"合計 {len(epoch_numbers)} エポックのチェックポイントを評価します")
