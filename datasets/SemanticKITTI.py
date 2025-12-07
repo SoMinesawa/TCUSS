@@ -319,13 +319,14 @@ class KITTItrain(Dataset):
             region[region != -1] = valid_region
             # region = np.array([1, -1, 0, 1, 2, -1])のようになる
 
-            pseudo = -np.ones_like(labels).astype(np.long)
+            # np.long は非推奨なので int64 で置換
+            pseudo = -np.ones_like(labels).astype(np.int64)
 
         else:
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
             file_path = os.path.join(self.args.pseudo_label_path, scene_name.lstrip("/") + '.npy')
-            pseudo = np.array(np.load(file_path), dtype=np.long)
+            pseudo = np.array(np.load(file_path), dtype=np.int64)
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
 
