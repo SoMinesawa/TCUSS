@@ -1,0 +1,24 @@
+
+dataset_path: data/Argoverse2/preprocess_v2/sensor
+checkpoint: checkpoints/seflow_best.ckpt
+av2_mode: val # [val, test]
+save_res: False # [True, False]
+
+leaderboard_version: 1 # [1, 2]
+supervised_flag: True # [True, False], whether you use any label from the dataset
+with_trainval: False # [True, False], whether you use the trainval for eval
+using_pwpp_gm: False
+with_size_bucket_eval: False
+use_demo_data: False
+
+# no need to change
+slurm_id: 00000
+output: ${model.name}-${slurm_id}
+gpus: 1
+seed: 42069
+eval_only: True
+wandb_mode: offline # [offline, disabled, online]
+wandb_project_name: sceneflow_translation_voting
+defaults:
+  - hydra: default
+  - model: deflow
