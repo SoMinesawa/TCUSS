@@ -63,6 +63,9 @@ def set_seed(seed):
 
 def setup_datasets(config):
     """データセットとデータローダーの設定"""
+    train_workers = 0 if config.vis else config.workers
+    cluster_workers = 0 if config.vis else config.cluster_workers
+
     # トレーニングデータセットとデータローダー
     trainset = KITTItcuss(config)
     train_loader = DataLoader(
@@ -70,7 +73,7 @@ def setup_datasets(config):
         batch_size=config.batch_size[0], 
         shuffle=True, 
         collate_fn=cfl_collate_fn_tcuss(), 
-        num_workers=config.workers, 
+        num_workers=train_workers, 
         pin_memory=True, 
         worker_init_fn=worker_init_fn
     )
@@ -84,7 +87,7 @@ def setup_datasets(config):
         clusterset, 
         batch_size=1, 
         collate_fn=cfl_collate_fn(), 
-        num_workers=config.cluster_workers, 
+        num_workers=cluster_workers, 
         pin_memory=True
     )
     

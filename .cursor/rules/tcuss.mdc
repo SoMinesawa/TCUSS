@@ -20,3 +20,8 @@ TCUSSとは、私のComputer Vision研究プロジェクト名です。TCUSSは�
 - 一度の会話ターンに複数回コードの変更をしないでください。
 - 基本的にはtrain_SemanticKITTI.pyを実行してもらうことになると思うのですが、実行コマンドはtcussというAnaconda環境をアクティベートしたうえで、次のフォーマットに従ってください。WANDB_MODE=disabled python train_SemanticKITTI.py --name debug --save_path data/users/minesawa/semantickitti/debug --workers 0 --cluster_workers 0 --batch_size 16 16 --select_num 128 --eval_select_num 16 --max_epoch 2 2 --cluster_interval 1
 
+
+<!-- # 可視化のための保存形式
+点群を可視化したい時には、以下のフォーマットでの保存までを実行してください。可視化は別の環境で私がする。
+- {save_dir}/vis/velodyne/{scan_num}.bin は float32 の [x, y, z, remission] が N 行並んだバイナリ。
+- {save_dir}/vis/labels/{scan_num}.label（または .bin/.npy）は各点1つの uint32。下位16bitが semantic ID，上位16bitが instance ID。今回はpanopticではなくsemantic segmentationなので、instance idは0でいい。 -->

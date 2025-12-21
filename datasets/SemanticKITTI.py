@@ -5,13 +5,13 @@ from torch.utils.data import Dataset
 import MinkowskiEngine as ME
 import random
 import os
+import sys
 import open3d as o3d
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional, Union, Any
 # import cuml  # GPU版（コメントアウト）
-import hdbscan  # CPU版を使用
                 
                 
 class cfl_collate_fn:
@@ -342,6 +342,7 @@ class KITTItemporal(Dataset):
         
         # 外れ値IDを追跡するための属性
         self.current_outlier_ids = {}  # バッチごとの外れ値IDを保存
+        self.vis_saved = False  # vis時に一度だけ書き出すためのフラグ
         
         self.file = []
         seq_list = np.sort(os.listdir(self.args.data_path))
@@ -402,9 +403,6 @@ class KITTItemporal(Dataset):
         coords_t2, labels_t2, _, _, _, region_num_t2 = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
         scene_idx_in_window = [(self.window_start_locates[index][0], self.window_start_locates[index][1]+i) for i in range(self.args.scan_window)]
         coords_tn, labels_tn, unique_map_tn, _, mask_tn, _ = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
-        if self.args.vis:
-            for i, coord in enumerate(coords_tn):
-                np.save(f'tmp/data/coords_{i}.npy', coord)
         agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn)
         agg_segs, outlier_id = self._clusterize_pcds(agg_coords, agg_ground_labels, region_num_t1, region_num_t2)
         
@@ -412,16 +410,77 @@ class KITTItemporal(Dataset):
         if outlier_id is not None:
             agg_segs[agg_segs == outlier_id] = -2
         
+        # vis用にフル長保持
+        agg_segs_full = agg_segs.copy()
+        
         segs_tn = []
+        start = 0
         for elements_num in elements_nums:
-            segs_tn.append(agg_segs[:elements_num])
-            agg_segs = agg_segs[elements_num:]
+            segs_tn.append(agg_segs_full[start:start+elements_num])
+            start += elements_num
         idx_t1_in_window = scene_idx_in_window.index((seq_t1, idx_t1))
         idx_t2_in_window = scene_idx_in_window.index((seq_t2, idx_t2))
         segs_t1 = segs_tn[idx_t1_in_window]
         segs_t2 = segs_tn[idx_t2_in_window]
+        
+        if self.args.vis and not self.vis_saved:
+            self._save_vis_results(scene_idx_in_window, agg_coords, agg_segs_full, elements_nums)
+            self.vis_saved = True
             
         return coords_t1, coords_t2, segs_t1, segs_t2
+
+
+    def _save_vis_results(self, scene_idx_in_window: List[Tuple[int, int]], agg_coords: np.ndarray,
+                          agg_segs: np.ndarray, elements_nums: List[int]) -> None:
+        """visモードのときに集約結果と各フレームのセグをPLYで保存する"""
+        # ラベルに応じたカラー付き ASCII PLY を書き出す簡易ヘルパ
+        def _write_colored_ascii_ply(path: str, coords: np.ndarray, labels: np.ndarray) -> None:
+            palette = np.array([
+                (166, 206, 227), (31, 120, 180), (178, 223, 138), (51, 160, 44), (251, 154, 153),
+                (227, 26, 28), (253, 191, 111), (255, 127, 0), (202, 178, 214), (106, 61, 154),
+                (255, 255, 153), (177, 89, 40), (141, 211, 199), (255, 255, 179), (190, 186, 218),
+                (251, 128, 114), (128, 177, 211), (253, 180, 98), (179, 222, 105), (252, 205, 229)
+            ], dtype=np.uint8)
+
+            coords = coords.astype(np.float32)
+            labels = np.asarray(labels, dtype=np.int32).reshape(-1)
+
+            with open(path, 'w', encoding='ascii') as f:
+                f.write('ply\n')
+                f.write('format ascii 1.0\n')
+                f.write(f'element vertex {coords.shape[0]}\n')
+                f.write('property float x\n')
+                f.write('property float y\n')
+                f.write('property float z\n')
+                f.write('property uchar red\n')
+                f.write('property uchar green\n')
+                f.write('property uchar blue\n')
+                f.write('property int label\n')
+                f.write('end_header\n')
+                for (x, y, z), label in zip(coords, labels):
+                    r, g, b = palette[label % len(palette)]
+                    f.write(f'{x} {y} {z} {r} {g} {b} {int(label)}\n')
+
+        seq = scene_idx_in_window[0][0]
+        last_idx = scene_idx_in_window[-1][1]
+        save_root = os.path.join(self.args.save_path, 'vis', 'tarl_kmeans80', str(seq).zfill(2))
+        os.makedirs(save_root, exist_ok=True)
+
+        # 集約した点群（最後のフレーム座標系）を保存
+        agg_path = os.path.join(save_root, f"{last_idx:06d}_agg.ply")
+        _write_colored_ascii_ply(agg_path, agg_coords, agg_segs)
+
+        # 各フレームの点群（同一座標系）を保存
+        start = 0
+        for (_, idx), num in zip(scene_idx_in_window, elements_nums):
+            coords_frame = agg_coords[start:start+num]
+            segs_frame = agg_segs[start:start+num]
+            frame_path = os.path.join(save_root, f"{idx:06d}.ply")
+            _write_colored_ascii_ply(frame_path, coords_frame, segs_frame)
+            start += num
+
+        # 1回出力したら終了
+        sys.exit(0)
 
     
     def _aggretate_pcds(self, scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn): # labels_tnはvis用
@@ -448,7 +507,7 @@ class KITTItemporal(Dataset):
     
     def _clusterize_pcds(self, agg_coords, agg_ground_labels, region_num_t1, region_num_t2):
         """
-        Clusterize point clouds using hdbscan library instead of k-means
+        Clusterize point clouds with a simple k-means (k=80). Temporary change.
         
         Args:
             agg_coords: Aggregated coordinates
@@ -458,7 +517,7 @@ class KITTItemporal(Dataset):
             
         Returns:
             agg_segs: Segmentation labels
-            outlier_id: ID assigned to hdbscan outlier points (None if no outliers)
+            outlier_id: Always None for k-means (kept for interface compatibility)
         """
         
         # 地面マスクの作成（元のコードと同様）
@@ -466,43 +525,14 @@ class KITTItemporal(Dataset):
         mask_ground = mask_ground.flatten()
         non_ground_coords = agg_coords[~mask_ground]
         
-        outlier_id = None  # hdbscanの外れ値IDを追跡
+        outlier_id = None
         
         if len(non_ground_coords) > 0:
-            # hdbscanライブラリを使用（CPU版）
-            # clusterer = hdbscan.HDBSCAN(algorithm='best', alpha=1., approx_min_span_tree=True,
-            #                     gen_min_span_tree=True, leaf_size=100,
-            #                     metric='euclidean', min_cluster_size=20, min_samples=None
-            #                 )
-            clusterer = hdbscan.HDBSCAN(
-                algorithm='best',
-                metric='euclidean',
-                min_cluster_size=100,
-                min_samples=20,
-                alpha=1.0,
-                cluster_selection_epsilon=0.8, # こいつ重要かも 0.6だとちょっと分けすぎで、0.8だと訳なさすぎる
-                cluster_selection_method='eom',
-                leaf_size=100,
-                approx_min_span_tree=True,
-                gen_min_span_tree=True
-            )
-            # print(f"non_ground_coords shape: {non_ground_coords.shape}")
-            labels = clusterer.fit_predict(non_ground_coords)
-            
-            # CPU版のhdbscanは直接NumPy配列を返すので、変換不要
-            
-            # ノイズポイント（-1ラベル）を適切に処理
-            # 元のk-meansは常に非負のラベルを返すので、-1を最大ラベル+1に変更
-            if (labels == -1).any():
-                max_valid_label = labels[labels >= 0].max() if (labels >= 0).any() else -1
-                outlier_id = max_valid_label + 1  # hdbscanの外れ値IDを記録
-                labels[labels == -1] = outlier_id
-            
-            # 地面ラベルのための値を動的に決定
+            labels = get_kmeans_labels(n_clusters=80, pcds=non_ground_coords)
+            labels = labels.to('cpu').numpy().astype(np.int64).flatten()
             dynamic_ground_label = labels.max() + 1 if len(labels) > 0 else 0
-            
         else:
-            labels = np.array([])
+            labels = np.array([], dtype=np.int64)
             dynamic_ground_label = 0
             
         # セグメンテーション配列の作成（元のコードと同様）

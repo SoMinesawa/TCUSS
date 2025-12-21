@@ -188,8 +188,12 @@ class TCUSSTrainer:
     
     def train(self, train_loader: DataLoader, cluster_loader: DataLoader):
         """モデルのトレーニングメイン関数"""
+        # vis時はwandbをdisableに設定
+        if self.config.vis:
+            os.environ["WANDB_MODE"] = "disabled"
+
         # Weights & Biasesの初期化
-        run = self.init_wandb()
+        _ = self.init_wandb()
         
         # オプティマイザとスケジューラの設定
         self.setup_optimizer()
