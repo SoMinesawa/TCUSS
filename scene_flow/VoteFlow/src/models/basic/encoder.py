@@ -3,7 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple
 
-from mmcv.ops import Voxelization, DynamicScatter
+# VoteFlowの独自mmcvパッケージを使用
+try:
+    from assets.cuda.mmcv import Voxelization, DynamicScatter
+except ImportError:
+    from mmcv.ops import Voxelization, DynamicScatter
 
 def get_paddings_indicator(actual_num, max_num, axis=0):
     """Create boolean mask by actually number of a padded tensor.

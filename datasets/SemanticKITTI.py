@@ -10,8 +10,13 @@ import open3d as o3d
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
 from tqdm import tqdm
-from typing import List, Tuple, Dict, Optional, Union, Any
+from typing import List, Tuple, Dict, Optional, Union, Any, Set
 # import cuml  # GPU版（コメントアウト）
+
+# 移動物体のraw labelリスト（SemanticKITTI定義）
+# 252: moving-car, 253: moving-bicyclist, 254: moving-person, 255: moving-motorcyclist,
+# 256: moving-on-rails, 257: moving-bus, 258: moving-truck, 259: moving-other-vehicle
+MOVING_RAW_LABELS: Set[int] = {252, 253, 254, 255, 256, 257, 258, 259}
                 
                 
 class cfl_collate_fn:
@@ -734,6 +739,29 @@ class KITTIval(Dataset):
             random_indices = random.sample(range(len(self.file)), args.eval_select_num)
             self.file = [self.file[i] for i in random_indices]
             self.name = [self.name[i] for i in random_indices]
+    
+    def _load_raw_labels(self, seq_id: str, frame_id: str) -> np.ndarray:
+        """元の.labelファイルからraw labelsを読み込む
+        
+        Args:
+            seq_id: シーケンスID（例: '08'）
+            frame_id: フレームID（例: '000000'）
+        
+        Returns:
+            raw_labels: 元のセマンティックラベル（252-259は移動物体）
+        """
+        label_path = os.path.join(
+            self.args.original_data_path, 
+            seq_id, 
+            'labels', 
+            f'{frame_id}.label'
+        )
+        if not os.path.exists(label_path):
+            raise FileNotFoundError(f'Raw label file not found: {label_path}')
+        
+        label = np.fromfile(label_path, dtype=np.uint32)
+        sem_label = label & 0xFFFF  # semantic label in lower half
+        return sem_label.astype(np.int32)
 
     def augment_coords_to_feats(self, coords, feats, labels=None):
         coords_center = coords.mean(0, keepdims=True)
@@ -758,6 +786,10 @@ class KITTIval(Dataset):
         coords = np.array([data['x'], data['y'], data['z']], dtype=np.float32).T
         feats = np.array(data['remission'])[:, np.newaxis]
         labels = np.array(data['class'])
+        
+        # 元座標を保持（距離計算用）
+        original_coords = coords.copy()
+        
         coords = coords.astype(np.float32)
         coords -= coords.mean(0)
 
@@ -769,9 +801,17 @@ class KITTIval(Dataset):
         region = region[unique_map]
 
         coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
+        
+        # raw labelsを読み込む（移動物体判定用）
+        # name[index]は '/08/000000' のような形式
+        name_parts = self.name[index].strip('/').split('/')
+        seq_id = name_parts[0]  # '08'
+        frame_id = name_parts[1]  # '000000'
+        raw_labels = self._load_raw_labels(seq_id, frame_id)
+        
         # labels -= 1 別にいらんよ。だってtrainでは、validゾーン作るためにlabel=-1を作っていたわけだから。
         # labels[labels == self.args.ignore_label - 1] = self.args.ignore_label
-        return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index
+        return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index, original_coords, raw_labels
 
 
 class KITTItest(Dataset):
@@ -859,9 +899,11 @@ class KITTItest(Dataset):
 class cfl_collate_fn_val:
 
     def __call__(self, list_data):
-        coords, feats, labels, inverse_map, region, index = list(zip(*list_data))
+        coords, feats, labels, inverse_map, region, index, original_coords, raw_labels = list(zip(*list_data))
         coords_batch, feats_batch, inverse_batch, labels_batch = [], [], [], []
         region_batch = []
+        original_coords_batch = []
+        raw_labels_batch = []
         for batch_id, _ in enumerate(coords):
             num_points = coords[batch_id].shape[0]
             coords_batch.append(
@@ -870,6 +912,9 @@ class cfl_collate_fn_val:
             inverse_batch.append(torch.from_numpy(inverse_map[batch_id]))
             labels_batch.append(torch.from_numpy(labels[batch_id]).int())
             region_batch.append(torch.from_numpy(region[batch_id])[:, None])
+            # 追加: 元座標とraw labels
+            original_coords_batch.append(torch.from_numpy(original_coords[batch_id]).float())
+            raw_labels_batch.append(torch.from_numpy(raw_labels[batch_id]).int())
         #
         # Concatenate all lists
         coords_batch = torch.cat(coords_batch, 0).float()
@@ -877,8 +922,10 @@ class cfl_collate_fn_val:
         inverse_batch = torch.cat(inverse_batch, 0).int()
         labels_batch = torch.cat(labels_batch, 0).int()
         region_batch = torch.cat(region_batch, 0)
+        original_coords_batch = torch.cat(original_coords_batch, 0)
+        raw_labels_batch = torch.cat(raw_labels_batch, 0)
 
-        return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch
+        return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch, original_coords_batch, raw_labels_batch
 
 
 class cfl_collate_fn_test:
@@ -904,3 +951,296 @@ class cfl_collate_fn_test:
         region_batch = torch.cat(region_batch, 0)
 
         return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch, file_path
+
+
+class KITTIstc(Dataset):
+    """STC (Superpoint Time Consistency) 学習用データセット
+    
+    連続する2フレーム（時刻tとt+1）のデータを返す。
+    各フレームは独立してSPラベルを持つ。
+    """
+    
+    def __init__(self, args):
+        self.args = args
+        self.seq_to_scan_num = {0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201}
+        
+        self.file = []
+        seq_list = np.sort(os.listdir(self.args.data_path))
+        for seq_id in seq_list:
+            seq_path = os.path.join(self.args.data_path, seq_id)
+            if seq_id in ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10']:
+                for f in np.sort(os.listdir(seq_path)):
+                    self.file.append(os.path.join(seq_path, f))
+        
+        self.scene_locates = None
+        self.scene_diff_locates = None
+        self.trans_coords = trans_coords(shift_ratio=50)
+        self.rota_coords = rota_coords(rotation_bound=((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
+        self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
+    
+    def _random_select_samples(self):
+        """ランダムに連続フレームペアを選択（scan_window=1固定）"""
+        scene_idx = np.random.choice(19130, self.args.select_num // 2, replace=False).tolist()
+        scene_locates = []
+        
+        for idx in scene_idx:
+            scan_num = 0
+            for seq, seq_scan_num in self.seq_to_scan_num.items():
+                if idx < scan_num + seq_scan_num:
+                    scene_locates.append((seq, idx - scan_num))
+                    break
+                scan_num += seq_scan_num
+        
+        # t+1は常に1フレーム後（連続フレーム）
+        scene_diff_locates = []
+        for seq, idx in scene_locates:
+            t1_idx = idx + 1
+            if t1_idx >= self.seq_to_scan_num[seq]:
+                t1_idx = idx - 1  # シーケンス末尾の場合は1つ前
+                if t1_idx < 0:
+                    t1_idx = idx  # それも無理なら同じフレーム
+            scene_diff_locates.append((seq, t1_idx))
+        
+        self.scene_locates = scene_locates
+        self.scene_diff_locates = scene_diff_locates
+    
+    def __len__(self):
+        return len(self.scene_locates) if self.scene_locates else 0
+    
+    def __getitem__(self, index):
+        seq_t, idx_t = self.scene_locates[index]
+        seq_t1, idx_t1 = self.scene_diff_locates[index]
+        
+        # 時刻tのデータ
+        coords_t, coords_t_original, sp_labels_t, pose_t = self._get_item_one_scene(seq_t, idx_t)
+        # 時刻t+1のデータ
+        coords_t1, coords_t1_original, sp_labels_t1, pose_t1 = self._get_item_one_scene(seq_t1, idx_t1)
+        
+        # scene_name（キャッシュ参照用）
+        scene_name_t = self._tuple_to_scene_name((seq_t, idx_t))
+        scene_name_t1 = self._tuple_to_scene_name((seq_t1, idx_t1))
+        
+        return coords_t, coords_t1, coords_t_original, coords_t1_original, sp_labels_t, sp_labels_t1, pose_t, pose_t1, scene_name_t, scene_name_t1
+    
+    def _tuple_to_scene_name(self, tup: Tuple[int, int]) -> str:
+        """シーン名を生成（KITTItrainと同じフォーマット）"""
+        return f'/{str(tup[0]).zfill(2)}/{str(tup[1]).zfill(6)}'
+    
+    def _get_item_one_scene(self, seq: int, idx: int):
+        """1シーンのデータを取得"""
+        coords, feats, labels = self._load_ply(seq, idx)
+        coords_original = coords.copy()
+        means = coords.mean(0)
+        coords -= means
+        
+        coords, feats, labels, unique_map, inverse_map = self._voxelize(coords, feats, labels)
+        coords = coords.astype(np.float32)
+        
+        mask = np.sqrt(((coords * self.args.voxel_size) ** 2).sum(-1)) < self.args.r_crop
+        coords = coords[mask]
+        
+        # SPラベルを取得
+        sp_file = self._tuple_to_sp_path((seq, idx))
+        sp_labels = np.load(sp_file)
+        sp_labels = sp_labels[unique_map]
+        sp_labels = sp_labels[mask]
+        
+        # poseを取得
+        poses = self._load_poses(seq)
+        pose = poses[idx]
+        
+        # オリジナル座標（mask後）
+        coords_original_masked = coords_original[unique_map][mask]
+        
+        return coords, coords_original_masked, sp_labels, pose
+    
+    def _load_ply(self, seq: int, idx: int):
+        ply_path = self._tuple_to_path((seq, idx))
+        data = read_ply(ply_path)
+        coords = np.array([data['x'], data['y'], data['z']], dtype=np.float32).T
+        feats = np.array(data['remission'])[:, np.newaxis]
+        labels = np.array(data['class'])
+        return coords, feats, labels
+    
+    def _voxelize(self, coords, feats, labels):
+        # MinkowskiEngineはcontiguousな入力を要求するため明示的に整形
+        coords = np.ascontiguousarray(coords)
+        feats = np.ascontiguousarray(feats)
+        labels = np.ascontiguousarray(labels)
+
+        res = ME.utils.sparse_quantize(
+            coords,
+            return_index=True,
+            return_inverse=True,
+            quantization_size=self.args.voxel_size,
+            return_maps_only=True
+        )
+
+        # MEの戻り値はreturn_maps_only=Trueの場合 (unique_map, inverse_map) の2要素
+        if len(res) == 2:
+            unique_map, inverse_map = res
+        else:
+            # safety fallback
+            quantized_coords, voxel_idx, inverse_map, voxel_counts = res
+            original_idx = np.arange(len(coords))
+            unique_map = original_idx[voxel_idx]
+
+        quantized_coords = coords[unique_map]
+        feats = feats[unique_map]
+        labels = labels[unique_map]
+        quantized_coords = (quantized_coords / self.args.voxel_size)
+        
+        return quantized_coords, feats, labels, unique_map, inverse_map
+    
+    def _tuple_to_path(self, tup):
+        return os.path.join(self.args.data_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.ply')
+    
+    def _tuple_to_sp_path(self, tup):
+        # 他クラスと同様に"_superpoint.npy"の命名規則に統一
+        return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
+    
+    def _load_poses(self, seq: int):
+        calib_fname = os.path.join(self.args.original_data_path, str(seq).zfill(2), 'calib.txt')
+        poses_fname = os.path.join(self.args.original_data_path, str(seq).zfill(2), 'poses.txt')
+        calibration = self._parse_calibration(calib_fname)
+        
+        Tr = calibration["Tr"]
+        Tr_inv = np.linalg.inv(Tr)
+        
+        poses = []
+        with open(poses_fname) as poses_file:
+            for line in poses_file:
+                values = [float(v) for v in line.strip().split()]
+                pose = np.zeros((4, 4))
+                pose[0, 0:4] = values[0:4]
+                pose[1, 0:4] = values[4:8]
+                pose[2, 0:4] = values[8:12]
+                pose[3, 3] = 1.0
+                poses.append(np.matmul(Tr_inv, np.matmul(pose, Tr)))
+        
+        return np.array(poses)
+    
+    def _parse_calibration(self, filename):
+        calibration = {}
+        with open(filename) as calib_file:
+            for line in calib_file:
+                key, content = line.strip().split(":")
+                values = [float(v) for v in content.strip().split()]
+                pose = np.zeros((4, 4))
+                pose[0, 0:4] = values[0:4]
+                pose[1, 0:4] = values[4:8]
+                pose[2, 0:4] = values[8:12]
+                pose[3, 3] = 1.0
+                calibration[key] = pose
+        return calibration
+    
+    def _tuple_to_scene_idx(self, tup):
+        seq, idx = tup
+        scene_idx = 0
+        for s in self.seq_to_scan_num.keys():
+            if s < seq:
+                scene_idx += self.seq_to_scan_num[s]
+        scene_idx += idx
+        return scene_idx
+
+
+class cfl_collate_fn_stc:
+    """STC用collate関数"""
+    
+    def __call__(self, list_data):
+        coords_t, coords_t1, coords_t_original, coords_t1_original, sp_labels_t, sp_labels_t1, pose_t, pose_t1, scene_name_t, scene_name_t1 = list(zip(*list_data))
+        
+        coords_t_batch = []
+        coords_t1_batch = []
+        
+        for batch_id in range(len(coords_t)):
+            num_points_t = coords_t[batch_id].shape[0]
+            num_points_t1 = coords_t1[batch_id].shape[0]
+            
+            coords_t_batch.append(
+                torch.cat((torch.ones(num_points_t, 1).int() * batch_id, 
+                          torch.from_numpy(coords_t[batch_id]).int()), 1)
+            )
+            coords_t1_batch.append(
+                torch.cat((torch.ones(num_points_t1, 1).int() * batch_id, 
+                          torch.from_numpy(coords_t1[batch_id]).int()), 1)
+            )
+        
+        coords_t_batch = torch.cat(coords_t_batch, 0).float()
+        coords_t1_batch = torch.cat(coords_t1_batch, 0).float()
+        
+        # オリジナル座標とSPラベルはリストのまま返す
+        coords_t_original = [torch.from_numpy(c).float() for c in coords_t_original]
+        coords_t1_original = [torch.from_numpy(c).float() for c in coords_t1_original]
+        sp_labels_t = [torch.from_numpy(s).long() for s in sp_labels_t]
+        sp_labels_t1 = [torch.from_numpy(s).long() for s in sp_labels_t1]
+        pose_t = [torch.from_numpy(p).float() for p in pose_t]
+        pose_t1 = [torch.from_numpy(p).float() for p in pose_t1]
+        
+        return {
+            'coords_t': coords_t_batch,
+            'coords_t1': coords_t1_batch,
+            'coords_t_original': coords_t_original,
+            'coords_t1_original': coords_t1_original,
+            'sp_labels_t': sp_labels_t,
+            'sp_labels_t1': sp_labels_t1,
+            'pose_t': pose_t,
+            'pose_t1': pose_t1,
+            'scene_name_t': list(scene_name_t),
+            'scene_name_t1': list(scene_name_t1)
+        }
+
+
+class KITTItcuss_stc(Dataset):
+    """TCUSS学習用の複合データセット（STC版）"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.phase = 0
+        self.kittitrain_t1 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
+        self.kittitrain_t2 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
+        self.kittistc = KITTIstc(args)
+        
+        self.scene_idx_all = None
+        self.random_select_sample()
+    
+    def __len__(self):
+        return self.kittistc.__len__()
+    
+    def __getitem__(self, index):
+        growsp_t1 = self.kittitrain_t1.__getitem__(index)
+        growsp_t2 = self.kittitrain_t2.__getitem__(index)
+        stc_data = self.kittistc.__getitem__(index)
+        return growsp_t1, growsp_t2, stc_data
+    
+    def random_select_sample(self):
+        """ランダムにサンプルを選択"""
+        self.kittistc._random_select_samples()
+        scene_idx_t = [self.kittistc._tuple_to_scene_idx(tup) for tup in self.kittistc.scene_locates]
+        scene_idx_t1 = [self.kittistc._tuple_to_scene_idx(tup) for tup in self.kittistc.scene_diff_locates]
+        self.kittitrain_t1.scene_idx = scene_idx_t
+        self.kittitrain_t2.scene_idx = scene_idx_t1
+        self.kittitrain_t1.random_select_sample(scene_idx_t)
+        self.kittitrain_t2.random_select_sample(scene_idx_t1)
+        scene_idx_all = []
+        for i in range(len(scene_idx_t)):
+            scene_idx_all.append(scene_idx_t[i])
+            scene_idx_all.append(scene_idx_t1[i])
+        self.scene_idx_all = scene_idx_all
+
+
+class cfl_collate_fn_tcuss_stc:
+    """TCUSS STC用collate関数"""
+    
+    def __init__(self):
+        self.growsp_collate = cfl_collate_fn()
+        self.stc_collate = cfl_collate_fn_stc()
+    
+    def __call__(self, list_data):
+        growsp_t1_data, growsp_t2_data, stc_data = list(zip(*list_data))
+        
+        growsp_t1 = self.growsp_collate(growsp_t1_data)
+        growsp_t2 = self.growsp_collate(growsp_t2_data)
+        stc = self.stc_collate(stc_data)
+        
+        return growsp_t1, growsp_t2, stc

@@ -1,27 +1,61 @@
 ---
-description: このプロジェクトにおけるルール
-globs: 
-alwaysApply: false
+alwaysApply: true
 ---
+# GrowSP(先行研究)
+- 3D 点群のUnsupervised Semantic Segmentation手法
+- Superpoint(SP)という点群のクラスタをepochとともに大きくしていくことで、スクラッチからの学習の序盤では安定性を保ち、意味のあるような特徴が出てきてから少しずつSuperpointをマージしていくことによってよりSemantic Segmentationらしいオブジェクトのような大きさのSuperpointになるように目指していく。この、シーンごとにinit SPからSuperpointを構築するクラスタリング処理をSuperpoint Constructorと呼ぶ。
+- 各シーンごとに、init SPを「RANSACによる地面を1つのSPにする→その他の点をDBSCANでクラスタリング」の手順で作成する。これはおおよそ各シーンごとに4000~10000個ぐらいある。
+- データセット全体(メモリ的に限界ならばそのうちのselect_num scanだけ)のSuperpointの特徴量を k-means(k = primitive_num)で実行することで、Semantic Primitiveというクラスタを作成する。これは、データセット全体で、同じセマンティック（車のタイヤ）ごとにSuperpointがクラスタリングされることが期待されている。このSemantic Primitiveを構築するクラスタリング処理をSemantic Primitive Clusteringと呼ぶ。
+- 推論時には、学習した特徴量抽出器と、Semantic Primitiveをsemantic_class数にk-meansすることで得られるseamntic_class数のクラスタ中心を使用する。特徴量抽出器で得た点ごとの特徴量に対して、最も近いsemantic_class数のクラスタ中心のクラスとしてその点は推論される。
+
 
 # TCUSS
-TCUSSとは、私のComputer Vision研究プロジェクト名です。TCUSSは、点群のみを入力とした、Unsupervised Semantic Segmentationの手法であるGrowSPのlossに、運転シーンの3D点群に特化した対照学習手法であるTARLのlossを追加することで、運転シーンの点群に特化したUnsupervised Semantic Segmentation用モデルができるのではないかというもの。つまり、運転シーンの3D点群であるSemanticKITTIデータセットにて、GrowSPよりも高いmIoUがでることが目標です。TARLは、連続する n フレーム分の点群を同じ座標系に集約するという処理を挟んでいるので、自動運転シーンにおいて特に有効である。例えば、停止車両は複数フレームで同じ位置に存在し安定したセグメントとして抽出される一方、移動車両は連続的な軌跡として捉えられ、その動きの文脈も含めたセグメントとして抽出することができるためです。だから精度を上げることができるんじゃないかって考えています。
-
-# ファイル構成
-基本的には、GrowSPのプロジェクトディレクトリをそのままコピーして名前を適宜変えて使用しています。
+- TCUSS(Temporally Consistent
+Unsupervised Semantic Segmentation)とは、私のComputer Vision研究プロジェクト名。
+- TCUSSは、点群のみを入力とした、Unsupervised Semantic Segmentationの手法であるGrowSPを時系列データ（特に運転シーン）に特化させることで、運転シーンでのLiDARのみ入力のUnsupervised Semantic Segmentationの精度でSOTAを狙うという研究
+- 具体的には、GrowSPのloss(growsp_loss)に、運転シーンの点群のScene Flow手法(例：VoteFlow)で推定した、時刻 t と時刻 t + scan_window とで対応するSuperpointの特徴量が近づくようなloss(stc_loss)を足し合わせる。
+- 追加することで、運転シーンの点群に特化したUnsupervised Semantic Segmentation用モデルができるのではないかというもの。つまり、運転シーンの3D点群であるSemanticKITTIデータセットにて、GrowSPよりも高いmIoUがでることが目標です。TARLは、連続する n フレーム分の点群を同じ座標系に集約するという処理を挟んでいるので、自動運転シーンにおいて特に有効である。例えば、停止車両は複数フレームで同じ位置に存在し安定したセグメントとして抽出される一方、移動車両は連続的な軌跡として捉えられ、その動きの文脈も含めたセグメントとして抽出することができるためです。だから精度を上げることができるんじゃないかって考えています。
+<!-- TCUSSとは、私のComputer Vision研究プロジェクト名です。TCUSSは、点群のみを入力とした、Unsupervised Semantic Segmentationの手法であるGrowSPのlossに、運転シーンの3D点群に特化した対照学習手法であるTARLのlossを追加することで、運転シーンの点群に特化したUnsupervised Semantic Segmentation用モデルができるのではないかというもの。つまり、運転シーンの3D点群であるSemanticKITTIデータセットにて、GrowSPよりも高いmIoUがでることが目標です。TARLは、連続する n フレーム分の点群を同じ座標系に集約するという処理を挟んでいるので、自動運転シーンにおいて特に有効である。例えば、停止車両は複数フレームで同じ位置に存在し安定したセグメントとして抽出される一方、移動車両は連続的な軌跡として捉えられ、その動きの文脈も含めたセグメントとして抽出することができるためです。だから精度を上げることができるんじゃないかって考えています。 -->
 
 # 現状
+## 課題
+- stc_lossとしてどのようなものがいいのかは模索中。異なる時間間で対応している点が多いsuperpoint同士の semantic primitives による分類の分布が近づくようにKLなどでLossを設定してもいいとか考えている。これからいいものを見つけていきたい。
+- 道路について。現状では、init SPの時点で、歩道も道路と同じ1つの巨大なsuperpointとなってしまっている。init SPにて歩道はRANSACで含まれないようにしたい。→ 小さめにransacしても問題ないな多分 superpointが小さくなるだけだから。
+- そもそもgrowsp_lossがこのタスクに適しているのかもわからない。growsp_lossが下がったからといって、val mIoU, val oAcc, val mAccが上がると
+- 距離ごとの精度比較
+- 移動物体と静止物体で比較
+- VoteFlowは別のデータセットで学習されてしまっている。（SemanticKITTIでうまくいっているのか要確認）
+- 反射率が考慮されていない。
+    - init SP
+    - backbone
 <!-- TCUSSのベースラインの実装は終わっていて、テストした結果、ワールド座標系にて移動している物体（車や歩行者など）の精度は向上したが、静止している物体（建物や草木など）の精度は下がってしまった。そのため、静止している物体からのTARLのlossを計算しないようにして、TARL lossは動いている物体のみで計算して、誤差逆伝播したい。 -->
 
-# agentモードの動作の流れ
-- 回答に際して、情報収集のために閲覧したいけどどうしても閲覧できないコードがあれば、この旨を私に伝えてください。可能であればそのコードを提示します。
-- 「実装して。」と明記されない限り、ファイル操作や編集は絶対に行わないこと。
-- 実行した際にエラーが生じたら、原因が明確に1つに絞れるまでデバッグ出力を行います。どこのデバッグ出力をすればいいかの提案だけして、そのコマンドの実行はしないでください。
-- 一度の会話ターンに複数回コードの変更をしないでください。
-- 基本的にはtrain_SemanticKITTI.pyを実行してもらうことになると思うのですが、実行コマンドはtcussというAnaconda環境をアクティベートしたうえで、次のフォーマットに従ってください。WANDB_MODE=disabled python train_SemanticKITTI.py --name debug --save_path data/users/minesawa/semantickitti/debug --workers 0 --cluster_workers 0 --batch_size 16 16 --select_num 128 --eval_select_num 16 --max_epoch 2 2 --cluster_interval 1
+
+# 実装のルール
+## 実装全般
+- 絶対にフォールバックは使わないでください。
+- あくまで実験用コードであり、実運用を想定したコードではない。そのため、フォールバックするよりもその時点でエラーの詳細や原因を表示して終了した方がバグが見つけやすくて良い。
+- バグや問題の修正時、原因が判明していない状態で根拠なくコードを変更しないで。当てずっぽうで勝手にコードを変えられると困る。原因がわからない時は無理に解決しようとしないで、原因解明のためのデバッグを追加するなど情報収集をして。
+- 使用の変更により、不要な関数やクラス、処理が発生したら、それらは削除してしまって良い。あとで使うとかあまりないので。(特に、TCUSSは以前別のアルゴリズムとして設計していたので、不要な部分が多々あると思う。)
 
 
-<!-- # 可視化のための保存形式
-点群を可視化したい時には、以下のフォーマットでの保存までを実行してください。可視化は別の環境で私がする。
-- {save_dir}/vis/velodyne/{scan_num}.bin は float32 の [x, y, z, remission] が N 行並んだバイナリ。
-- {save_dir}/vis/labels/{scan_num}.label（または .bin/.npy）は各点1つの uint32。下位16bitが semantic ID，上位16bitが instance ID。今回はpanopticではなくsemantic segmentationなので、instance idは0でいい。 -->
+## オプション引数について
+- 学習や推論、テスト用コードを実行する際のオプションは、すべてconfigディレクトリ以下のyamlファイルで設定する。
+- オプション引数について、コード内で初期値を用意することは禁ずる。
+- yamlファイル内に設定されていないオプションがあればエラーで終了する。
+
+## 可視化のための保存形式
+点群をデバッグ向けに簡単に可視化したい時には、以下のフォーマットでのplyファイルとしての保存までを実行してください。plyファイルのヘッダーは以下のようにして。可視化は別の環境で私がする。
+```
+ply
+format ascii 1.0
+element vertex 35718(ここには実際の値)
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+property int label
+end_header
+```

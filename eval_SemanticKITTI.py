@@ -27,7 +27,13 @@ import random
 import os
 import re
 from tqdm import tqdm
-from typing import Tuple, Dict, List, Optional, Union, Any
+from typing import Tuple, Dict, List, Optional, Union, Any, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lib.config import TCUSSConfig
+
+# 移動物体のraw labelリスト（SemanticKITTI定義）
+MOVING_RAW_LABELS: Set[int] = {252, 253, 254, 255, 256, 257, 258, 259}
 
 ###
 def parse_args() -> argparse.Namespace:
@@ -73,7 +79,7 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.enabled = False
 
-def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: DataLoader, classifier: torch.nn.Module, epoch: int) -> Tuple[List, List]:
+def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: DataLoader, classifier: torch.nn.Module, epoch: int) -> Tuple[List, List, List, List]:
     """一回の評価を実行する関数
     
     Args:
@@ -86,12 +92,14 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
     Returns:
         all_preds: すべての予測結果
         all_label: すべてのラベル
+        all_distances: すべての距離（原点からの2D距離）
+        all_is_moving: すべての移動物体フラグ
     """
-    all_preds, all_label = [], []
+    all_preds, all_label, all_distances, all_is_moving = [], [], [], []
     
     for data in tqdm(test_loader, desc=f'Eval Epoch: {epoch}'):
         with torch.no_grad():
-            coords, features, inverse_map, labels, index, region = data
+            coords, features, inverse_map, labels, index, region, original_coords, raw_labels = data
 
             # TensorFieldを作成
             in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
@@ -103,24 +111,218 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
             preds = torch.argmax(scores, dim=1).cpu()
 
             preds = preds[inverse_map.long()]
-            preds = preds[labels!=args.ignore_label]
-            labels = labels[labels!=args.ignore_label]
+            
+            # 距離を計算（原点からの2D距離）
+            distances = torch.sqrt(original_coords[:, 0]**2 + original_coords[:, 1]**2)
+            
+            # 移動物体フラグを計算
+            is_moving = torch.tensor([int(r.item()) in MOVING_RAW_LABELS for r in raw_labels], dtype=torch.bool)
+            
+            # ignore_labelを除外
+            valid_mask = labels != args.ignore_label
+            preds = preds[valid_mask]
+            labels = labels[valid_mask]
+            distances = distances[valid_mask]
+            is_moving = is_moving[valid_mask]
+            
             all_preds.append(preds)
             all_label.append(labels)
+            all_distances.append(distances)
+            all_is_moving.append(is_moving)
 
             # メモリ解放
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
 
-    return all_preds, all_label
+    return all_preds, all_label, all_distances, all_is_moving
 
 
-def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str, Dict[str, float]]:
+def compute_metrics_for_subset(
+    preds: np.ndarray, 
+    labels: np.ndarray, 
+    sem_num: int,
+    matching: np.ndarray
+) -> Tuple[float, float, float]:
+    """サブセットに対してメトリクスを計算する
+    
+    Args:
+        preds: 予測ラベル
+        labels: 正解ラベル
+        sem_num: セマンティッククラス数
+        matching: ハンガリアンマッチング結果（全体で計算済み）
+    
+    Returns:
+        o_Acc, m_Acc, m_IoU
+    """
+    if len(preds) == 0 or len(labels) == 0:
+        return 0.0, 0.0, 0.0
+    
+    mask = (labels >= 0) & (labels < sem_num)
+    if not mask.any():
+        return 0.0, 0.0, 0.0
+    
+    histogram = np.bincount(
+        sem_num * labels[mask] + preds[mask], 
+        minlength=sem_num ** 2
+    ).reshape(sem_num, sem_num)
+    
+    # 既存のマッチングを使用してhistogramを再配置
+    hist_new = np.zeros((sem_num, sem_num))
+    for idx in range(sem_num):
+        hist_new[:, idx] = histogram[:, matching[idx, 1]]
+    
+    # メトリクスを計算
+    total = histogram.sum()
+    if total == 0:
+        return 0.0, 0.0, 0.0
+    
+    o_Acc = histogram[matching[:, 0], matching[:, 1]].sum() / total * 100.0
+    
+    # クラスごとの正解数
+    class_totals = histogram.sum(1)
+    class_totals[class_totals == 0] = 1  # 0除算防止
+    m_Acc = np.mean(histogram[matching[:, 0], matching[:, 1]] / class_totals) * 100.0
+    
+    # IoU計算
+    tp = np.diag(hist_new)
+    fp = np.sum(hist_new, 0) - tp
+    fn = np.sum(hist_new, 1) - tp
+    IoUs = (100 * tp) / (tp + fp + fn + 1e-8)
+    m_IoU = np.nanmean(IoUs)
+    
+    return o_Acc, m_Acc, m_IoU
+
+
+def compute_distance_metrics(
+    all_preds: np.ndarray,
+    all_labels: np.ndarray,
+    all_distances: np.ndarray,
+    distance_bins: List[int],
+    sem_num: int,
+    matching: np.ndarray
+) -> Dict[str, Dict[str, float]]:
+    """距離帯ごとにメトリクスを計算する
+    
+    Args:
+        all_preds: 全予測ラベル
+        all_labels: 全正解ラベル
+        all_distances: 全距離
+        distance_bins: 距離区切り（例: [10, 20, 30, 40, 50, 60, 70, 80]）
+        sem_num: セマンティッククラス数
+        matching: ハンガリアンマッチング結果
+    
+    Returns:
+        距離帯ごとのメトリクス辞書
+        例: {'0-10': {'oAcc': ..., 'mAcc': ..., 'mIoU': ...}, ...}
+    """
+    result = {}
+    
+    prev_dist = 0
+    for dist in distance_bins:
+        # この距離帯のマスク
+        mask = (all_distances >= prev_dist) & (all_distances < dist)
+        
+        if mask.sum() > 0:
+            subset_preds = all_preds[mask]
+            subset_labels = all_labels[mask]
+            o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
+                subset_preds, subset_labels, sem_num, matching
+            )
+        else:
+            o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
+        
+        key = f'{prev_dist}-{dist}'
+        result[key] = {
+            'oAcc': o_Acc,
+            'mAcc': m_Acc,
+            'mIoU': m_IoU,
+            'count': int(mask.sum())
+        }
+        prev_dist = dist
+    
+    # 最後の距離帯以降（distance_bins[-1]以上）
+    mask = all_distances >= distance_bins[-1]
+    if mask.sum() > 0:
+        subset_preds = all_preds[mask]
+        subset_labels = all_labels[mask]
+        o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
+            subset_preds, subset_labels, sem_num, matching
+        )
+    else:
+        o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
+    
+    key = f'{distance_bins[-1]}+'
+    result[key] = {
+        'oAcc': o_Acc,
+        'mAcc': m_Acc,
+        'mIoU': m_IoU,
+        'count': int(mask.sum())
+    }
+    
+    return result
+
+
+def compute_moving_static_metrics(
+    all_preds: np.ndarray,
+    all_labels: np.ndarray,
+    all_is_moving: np.ndarray,
+    sem_num: int,
+    matching: np.ndarray
+) -> Dict[str, Dict[str, float]]:
+    """移動物体/静止物体ごとにメトリクスを計算する
+    
+    Args:
+        all_preds: 全予測ラベル
+        all_labels: 全正解ラベル
+        all_is_moving: 移動物体フラグ
+        sem_num: セマンティッククラス数
+        matching: ハンガリアンマッチング結果
+    
+    Returns:
+        移動/静止ごとのメトリクス辞書
+        例: {'moving': {'oAcc': ..., 'mAcc': ..., 'mIoU': ...}, 'static': {...}}
+    """
+    result = {}
+    
+    # 移動物体
+    moving_mask = all_is_moving
+    if moving_mask.sum() > 0:
+        o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
+            all_preds[moving_mask], all_labels[moving_mask], sem_num, matching
+        )
+    else:
+        o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
+    result['moving'] = {
+        'oAcc': o_Acc,
+        'mAcc': m_Acc,
+        'mIoU': m_IoU,
+        'count': int(moving_mask.sum())
+    }
+    
+    # 静止物体
+    static_mask = ~all_is_moving
+    if static_mask.sum() > 0:
+        o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
+            all_preds[static_mask], all_labels[static_mask], sem_num, matching
+        )
+    else:
+        o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
+    result['static'] = {
+        'oAcc': o_Acc,
+        'mAcc': m_Acc,
+        'mIoU': m_IoU,
+        'count': int(static_mask.sum())
+    }
+    
+    return result
+
+
+def eval(epoch: int, args: Union[argparse.Namespace, 'TCUSSConfig']) -> Tuple[float, float, float, str, Dict[str, float], Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     """モデルを評価する関数
     
     Args:
         epoch: 評価するエポック
-        args: コマンドライン引数
+        args: コマンドライン引数またはTCUSSConfig
     
     Returns:
         o_Acc: 全体の精度
@@ -128,6 +330,8 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
         m_IoU: 平均IoU
         s: IoU情報の文字列
         IoU_dict: クラスごとのIoU辞書
+        distance_metrics: 距離別メトリクス（distance_evaluation有効時のみ、無効時は空辞書）
+        moving_static_metrics: 移動/静止別メトリクス（moving_static_evaluation有効時のみ、無効時は空辞書）
     """
     # モデルを読み込み
     model = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
@@ -160,11 +364,13 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
     val_loader = DataLoader(val_dataset, batch_size=1, collate_fn=cfl_collate_fn_val(), num_workers=args.cluster_workers, pin_memory=True)
 
     # 評価を実行
-    preds, labels = eval_once(args, model, val_loader, classifier, epoch)
+    preds, labels, distances, is_moving = eval_once(args, model, val_loader, classifier, epoch)
     
     # 結果を連結
     all_preds = torch.cat(preds).numpy()
     all_labels = torch.cat(labels).numpy()
+    all_distances = torch.cat(distances).numpy()
+    all_is_moving = torch.cat(is_moving).numpy()
 
     # 教師なし評価：予測をGTにマッチング
     sem_num = args.semantic_class
@@ -172,12 +378,12 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
     histogram = np.bincount(sem_num * all_labels[mask] + all_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
     
     # ハンガリアンマッチング
-    m = assignment_function(histogram.max() - histogram)
-    o_Acc = histogram[m[:, 0], m[:, 1]].sum() / histogram.sum() * 100.
-    m_Acc = np.mean(histogram[m[:, 0], m[:, 1]] / histogram.sum(1)) * 100
+    matching = assignment_function(histogram.max() - histogram)
+    o_Acc = histogram[matching[:, 0], matching[:, 1]].sum() / histogram.sum() * 100.
+    m_Acc = np.mean(histogram[matching[:, 0], matching[:, 1]] / histogram.sum(1)) * 100
     hist_new = np.zeros((sem_num, sem_num))
     for idx in range(sem_num):
-        hist_new[:, idx] = histogram[:, m[idx, 1]]
+        hist_new[:, idx] = histogram[:, matching[idx, 1]]
 
     # 最終評価指標を計算
     tp = np.diag(hist_new)
@@ -192,7 +398,24 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
         s += '{:5.2f} '.format(IoU)
         IoU_list.append(IoU)
     IoU_dict = dict(zip(class_name_IoU_list, IoU_list))
-    return o_Acc, m_Acc, m_IoU, s, IoU_dict
+    
+    # 距離別メトリクス計算
+    distance_metrics = {}
+    if hasattr(args, 'evaluation') and args.evaluation.distance_evaluation:
+        distance_metrics = compute_distance_metrics(
+            all_preds, all_labels, all_distances,
+            args.evaluation.distance_bins, sem_num, matching
+        )
+    
+    # 移動/静止別メトリクス計算
+    moving_static_metrics = {}
+    if hasattr(args, 'evaluation') and args.evaluation.moving_static_evaluation:
+        moving_static_metrics = compute_moving_static_metrics(
+            all_preds, all_labels, all_is_moving,
+            sem_num, matching
+        )
+    
+    return o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics
 
 
 def extract_epoch_from_filename(filename: str) -> Optional[int]:
@@ -299,7 +522,7 @@ if __name__ == '__main__':
             # 単一エポック評価（従来の動作）
             if args.eval_epoch in epoch_numbers:
                 print(f"指定されたエポック {args.eval_epoch} を評価します")
-                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(args.eval_epoch, args)
+                o_Acc, m_Acc, m_IoU, s, IoU_dict, dist_metrics, ms_metrics = eval(args.eval_epoch, args)
                 print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(args.eval_epoch, o_Acc, m_Acc, m_IoU))
                 print(s)
             else:
@@ -321,7 +544,7 @@ if __name__ == '__main__':
             multi_results = []
             for epoch in target_epochs:
                 print(f"\n--- エポック {epoch} の評価開始 ---")
-                o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
+                o_Acc, m_Acc, m_IoU, s, IoU_dict, dist_metrics, ms_metrics = eval(epoch, args)
                 multi_results.append((epoch, o_Acc, m_Acc, m_IoU))
                 print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, m_Acc, m_IoU))
                 print(s)
@@ -349,7 +572,7 @@ if __name__ == '__main__':
         results = []
         
         for epoch in epoch_numbers:
-            o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(epoch, args)
+            o_Acc, m_Acc, m_IoU, s, IoU_dict, dist_metrics, ms_metrics = eval(epoch, args)
             results.append((epoch, o_Acc, m_Acc, m_IoU))
             print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, m_Acc, m_IoU))
             print(s)

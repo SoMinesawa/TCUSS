@@ -205,12 +205,13 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
             feats_cpu = feats.cpu()
             labels_cpu = labels.cpu()
             neural_region_cpu = neural_region.cpu().detach().numpy().copy()
+            sp_idx_cpu = sp_idx.cpu().detach().numpy().copy()  # init SP → 統合SP マッピング
 
             # リストにデータを追加
             point_feats_list.append(feats_cpu) # [266, 4+1+10]
             point_labels_list.append(labels_cpu) # [32629]
             all_sp_index.append(neural_region_cpu) # [32629]
-            context.append((scene_name, gt, raw_region)) # [39521]
+            context.append((scene_name, gt, raw_region, sp_idx_cpu)) # [39521], sp_idx追加
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
@@ -288,7 +289,9 @@ def get_pseudo_kitti(args, context, cluster_pred, all_sub_cluster=None):
     region_num = 0
 
     for i in range(len(context)):
-        scene_name, labels, region = context[i]
+        # context[i] = (scene_name, labels, region) or (scene_name, labels, region, sp_idx)
+        ctx = context[i]
+        scene_name, labels, region = ctx[0], ctx[1], ctx[2]
 
         sub_cluster_pred = all_sub_cluster[pc_no]+ region_num
         valid_mask = region != -1

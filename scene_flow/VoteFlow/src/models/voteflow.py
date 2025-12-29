@@ -314,7 +314,7 @@ class VoteFlow(nn.Module):
         # print('feats_voxel_dst:', feats_voxel_dst.shape)
         
         self.timer[1][2].stop()
-        
+
         if self.using_voting:
             self.timer[1][3].start("Gathering")
             if self.use_separate_feats:
@@ -337,34 +337,15 @@ class VoteFlow(nn.Module):
             
             self.timer[1][4].start("Voting")
             # print('corr_src_dst:', corr_src_dst.shape)
-            voting_vols= self.vote(corr_src_dst[:, :, :, None], voxels_src, voxels_dst, knn_idxs_src, knn_idxs_dst) # [b, l, c, ny, nx]
+            # HT_CUDA が -1 のインデックスを想定していない可能性があるためクランプ＋ゼロ化
+            neg_dst = (knn_idxs_dst < 0)
+            knn_idxs_dst_safe = knn_idxs_dst.clamp(min=0)
+            knn_idxs_src_safe = knn_idxs_src.clamp(min=0)
+            if neg_dst.any():
+                corr_src_dst = corr_src_dst.masked_fill(neg_dst, 0)
+            voting_vols= self.vote(corr_src_dst[:, :, :, None], voxels_src, voxels_dst, knn_idxs_src_safe, knn_idxs_dst_safe) # [b, l, c, ny, nx]
             # print('voting  vols:', voting_vols.shape)
-            
-            # voting_vols_flatten = voting_vols.flatten(start_dim=-2)
-            # voting_vols_max = voting_vols_flatten.max(-1)[0]
-            # voting_vols_min = voting_vols_flatten.min(-1)[0]
-            # print('voting  vols flatten:', voting_vols_flatten.shape, voting_vols_max.shape, voting_vols_min.shape) 
-            
-            # voting_vols_norm = (voting_vols - voting_vols_min[..., None, None] )/ (voting_vols_max[..., None, None] - voting_vols_min[..., None, None] + 1e-6)
-            
-            # print(voting_vols_norm.shape, voting_vols_norm.max(), voting_vols_norm.min())
-            
-            # vols_flattened = vols.view(vols.shape[0], vols.shape[1], -1)
-            
-            # print('vols_flattened:', vols_flattened.shape, vols_flattened[0].max(), vols_flattened[0].min())
-            
-            # for vol in vols_flattened:
-            #     print('vol:', vol.shape, vol.max(), vol.min())
-            #     topk_voting, topk_idx = torch.topk(vol, 5, dim=-1)
-            #     print('topk voting:', topk_voting.shape, topk_voting.max(), topk_voting.min())
-            #     print('topk idx:', topk_idx.shape)
-            #     # gathered_vol = torch.gather(vol, dim =1, index = topk_idx)
-            #     # print('topk idx verfi:', gathered_vol.shape)
-            #     # print(torch.eq(gathered_vol, topk_voting).all())
-            #     print('topk voting values:', topk_voting[:10, :])
-                
-            #     norm_topk_voting = topk_voting
-            
+
             vols = self.volconv(voting_vols)
             feats_point_vol = self.extract_point_from_voxel(vols, point_voxel_idxs_src)
             # print('voting  vols after volconv:', voting_vols.shape, vols.shape, vols.max(), vols.min())

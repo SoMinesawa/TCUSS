@@ -5,7 +5,10 @@ import numpy as np
 import random
 import torch
 import torch.multiprocessing as multiprocessing
-from datasets.SemanticKITTI import KITTItrain, cfl_collate_fn, KITTItcuss, cfl_collate_fn_tcuss
+from datasets.SemanticKITTI import (
+    KITTItrain, cfl_collate_fn, KITTItcuss, cfl_collate_fn_tcuss,
+    KITTItcuss_stc, cfl_collate_fn_tcuss_stc
+)
 from torch.utils.data import DataLoader
 import logging
 
@@ -15,8 +18,12 @@ from lib.trainer import TCUSSTrainer
 
 def worker_init_fn(worker_id):
     """データローダーワーカーの初期化関数"""
-    # GPU 0もデータ作成に使用するように変更
-    gpu_id = worker_id % torch.cuda.device_count()  # GPU0も含めたラウンドロビン
+    # GPU0を避け、GPU1以降でデータ生成を行う（GPUが1枚しかない場合はGPU0を使用）
+    device_count = torch.cuda.device_count()
+    if device_count <= 1:
+        gpu_id = 0
+    else:
+        gpu_id = 1 + (worker_id % (device_count - 1))
     torch.cuda.set_device(gpu_id)
     # WorkerごとにユニークなシードをNumPyに設定
     worker_seed = torch.initial_seed() % 2**32
@@ -66,13 +73,19 @@ def setup_datasets(config):
     train_workers = 0 if config.vis else config.workers
     cluster_workers = 0 if config.vis else config.cluster_workers
 
-    # トレーニングデータセットとデータローダー
-    trainset = KITTItcuss(config)
+    # トレーニングデータセットとデータローダー（STCモードに応じて切り替え）
+    if config.stc.enabled:
+        trainset = KITTItcuss_stc(config)
+        collate_fn = cfl_collate_fn_tcuss_stc()
+    else:
+        trainset = KITTItcuss(config)
+        collate_fn = cfl_collate_fn_tcuss()
+    
     train_loader = DataLoader(
         trainset, 
         batch_size=config.batch_size[0], 
         shuffle=True, 
-        collate_fn=cfl_collate_fn_tcuss(), 
+        collate_fn=collate_fn, 
         num_workers=train_workers, 
         pin_memory=True, 
         worker_init_fn=worker_init_fn
