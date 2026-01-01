@@ -6,12 +6,12 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "stc"
+name: "growsp_test"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/stc"
+save_path: "data/users/minesawa/semantickitti/growsp_test"
 pseudo_label_path: "pseudo_label_kitti/"
 
 # エポック設定
@@ -24,16 +24,23 @@ conv1_kernel_size: 5
 
 # 最適化設定
 lr: 0.01  # バックボーンの学習率
-tarl_lr: 0.0002  # Transformerプロジェクタとプレディクタの学習率
 weight_decay: 0.01
 accum_step: 2
-lmb: 1.0  # TARL損失の重み
-ignore_hdbscan_outliers: true  # HDBSCANの外れ値を除外
 
 # データロード設定
 workers: 24
 cluster_workers: 24
-batch_size: [8, 8]
+batch_size: [1, 1]
+eval_batch_size: 16  # 評価時のバッチサイズ
+cluster_batch_size: 1  # クラスタリング時のバッチサイズ
+
+# DataLoader最適化
+persistent_workers: false  # ワーカープロセスを維持
+prefetch_factor: 4  # プリフェッチ数
+
+# マルチGPU設定
+use_ddp: true  # DistributedDataParallelを使用
+ddp_backend: "nccl"  # DDPバックエンド
 
 # 実験設定
 seed: 2022
@@ -60,6 +67,7 @@ growsp:
 select_num: 1500
 eval_select_num: 4071
 r_crop: 50.0
+scan_window: 12  # t1からt2を選ぶ際の最大フレーム差
 
 # 評価設定
 cluster_interval: 10
@@ -82,39 +90,31 @@ early_stopping:
   rel_drop_window: 15
   overfit_drop: 0.30
 
-# 時間設定
-scan_window: 2
-
 # デバッグ設定
 debug: false
 vis: false
 vis_sp: false 
 # 学習再開設定
-resume: true
-wandb_run_id: 90otn0h8
+resume: false
+wandb_run_id: null
 
 # ===========================================
 # STC (Superpoint Time Consistency) 設定
 # ===========================================
 stc:
-  enabled: true  # 元のTARLモードでテスト用に一時的に無効化
+  enabled: false  # 元のTARLモードでテスト用に一時的に無効化
   weight: 1.0  # loss_stc の重み
 
-  # Scene Flow設定
-  scene_flow:
-    model: "voteflow"  # 将来的には他のモデルも選択可能
-    checkpoint: "scene_flow/VoteFlow/checkpoints/voteflow_best_m8n128_ori.ckpt"
-    # VoteFlow固有の設定
-    voxel_size: [0.2, 0.2, 6]
-    point_cloud_range: [-51.2, -51.2, -3, 51.2, 51.2, 3]
+  # VoteFlow前処理済みデータのパス（H5ファイル）
+  voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
 
   # 対応点計算
   correspondence:
     distance_threshold: 0.3  # meters
     min_points: 5  # SPペアを有効とする最小対応点数
+    exclude_ground: true  # 地面点を対応計算から除外
+    remove_ego_motion: true  # エゴモーションを除去してobject_flowを使用
 
   # 損失関数設定
   loss:
     temperature: 0.1  # 将来的に使う可能性
-
-

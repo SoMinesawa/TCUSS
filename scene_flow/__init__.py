@@ -1,22 +1,11 @@
 """
 Scene Flow モジュール
 
-VoteFlowなどのScene Flowモデルを統合するためのモジュール。
+Scene Flow関連のユーティリティ関数を提供。
+VoteFlowで事前計算されたScene FlowデータはH5ファイルから直接読み込む。
 """
 
+from .correspondence import compute_point_correspondence, compute_superpoint_correspondence_matrix
 
-def get_voteflow_wrapper():
-    """VoteFlowWrapperを遅延インポートして返す"""
-    from .voteflow_wrapper import VoteFlowWrapper
-    return VoteFlowWrapper
-
-
-# 後方互換性のため、遅延インポートでVoteFlowWrapperを提供
-def __getattr__(name):
-    if name == 'VoteFlowWrapper':
-        return get_voteflow_wrapper()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = ['VoteFlowWrapper', 'get_voteflow_wrapper']
+__all__ = ['compute_point_correspondence', 'compute_superpoint_correspondence_matrix']
 

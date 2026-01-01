@@ -2,8 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import MinkowskiEngine as ME
 import numpy as np
+import random
 import time
 import os
 import wandb
@@ -12,20 +15,21 @@ from tqdm import tqdm
 from math import ceil
 from typing import Dict, List, Tuple, Optional, Union, Any
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from os.path import join
 
 from models.fpn import Res16FPN18, Res16FPNBase
-from models.transformer_projector import TransformerProjector
 from lib.config import TCUSSConfig
 from lib.utils import (
-    get_pseudo_kitti, get_kittisp_feature, get_fixclassifier, copy_minkowski_network_params,
-    compute_segment_feats, momentum_update_key_encoder, calc_info_nce, get_kmeans_labels,
-    calc_cluster_metrics
+    get_pseudo_kitti, get_kittisp_feature, get_fixclassifier, get_kmeans_labels
 )
+from datasets.SemanticKITTI import generate_scene_pairs, get_unique_scene_indices
 from lib.stc_loss import compute_sp_features, loss_stc_similarity
-from lib.utils import get_kmeans_labels
-from lib.scene_flow_prefetcher import SceneFlowPrefetcher
-from eval_SemanticKITTI import eval
+from scene_flow.correspondence import (
+    compute_point_correspondence_filtered,
+    compute_superpoint_correspondence_matrix
+)
+from eval_SemanticKITTI import eval, eval_ddp
 import sys
 
 
@@ -79,99 +83,58 @@ def save_vis_sp_ply(
 
 
 class TCUSSTrainer:
-    """TCUSSのトレーニングプロセスを管理するクラス"""
+    """TCUSSのトレーニングプロセスを管理するクラス（DDP対応版）"""
     
-    def __init__(self, config: TCUSSConfig, logger: logging.Logger):
+    def __init__(
+        self, 
+        config: TCUSSConfig, 
+        logger: logging.Logger,
+        local_rank: int = 0,
+        world_size: int = 1,
+        is_main_process: bool = True
+    ):
         """
         トレーナーの初期化
         
         Args:
             config: トレーニング設定
             logger: ロガー
+            local_rank: このプロセスのローカルランク（GPU ID）
+            world_size: 総プロセス数
+            is_main_process: メインプロセスかどうか
         """
         self.config = config
         self.logger = logger
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.is_main_process = is_main_process
+        self.use_ddp = getattr(config, 'use_ddp', False) and world_size > 1
         
-        # モデルの初期化
+        # デバイス設定
+        self.device = f"cuda:{local_rank}"
+        
+        # モデルの初期化（バックボーンのみ）
         self.model_q = Res16FPN18(
             in_channels=config.input_dim, 
             out_channels=config.feats_dim, 
             conv1_kernel_size=config.conv1_kernel_size, 
             config=config
-        ).to("cuda:0")
+        ).to(self.device)
         
-        self.model_k = Res16FPN18(
-            in_channels=config.input_dim, 
-            out_channels=config.feats_dim, 
-            conv1_kernel_size=config.conv1_kernel_size, 
-            config=config
-        ).to("cuda:0")
-        
-        self.proj_head_q = TransformerProjector(d_model=config.feats_dim, num_layer=1).to("cuda:0")
-        self.proj_head_k = TransformerProjector(d_model=config.feats_dim, num_layer=1).to("cuda:0")
-        self.predictor = TransformerProjector(d_model=config.feats_dim, num_layer=1).to("cuda:0")
-        # VoteFlowラウンドロビン用カウンタ
-        self.vf_rr_idx = 0
-        
-        # モデルパラメータの初期化
-        copy_minkowski_network_params(self.model_q, self.model_k)
-        for param_q, param_k in zip(self.proj_head_q.parameters(), self.proj_head_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
+        # DDPでモデルをラップ
+        if self.use_ddp:
+            self.model_q = DDP(self.model_q, device_ids=[local_rank], output_device=local_rank)
+            if self.is_main_process:
+                self.logger.info(f'DDP有効: {world_size}プロセスで分散学習')
         
         # デバイス確認ログ
-        self.logger.info(f'model_q device: {next(self.model_q.parameters()).device}')
+        model_q_module = self.model_q.module if self.use_ddp else self.model_q
+        if self.is_main_process:
+            self.logger.info(f'model_q device: {next(model_q_module.parameters()).device}')
         
-        # VoteFlowの初期化（STC用、推論のみ）: GPU0以外を優先して複数デバイスにラウンドロビン
-        self.voteflow = None  # 後方互換用
-        self.voteflow_wrappers = []
-        if config.stc.enabled:
-            self.logger.info(f'VoteFlowを初期化中: {config.stc.scene_flow.checkpoint}')
-            try:
-                from scene_flow.voteflow_wrapper import VoteFlowWrapper
-                device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-                devices = []
-                if device_count > 1:
-                    devices = [f'cuda:{i}' for i in range(device_count) if i != 0]
-                if not devices:
-                    devices = ['cuda:0']
-                self.logger.info(f'VoteFlow使用デバイス: {devices}')
-                for dev in devices:
-                    wrapper = VoteFlowWrapper(
-                        checkpoint_path=config.stc.scene_flow.checkpoint,
-                        voxel_size=config.stc.scene_flow.voxel_size,
-                        point_cloud_range=config.stc.scene_flow.point_cloud_range,
-                        device=dev
-                    )
-                    self.voteflow_wrappers.append(wrapper)
-                if self.voteflow_wrappers:
-                    self.voteflow = self.voteflow_wrappers[0]
-                    self.logger.info(f'VoteFlow初期化完了: {len(self.voteflow_wrappers)} デバイス（並列計算対応）')
-                else:
-                    raise RuntimeError('VoteFlowWrapperが初期化できませんでした')
-            except Exception as e:
-                self.logger.error(f'VoteFlow初期化失敗: {e}')
-                self.logger.warning('STCを無効化して続行します')
-                config.stc.enabled = False
-        
-        # Scene Flowプリフェッチャーの初期化（STC用、先行計算）
-        # 各GPUは1バッチの全サンプルを担当、プリフェッチバッチ数 = GPU数 × 2
-        self.scene_flow_prefetcher = None
-        if config.stc.enabled and len(self.voteflow_wrappers) > 0:
-            n_voteflow_gpus = len(self.voteflow_wrappers)
-            # デフォルト: GPU数 × 2（設定があればそれを使用）
-            prefetch_batches = getattr(config.stc, 'prefetch_batches', None)
-            if prefetch_batches is None:
-                prefetch_batches = n_voteflow_gpus * 2
-            self.scene_flow_prefetcher = SceneFlowPrefetcher(
-                voteflow_wrappers=self.voteflow_wrappers,
-                prefetch_batches=prefetch_batches,
-                logger=self.logger
-            )
-            self.logger.info(
-                f'SceneFlowPrefetcher初期化完了: '
-                f'{n_voteflow_gpus} GPUs × 2 = {prefetch_batches} バッチをプリフェッチ'
-            )
+        # STC設定の確認
+        if config.stc.enabled and self.is_main_process:
+            self.logger.info(f'STC有効: VoteFlow前処理済みデータを使用 ({config.stc.voteflow_preprocess_path})')
         
         # オプティマイザーとスケジューラーは後で初期化する
         self.optimizer = None
@@ -192,16 +155,17 @@ class TCUSSTrainer:
     
     def setup_optimizer(self):
         """オプティマイザの設定"""
-        # パラメータグループを分けて異なる学習率を設定
-        backbone_params = list(self.model_q.parameters())
-        transformer_params = list(self.proj_head_q.parameters()) + list(self.predictor.parameters())
+        # DDP時は.moduleを通してパラメータにアクセス
+        model_q = self.model_q.module if self.use_ddp else self.model_q
         
-        param_groups = [
-            {'params': backbone_params, 'lr': self.config.lr},
-            {'params': transformer_params, 'lr': self.config.tarl_lr}
-        ]
+        # バックボーンのパラメータのみ
+        backbone_params = list(model_q.parameters())
         
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=self.config.weight_decay)
+        self.optimizer = torch.optim.AdamW(
+            backbone_params, 
+            lr=self.config.lr, 
+            weight_decay=self.config.weight_decay
+        )
     
     def setup_schedulers(self, train_loader_length: int):
         """スケジューラの設定"""
@@ -209,7 +173,7 @@ class TCUSSTrainer:
         self.schedulers = [
             torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer, 
-                max_lr=[self.config.lr, self.config.tarl_lr], 
+                max_lr=self.config.lr, 
                 epochs=epoch, 
                 steps_per_epoch=steps_per_epoch
             ) for epoch in self.config.max_epoch
@@ -228,61 +192,83 @@ class TCUSSTrainer:
         return run
     
     def resume_from_checkpoint(self, phase: int):
-        """チェックポイントから再開"""
+        """チェックポイントから再開（DDP対応版）
+        
+        全プロセスで同じresume_epochを返すように、broadcastで同期する。
+        """
         if not self.config.resume:
             return None
-            
-        last_epoch = wandb.run.summary.get("epoch", 0)
-        self.resume_epoch = ((last_epoch-1) // self.config.cluster_interval) * self.config.cluster_interval + 1
-        self.logger.info(f'エポック {self.resume_epoch} から再開します')
         
-        # 指定されたエポックのチェックポイントを読み込む
-        checkpoint_path = join(self.config.save_path, f'checkpoint_epoch_{self.resume_epoch-1}.pth')
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path)
-            self.model_q.load_state_dict(checkpoint['model_q_state_dict'])
-            self.model_k.load_state_dict(checkpoint['model_k_state_dict'])
-            self.proj_head_q.load_state_dict(checkpoint['proj_head_q_state_dict'])
-            self.proj_head_k.load_state_dict(checkpoint['proj_head_k_state_dict'])
-            self.predictor.load_state_dict(checkpoint['predictor_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # resume_epochを格納するテンソル（全プロセスで同期するため）
+        resume_epoch_tensor = torch.zeros(1, dtype=torch.int64, device=self.device)
+        
+        if self.is_main_process:
+            # メインプロセスのみでwandbから情報を取得
+            last_epoch = wandb.run.summary.get("epoch", 0)
+            self.resume_epoch = ((last_epoch-1) // self.config.cluster_interval) * self.config.cluster_interval + 1
+            self.logger.info(f'エポック {self.resume_epoch} から再開します')
+            resume_epoch_tensor[0] = self.resume_epoch
             
-            # 現在のフェーズのスケジューラー状態を読み込む
-            if f'scheduler_{phase}_state_dict' in checkpoint:
-                self.schedulers[phase].load_state_dict(checkpoint[f'scheduler_{phase}_state_dict'])
-            
-            # 乱数状態を復元
-            if 'np_random_state' in checkpoint:
-                np.random.set_state(checkpoint['np_random_state'])
-            if 'torch_random_state' in checkpoint:
-                torch.set_rng_state(checkpoint['torch_random_state'])
-            if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
-                torch.cuda.set_rng_state(checkpoint['torch_cuda_random_state'])
-            
-            # early stopping状態の復元
-            if 'best_metric_score' in checkpoint:
-                self.best_metric_score = checkpoint['best_metric_score']
-                self.patience_counter = checkpoint['patience_counter']
-                self.early_stopped = checkpoint['early_stopped']
-                self.best_epoch = checkpoint['best_epoch']
-                self.loss_history = checkpoint['loss_history']
-                self.logger.info(f'early stopping状態を復元: best_score={self.best_metric_score:.4f}, '
-                                f'patience={self.patience_counter}, best_epoch={self.best_epoch}')
-            
-            return self.resume_epoch
-        else:
-            self.logger.warning(f'チェックポイントファイル {checkpoint_path} が見つかりません')
-            return None
+            # 指定されたエポックのチェックポイントを読み込む
+            checkpoint_path = join(self.config.save_path, f'checkpoint_epoch_{self.resume_epoch-1}.pth')
+            if os.path.exists(checkpoint_path):
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                
+                # DDPラップを解除してロード
+                model_q = self.model_q.module if self.use_ddp else self.model_q
+                
+                model_q.load_state_dict(checkpoint['model_q_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+                # 現在のフェーズのスケジューラー状態を読み込む
+                if f'scheduler_{phase}_state_dict' in checkpoint:
+                    self.schedulers[phase].load_state_dict(checkpoint[f'scheduler_{phase}_state_dict'])
+                
+                # 乱数状態を復元（CPUのByteTensorである必要がある）
+                if 'np_random_state' in checkpoint:
+                    np.random.set_state(checkpoint['np_random_state'])
+                if 'torch_random_state' in checkpoint:
+                    rng_state = checkpoint['torch_random_state']
+                    if isinstance(rng_state, torch.Tensor):
+                        rng_state = rng_state.cpu().to(torch.uint8)
+                    torch.set_rng_state(rng_state)
+                if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
+                    cuda_rng_state = checkpoint['torch_cuda_random_state']
+                    if isinstance(cuda_rng_state, torch.Tensor):
+                        cuda_rng_state = cuda_rng_state.cpu().to(torch.uint8)
+                    torch.cuda.set_rng_state(cuda_rng_state, device=self.local_rank)
+                
+                # early stopping状態の復元
+                if 'best_metric_score' in checkpoint:
+                    self.best_metric_score = checkpoint['best_metric_score']
+                    self.patience_counter = checkpoint['patience_counter']
+                    self.early_stopped = checkpoint['early_stopped']
+                    self.best_epoch = checkpoint['best_epoch']
+                    self.loss_history = checkpoint['loss_history']
+                    self.logger.info(f'early stopping状態を復元: best_score={self.best_metric_score:.4f}, '
+                                    f'patience={self.patience_counter}, best_epoch={self.best_epoch}')
+            else:
+                self.logger.warning(f'チェックポイントファイル {checkpoint_path} が見つかりません')
+                resume_epoch_tensor[0] = 0  # チェックポイントが見つからない場合は0
+        
+        # DDP時は全プロセスでresume_epochを同期
+        if self.use_ddp:
+            dist.broadcast(resume_epoch_tensor, src=0)
+        
+        resume_epoch = int(resume_epoch_tensor[0].item())
+        return resume_epoch if resume_epoch > 0 else None
     
     def save_checkpoint(self, epoch: int, phase: int):
-        """チェックポイントの保存"""
+        """チェックポイントの保存（メインプロセスのみ）"""
+        if not self.is_main_process:
+            return
+        
+        # DDPラップを解除してstate_dictを取得
+        model_q_state = self.model_q.module.state_dict() if self.use_ddp else self.model_q.state_dict()
+        
         checkpoint = {
             'epoch': epoch,
-            'model_q_state_dict': self.model_q.state_dict(),
-            'model_k_state_dict': self.model_k.state_dict(),
-            'proj_head_q_state_dict': self.proj_head_q.state_dict(),
-            'proj_head_k_state_dict': self.proj_head_k.state_dict(),
-            'predictor_state_dict': self.predictor.state_dict(),
+            'model_q_state_dict': model_q_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             f'scheduler_{phase}_state_dict': self.schedulers[phase].state_dict(),
             'np_random_state': np.random.get_state(),
@@ -298,26 +284,35 @@ class TCUSSTrainer:
         
         torch.save(checkpoint, join(self.config.save_path, f'checkpoint_epoch_{epoch}.pth'))
     
-    def train(self, train_loader: DataLoader, cluster_loader: DataLoader):
-        """モデルのトレーニングメイン関数"""
+    def train(self, train_loader: DataLoader, cluster_loader: DataLoader, train_sampler: Optional[DistributedSampler] = None):
+        """モデルのトレーニングメイン関数（DDP対応版）
+        
+        Args:
+            train_loader: トレーニングデータローダー
+            cluster_loader: クラスタリングデータローダー
+            train_sampler: DDP用のDistributedSampler（DDPなしの場合はNone）
+        """
         # vis時はwandbをdisableに設定
         if self.config.vis:
             os.environ["WANDB_MODE"] = "disabled"
 
-        # Weights & Biasesの初期化
-        _ = self.init_wandb()
+        # Weights & Biasesの初期化（メインプロセスのみ）
+        if self.is_main_process:
+            _ = self.init_wandb()
+        else:
+            os.environ["WANDB_MODE"] = "disabled"
         
         # オプティマイザとスケジューラの設定
         self.setup_optimizer()
         self.setup_schedulers(len(train_loader))
         
-        # モデルの更新
-        momentum_update_key_encoder(self.model_q, self.model_k, self.proj_head_q, self.proj_head_k)
+        # train_samplerを保存（train_phaseで使用）
+        self.train_sampler = train_sampler
         
         # トレーニング開始
         is_growing = False
         for i, (epoch, scheduler) in enumerate(zip(self.config.max_epoch, self.schedulers)):
-            train_loader.dataset.phase = i # iではなくフェーズを0に固定すれば、それだけでGrowSPのみのトレーニングになる（今のコードでは違うけど）
+            train_loader.dataset.phase = i
             self.train_phase(i, train_loader, cluster_loader, is_growing)
             is_growing = True
     
@@ -337,14 +332,27 @@ class TCUSSTrainer:
             
             # クラスタリングの実行
             if (epoch - 1) % self.config.cluster_interval == 0:
-                train_loader.dataset.random_select_sample()
-                scene_idx = train_loader.dataset.scene_idx_all
-                cluster_loader.dataset.random_select_sample(scene_idx)
+                # シーンペアを再生成（固定シード + エポック番号で全GPUで同じ結果）
+                # これによりtrainsetとclustersetで同じシーンを使用できる
+                sync_seed = self.config.seed + epoch
+                scene_pairs, scene_idx_t1, scene_idx_t2 = generate_scene_pairs(
+                    select_num=self.config.select_num,
+                    scan_window=self.config.scan_window,
+                    seed=sync_seed
+                )
+                scene_idx_all = get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
+                
+                # trainsetとclustersetに同じシーンを設定
+                train_loader.dataset.set_scene_pairs(scene_idx_t1, scene_idx_t2)
+                cluster_loader.dataset.random_select_sample(scene_idx_all)
+                
+                # DDP時はバリア同期
+                if self.use_ddp:
+                    dist.barrier()
+                
                 self.classifier, self.current_growsp = self.cluster(cluster_loader, epoch, self.config.max_epoch[0], is_growing)
             
-            # データセットにクラスタ数を設定（STC/TARLでデータセットが異なるため属性チェック）
-            if hasattr(train_loader.dataset, 'kittitemporal'):
-                train_loader.dataset.kittitemporal.n_clusters = self.current_growsp
+            # データセットにクラスタ数を設定（STCでデータセットが異なるため属性チェック）
             if hasattr(train_loader.dataset, 'kittistc'):
                 # STCデータセット側も必要なら持つようにする（存在しない場合はスキップ）
                 if hasattr(train_loader.dataset.kittistc, 'n_clusters'):
@@ -367,13 +375,17 @@ class TCUSSTrainer:
                 self.save_checkpoint(epoch, phase)
     
     def train_epoch(self, train_loader: DataLoader, epoch: int, phase: int):
-        """1エポックのトレーニング"""
+        """1エポックのトレーニング（DDP対応版）"""
+        # DDP時は全プロセスでバリア同期してからエポック開始
+        if self.use_ddp:
+            dist.barrier()
+        
+        # DDP時はDistributedSamplerにエポックを設定
+        if self.train_sampler is not None:
+            self.train_sampler.set_epoch(epoch)
+        
         # モデルをトレーニングモードに設定
         self.model_q.train()
-        self.model_k.train()
-        self.proj_head_q.train()
-        self.proj_head_k.train()
-        self.predictor.train()
         
         # オプティマイザのリセット
         self.optimizer.zero_grad()
@@ -382,117 +394,63 @@ class TCUSSTrainer:
         loss_growsp_display = 0.0
         loss_temporal_display = 0.0
         
-        # タイミング計測用（最初の10バッチのみ詳細計測）
-        timing_stats = {
-            'dataloader': [], 'growsp_t1': [], 'growsp_t2': [], 
-            'stc_total': [], 'backward': [], 'optimizer': [], 'cuda_sync': []
-        }
+        # DataLoaderイテレータを使用
+        dataloader_iter = iter(train_loader)
         
-        # プリフェッチャーを使用するかどうか
-        # Phase 0（Phase 1）ではSTC lossを計算しないのでプリフェッチャー（VoteFlow計算）も不要
-        use_prefetcher = (
-            self.config.stc.enabled and 
-            self.scene_flow_prefetcher is not None and
-            phase != 0  # Phase 1ではVoteFlow計算を省略
-        )
+        # メインプロセスのみtqdmで進捗表示
+        iterator = range(len(train_loader))
+        if self.is_main_process:
+            iterator = tqdm(iterator, desc=f'トレーニングエポック: {epoch}')
         
-        if use_prefetcher:
-            # プリフェッチャーを開始（DataLoaderを渡す）
-            self.scene_flow_prefetcher.start(train_loader, len(train_loader))
-            self.logger.info(f'SceneFlowPrefetcher開始: バッチ先読み中...')
-        else:
-            # 従来通りDataLoaderイテレータを使用
-            dataloader_iter = iter(train_loader)
-        
-        t_dataloader_start = time.perf_counter()
-        
-        for i in tqdm(range(len(train_loader)), desc=f'トレーニングエポック: {epoch}'):
-            # === DataLoader/Prefetch時間計測 ===
-            if use_prefetcher:
-                # プリフェッチャーから事前計算済みのデータを取得
-                result = self.scene_flow_prefetcher.get_batch(i, timeout=120.0)
-                if result is None:
-                    self.logger.warning(f'Prefetch failed for batch {i}, skipping')
-                    continue
-                growsp_t1_data, growsp_t2_data, tarl_data, prefetched_flow_results = result
-            else:
-                # 従来通りDataLoaderから取得
-                data = next(dataloader_iter)
-                growsp_t1_data, growsp_t2_data, tarl_data = data
-                prefetched_flow_results = None
+        for i in iterator:
+            data = next(dataloader_iter)
+            growsp_t1_data, growsp_t2_data, stc_data = data
             
-            torch.cuda.synchronize()  # GPU処理完了を待つ
-            t_dataloader_end = time.perf_counter()
+            # 注意: BatchNormのinplace更新問題を回避するため、各損失は個別にbackwardする
+            growsp_t1_loss = self.train_growsp(growsp_t1_data) / self.config.accum_step
+            if growsp_t1_loss.grad_fn is not None:
+                growsp_t1_loss.backward()
             
-            # === GrowSP t1 時間計測 ===
-            t_growsp_t1_start = time.perf_counter()
-            growsp_t1_loss = self.train_growsp(growsp_t1_data)
-            torch.cuda.synchronize()
-            t_growsp_t1_end = time.perf_counter()
+            growsp_t2_loss = self.train_growsp(growsp_t2_data) / self.config.accum_step
+            if growsp_t2_loss.grad_fn is not None:
+                growsp_t2_loss.backward()
             
-            # === GrowSP t2 時間計測 ===
-            t_growsp_t2_start = time.perf_counter()
-            growsp_t2_loss = self.train_growsp(growsp_t2_data)
-            torch.cuda.synchronize()
-            t_growsp_t2_end = time.perf_counter()
-            
-            # === STC/TARL 時間計測 ===
-            t_stc_start = time.perf_counter()
             if self.config.stc.enabled:
                 # STCモード
-                # Phase 0（Phase 1）ではSTC lossを計算しない（VoteFlowやマッチングも省略）
+                # Phase 0（Phase 1）ではSTC lossを計算しない
                 if phase == 0:
-                    temporal_loss = torch.tensor(0.0, device="cuda")
-                elif tarl_data is not None:
+                    temporal_loss = torch.tensor(0.0, device=self.device)
+                elif stc_data is not None:
                     temporal_loss = self.train_stc(
-                        tarl_data, 
+                        stc_data, 
                         phase=phase,
-                        current_growsp=self.current_growsp,
-                        profile=(i < 10),
-                        prefetched_flow_results=prefetched_flow_results
+                        current_growsp=self.current_growsp
                     ) / self.config.accum_step
+                    if temporal_loss.grad_fn is not None:
+                        (self.config.stc.weight * temporal_loss).backward()
                 else:
-                    temporal_loss = torch.tensor(0.0, device="cuda")
+                    temporal_loss = torch.tensor(0.0, device=self.device)
                 temporal_weight = self.config.stc.weight
             else:
-                # TARLモード
-                if tarl_data is not None:
-                    temporal_loss = self.train_tarl(tarl_data) / self.config.accum_step
-                else:
-                    temporal_loss = torch.tensor(0.0, device="cuda")
-                temporal_weight = self.config.lmb
-            torch.cuda.synchronize()
-            t_stc_end = time.perf_counter()
+                # GrowSPのみモード（STC無効）
+                temporal_loss = torch.tensor(0.0, device=self.device)
+                temporal_weight = 0.0
             
-            # 合計損失の計算
-            growsp_loss = (growsp_t1_loss + growsp_t2_loss) / self.config.accum_step
-            loss = growsp_loss + temporal_weight * temporal_loss
-            
-            # 損失の表示用に加算
-            loss_growsp_display += growsp_loss.item()
+            # 損失の表示用に加算（backwardは既に各損失で個別に実行済み）
+            growsp_loss = growsp_t1_loss.item() + growsp_t2_loss.item()
+            loss_growsp_display += growsp_loss
             loss_temporal_display += temporal_loss.item() if isinstance(temporal_loss, torch.Tensor) else temporal_loss
-            
-            # === Backward 時間計測 ===
-            t_backward_start = time.perf_counter()
-            if loss.grad_fn is not None:
-                loss.backward()
-            torch.cuda.synchronize()
-            t_backward_end = time.perf_counter()
             
             # 勾配の蓄積ステップに達したか、最後のバッチの場合
             if ((i+1) % self.config.accum_step == 0) or (i == len(train_loader)-1):
-                # === Optimizer 時間計測 ===
-                t_optimizer_start = time.perf_counter()
                 self.optimizer.step()
-                torch.cuda.synchronize()
-                t_optimizer_end = time.perf_counter()
                 
-                # 学習率のログ記録
-                wandb.log({
-                    'epoch': epoch, 
-                    'backbone_lr': self.optimizer.param_groups[0]['lr'], 
-                    'transformer_lr': self.optimizer.param_groups[1]['lr']
-                })
+                # 学習率のログ記録（メインプロセスのみ）
+                if self.is_main_process:
+                    wandb.log({
+                        'epoch': epoch, 
+                        'backbone_lr': self.optimizer.param_groups[0]['lr']
+                    })
                 
                 # スケジューラの更新
                 if self.schedulers[phase] is not None:
@@ -500,87 +458,39 @@ class TCUSSTrainer:
                 
                 # オプティマイザのリセット
                 self.optimizer.zero_grad()
-                
-                # モメンタムモデルの更新
-                momentum_update_key_encoder(self.model_q, self.model_k, self.proj_head_q, self.proj_head_k)
-                
-                # === CUDA同期・メモリ解放 時間計測 ===
-                t_sync_start = time.perf_counter()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize(torch.device("cuda"))
-                t_sync_end = time.perf_counter()
-            else:
-                t_optimizer_end = t_backward_end
-                t_sync_end = t_backward_end
-            
-            # タイミング統計を記録（最初の10バッチ）
-            if i < 10:
-                timing_stats['dataloader'].append(t_dataloader_end - t_dataloader_start)
-                timing_stats['growsp_t1'].append(t_growsp_t1_end - t_growsp_t1_start)
-                timing_stats['growsp_t2'].append(t_growsp_t2_end - t_growsp_t2_start)
-                timing_stats['stc_total'].append(t_stc_end - t_stc_start)
-                timing_stats['backward'].append(t_backward_end - t_backward_start)
-                timing_stats['optimizer'].append(t_optimizer_end - t_backward_end)
-                timing_stats['cuda_sync'].append(t_sync_end - t_optimizer_end)
-                
-                total_time = t_sync_end - t_dataloader_start
-                self.logger.info(
-                    f'[PROFILE batch {i}] total={total_time:.3f}s | '
-                    f'dataloader={t_dataloader_end - t_dataloader_start:.3f}s | '
-                    f'growsp_t1={t_growsp_t1_end - t_growsp_t1_start:.3f}s | '
-                    f'growsp_t2={t_growsp_t2_end - t_growsp_t2_start:.3f}s | '
-                    f'stc={t_stc_end - t_stc_start:.3f}s | '
-                    f'backward={t_backward_end - t_backward_start:.3f}s | '
-                    f'optimizer={t_optimizer_end - t_backward_end:.3f}s | '
-                    f'cuda_sync={t_sync_end - t_optimizer_end:.3f}s'
-                )
-            
-            # 次のイテレーション用にDataLoader開始時間を更新
-            t_dataloader_start = time.perf_counter()
         
-        # プリフェッチャーを停止
-        if use_prefetcher:
-            prefetch_stats = self.scene_flow_prefetcher.get_stats()
-            self.scene_flow_prefetcher.stop()
-            self.logger.info(
-                f'[PREFETCH STATS] prefetched={prefetch_stats["prefetched"]}, '
-                f'cache_hits={prefetch_stats["cache_hits"]}, '
-                f'wait_time={prefetch_stats["wait_time"]:.2f}s, '
-                f'compute_time={prefetch_stats["compute_time"]:.2f}s'
-            )
-        
-        # タイミング統計のサマリーを出力
-        if timing_stats['dataloader']:
-            self.logger.info('='*80)
-            self.logger.info('[PROFILE SUMMARY] 最初の10バッチの平均時間:')
-            for key, values in timing_stats.items():
-                if values:
-                    avg = sum(values) / len(values)
-                    self.logger.info(f'  {key}: {avg:.3f}s ({avg/sum(sum(v) for v in timing_stats.values() if v)*100:.1f}%)')
-            self.logger.info('='*80)
-        
-        # エポック全体の損失をログに記録
-        temporal_weight = self.config.stc.weight if self.config.stc.enabled else self.config.lmb
+        # エポック全体の損失をログに記録（メインプロセスのみ）
+        temporal_weight = self.config.stc.weight if self.config.stc.enabled else 0.0
         train_loss = loss_growsp_display + temporal_weight * loss_temporal_display
         self.loss_history.append(train_loss)
-        loss_name = 'loss_stc' if self.config.stc.enabled else 'loss_tarl'
-        wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, loss_name: loss_temporal_display, 'train_loss': train_loss})
+        
+        if self.is_main_process:
+            loss_name = 'loss_stc' if self.config.stc.enabled else 'loss_temporal'
+            wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, loss_name: loss_temporal_display, 'train_loss': train_loss})
     
     def train_growsp(self, growsp_data):
-        """GrowSPのトレーニング
+        """GrowSPのトレーニング（DDP対応版）
         
-        growsp_dataはcollate結果のタプル:
-        (coords_batch, feats_batch, normal_batch, labels_batch,
-         inverse_batch, pseudo_batch, inds_batch, region_batch, index_batch)
-        の9要素が入る想定。ここではcoords, pseudo, indsのみ使用する。
+        growsp_dataはcollate結果で、10要素タプル:
+        (coords, feats, normal, labels, inverse, pseudo, inds, region, index, feats_sizes)
         """
-        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.config.ignore_label).to("cuda:0")
+        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.config.ignore_label).to(self.device)
+        
+        # データ形式をアンパック（10要素タプルのみ対応）
+        if len(growsp_data) != 10:
+            raise ValueError(f"Unexpected growsp_data length: {len(growsp_data)}. Expected 10.")
+        
         coords = growsp_data[0]
         pseudo_labels = growsp_data[5]
         inds = growsp_data[6]
+        feats_sizes = growsp_data[9]
         
-        # 入力フィールドの作成
-        in_field = ME.TensorField(coords[:, 1:] * self.config.voxel_size, coords, device=0)
+        # サイズ不一致チェック
+        if len(inds) != len(pseudo_labels):
+            raise ValueError(f"inds ({len(inds)}) と pseudo_labels ({len(pseudo_labels)}) のサイズが一致しません")
+        
+        # 入力フィールドの作成（DDPデバイスを使用）
+        in_field = ME.TensorField(coords[:, 1:] * self.config.voxel_size, coords, device=self.local_rank)
         
         # 特徴抽出
         feats = self.model_q(in_field)
@@ -588,7 +498,7 @@ class TCUSSTrainer:
         feats = F.normalize(feats, dim=-1)
         
         # 擬似ラベルの準備
-        pseudo_labels_comp = pseudo_labels.long().to("cuda:0")
+        pseudo_labels_comp = pseudo_labels.long().to(self.device)
         
         # ロジットの計算
         logits = F.linear(F.normalize(feats), F.normalize(self.classifier.weight))
@@ -596,173 +506,6 @@ class TCUSSTrainer:
         # 損失計算
         loss_sem = loss_fn(logits * 5, pseudo_labels_comp).mean()
         return loss_sem
-    
-    def train_tarl(self, tarl_data):
-        """TARLのトレーニング"""
-        coords_q, coords_k, segs_q, segs_k = tarl_data
-        
-        # デバッグモードでTARLデータを保存
-        if self.config.debug:
-            print('TARLデータを保存します')
-            debug_dir = os.path.join(self.config.save_path, 'debug_tarl')
-            if not os.path.exists(debug_dir):
-                os.makedirs(debug_dir)
-            
-            # ファイル名の生成
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            
-            # バッチIDを取得
-            batch_ids = torch.unique(coords_q[:, 0])
-            if len(batch_ids) > 0:
-                # 最初のバッチを選択
-                batch_id = batch_ids[0].item()
-                
-                # クエリデータの抽出と保存
-                mask_q = coords_q[:, 0] == batch_id
-                points_q = coords_q[mask_q, 1:].detach().cpu().numpy() * self.config.voxel_size
-                seg_q = segs_q[int(batch_id)].cpu().numpy()
-                
-                # キーデータの抽出と保存
-                mask_k = coords_k[:, 0] == batch_id
-                points_k = coords_k[mask_k, 1:].detach().cpu().numpy() * self.config.voxel_size
-                seg_k = segs_k[int(batch_id)].cpu().numpy()
-                
-                # データ保存
-                np.save(os.path.join(debug_dir, f'points_q_{timestamp}.npy'), points_q)
-                np.save(os.path.join(debug_dir, f'segs_q_{timestamp}.npy'), seg_q)
-                np.save(os.path.join(debug_dir, f'points_k_{timestamp}.npy'), points_k)
-                np.save(os.path.join(debug_dir, f'segs_k_{timestamp}.npy'), seg_k)
-                
-                self.logger.info(f'TARLデータを保存しました: {debug_dir}')
-            exit()
-        # 順方向と逆方向の損失を計算して合計
-        loss = self.train_contrast_half(coords_q, coords_k, segs_q, segs_k)
-        loss += self.train_contrast_half(coords_k, coords_q, segs_k, segs_q)
-        
-        return loss
-    
-    def train_contrast_half(self, coords_q, coords_k, segs_q, segs_k):
-        """コントラスト学習の半分（一方向）"""
-        # クエリモデルでの特徴抽出
-        in_field_q = ME.TensorField(coords_q[:, 1:] * self.config.voxel_size, coords_q, device=0)
-        feats_q = self.model_q(in_field_q)
-        
-        # バッチIDの取得
-        batch_ids = torch.unique(coords_q[:, 0])
-        
-        seg_feats_q_list, mask_q_list = [], []
-        
-        # バッチごとの処理
-        for batch_id in batch_ids:
-            mask = coords_q[:, 0] == batch_id
-            scene_feats_q = feats_q[mask]
-            scene_segs_q = segs_q[int(batch_id)].to("cuda:0")
-            scene_seg_feats_q, mask_q = compute_segment_feats(
-                scene_feats_q, scene_segs_q, max_seg_num=None, 
-                ignore_hdbscan_outliers=self.config.ignore_hdbscan_outliers
-            )
-            seg_feats_q_list.append(scene_seg_feats_q)
-            mask_q_list.append(mask_q)
-        
-        # 特徴とマスクのスタック
-        # バッチ内で最大セグメント数を計算
-        max_seg_num_in_batch = max(seg_feats.size(0) for seg_feats in seg_feats_q_list)
-        
-        # キーモデルでの特徴抽出（勾配計算なし）
-        with torch.no_grad():
-            in_field_k = ME.TensorField(coords_k[:, 1:] * self.config.voxel_size, coords_k, device=0)
-            feats_k = self.model_k(in_field_k)
-            
-            # バッチIDの取得
-            batch_ids = torch.unique(coords_k[:, 0])
-            seg_feats_k_list, mask_k_list = [], []
-            
-            # バッチごとの処理
-            for batch_id in batch_ids:
-                mask = coords_k[:, 0] == batch_id
-                scene_feats_k = feats_k[mask]
-                scene_segs_k = segs_k[int(batch_id)].to("cuda:0")
-                scene_seg_feats_k, mask_k = compute_segment_feats(
-                    scene_feats_k, scene_segs_k, max_seg_num=None,
-                    ignore_hdbscan_outliers=self.config.ignore_hdbscan_outliers
-                )
-                seg_feats_k_list.append(scene_seg_feats_k)
-                mask_k_list.append(mask_k)
-            
-            # クエリ側とキー側の最大セグメント数を統一
-            max_seg_num_k_in_batch = max(seg_feats.size(0) for seg_feats in seg_feats_k_list)
-            final_max_seg_num = max(max_seg_num_in_batch, max_seg_num_k_in_batch)
-        
-        # クエリ側パディング処理
-        padded_seg_feats_q_list = []
-        padded_mask_q_list = []
-        
-        for seg_feats, mask in zip(seg_feats_q_list, mask_q_list):
-            current_seg_num = seg_feats.size(0)
-            if current_seg_num < final_max_seg_num:
-                # 不足分をゼロパディング
-                padding_size = final_max_seg_num - current_seg_num
-                padded_feats = torch.cat([
-                    seg_feats,
-                    torch.zeros(padding_size, seg_feats.size(1), device=seg_feats.device)
-                ], dim=0)
-                padded_mask = torch.cat([
-                    mask,
-                    torch.ones(padding_size, dtype=torch.bool, device=mask.device)  # パディング部分はTrue（存在しない）
-                ], dim=0)
-            else:
-                padded_feats = seg_feats
-                padded_mask = mask
-            
-            padded_seg_feats_q_list.append(padded_feats)
-            padded_mask_q_list.append(padded_mask)
-        
-        padded_seg_feats_q = torch.stack(padded_seg_feats_q_list, dim=0)
-        batch_mask_q = torch.stack(padded_mask_q_list, dim=0)
-        
-        # プロジェクションヘッドに入力
-        proj_feats_q = self.proj_head_q(padded_seg_feats_q, enc_mask=batch_mask_q)
-        
-        # プレディクターに入力
-        pred_feats_q = self.predictor(proj_feats_q, enc_mask=batch_mask_q)
-        pred_feats_q = F.normalize(pred_feats_q, dim=-1)
-        
-        # キー側の特徴抽出は既に上で実行済み
-        with torch.no_grad():
-            # キー側パディング処理
-            padded_seg_feats_k_list = []
-            padded_mask_k_list = []
-            
-            for seg_feats, mask in zip(seg_feats_k_list, mask_k_list):
-                current_seg_num = seg_feats.size(0)
-                if current_seg_num < final_max_seg_num:
-                    # 不足分をゼロパディング
-                    padding_size = final_max_seg_num - current_seg_num
-                    padded_feats = torch.cat([
-                        seg_feats,
-                        torch.zeros(padding_size, seg_feats.size(1), device=seg_feats.device)
-                    ], dim=0)
-                    padded_mask = torch.cat([
-                        mask,
-                        torch.ones(padding_size, dtype=torch.bool, device=mask.device)  # パディング部分はTrue（存在しない）
-                    ], dim=0)
-                else:
-                    padded_feats = seg_feats
-                    padded_mask = mask
-                
-                padded_seg_feats_k_list.append(padded_feats)
-                padded_mask_k_list.append(padded_mask)
-            
-            padded_seg_feats_k = torch.stack(padded_seg_feats_k_list, dim=0)
-            batch_mask_k = torch.stack(padded_mask_k_list, dim=0)
-            
-            # プロジェクションヘッドに入力
-            proj_feats_k = self.proj_head_k(padded_seg_feats_k, enc_mask=batch_mask_k)
-            proj_feats_k = F.normalize(proj_feats_k, dim=-1)
-        
-        # InfoNCE損失の計算
-        loss = calc_info_nce(pred_feats_q, proj_feats_k, batch_mask_q, batch_mask_k)
-        return loss
     
     def _merge_init_sp_to_growsp(
         self,
@@ -859,32 +602,23 @@ class TCUSSTrainer:
         self, 
         stc_data: Dict, 
         phase: int = 0,
-        current_growsp: Optional[int] = None,
-        profile: bool = False,
-        prefetched_flow_results: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
+        current_growsp: Optional[int] = None
     ) -> torch.Tensor:
         """
-        STC (Superpoint Time Consistency) 損失の計算
-        複数GPUでVoteFlowを並列実行して高速化
+        STC (Superpoint Time Consistency) 損失の計算（DDP対応版）
+        VoteFlowで事前計算されたScene Flowデータ（H5ファイル）を使用する。
         
         Phase 0ではSTC lossを計算せず、Phase 1以降でSuperpoint Constructor（kmeans）で
         統合したSP単位で対応をとる。
         
         Args:
-            stc_data: STC用データ
+            stc_data: STC用データ（flow_t, ground_mask_t等を含む）
             phase: トレーニングフェーズ（0: Phase 1, 1: Phase 2）
             current_growsp: 統合後のSP数（Phase 2で使用）
-            profile: 詳細なタイミング計測を行うかどうか
-            prefetched_flow_results: 事前計算済みのScene Flow結果（プリフェッチャーから）
         """
-        from scene_flow.correspondence import (
-            compute_point_correspondence, compute_superpoint_correspondence_matrix
-        )
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         # Phase 0（Phase 1）ではSTC lossを計算しない
         if phase == 0:
-            return torch.tensor(0.0, device="cuda:0", requires_grad=False)
+            return torch.tensor(0.0, device=self.device, requires_grad=False)
         
         coords_t = stc_data['coords_t']
         coords_t1 = stc_data['coords_t1']
@@ -896,150 +630,20 @@ class TCUSSTrainer:
         pose_t1 = stc_data['pose_t1']
         scene_name_t = stc_data.get('scene_name_t', None)  # キャッシュ参照用
         scene_name_t1 = stc_data.get('scene_name_t1', None)
-
-        if not self.voteflow_wrappers and prefetched_flow_results is None:
-            return torch.tensor(0.0, device="cuda:0")
+        flow_t_list = stc_data['flow_t']  # H5ファイルから読み込んだScene Flow
+        ground_mask_t_list = stc_data['ground_mask_t']  # 地面マスク（時刻t）
+        ground_mask_t1_list = stc_data['ground_mask_t1']  # 地面マスク（時刻t+1）
         
-        # プロファイル用タイミング
-        if profile:
-            t_feat_start = time.perf_counter()
-        
-        # 特徴抽出
-        in_field_t = ME.TensorField(coords_t[:, 1:] * self.config.voxel_size, coords_t, device=0)
-        in_field_t1 = ME.TensorField(coords_t1[:, 1:] * self.config.voxel_size, coords_t1, device=0)
+        # 特徴抽出（DDPデバイスを使用）
+        in_field_t = ME.TensorField(coords_t[:, 1:] * self.config.voxel_size, coords_t, device=self.local_rank)
+        in_field_t1 = ME.TensorField(coords_t1[:, 1:] * self.config.voxel_size, coords_t1, device=self.local_rank)
         
         feats_t = self.model_q(in_field_t)
         feats_t1 = self.model_q(in_field_t1)
         
-        if profile:
-            torch.cuda.synchronize()
-            t_feat_end = time.perf_counter()
-        
         batch_ids = torch.unique(coords_t[:, 0])
-        n_samples = len(batch_ids)
-        
-        # === VoteFlow並列処理用データ収集 ===
-        voteflow_tasks = []
-        for batch_idx in range(n_samples):
-            points_t = coords_t_original[batch_idx]
-            points_t1 = coords_t1_original[batch_idx]
-            p_t = pose_t[batch_idx]
-            p_t1 = pose_t1[batch_idx]
-            
-            # numpy配列に変換
-            if torch.is_tensor(points_t):
-                points_t = points_t.numpy()
-            if torch.is_tensor(points_t1):
-                points_t1 = points_t1.numpy()
-            if torch.is_tensor(p_t):
-                p_t = p_t.numpy()
-            if torch.is_tensor(p_t1):
-                p_t1 = p_t1.numpy()
-            
-            voteflow_tasks.append({
-                'batch_idx': batch_idx,
-                'points_t': points_t,
-                'points_t1': points_t1,
-                'pose_t': p_t,
-                'pose_t1': p_t1,
-            })
-        
-        # === VoteFlowマルチGPU並列推論（または事前計算結果を使用） ===
-        if profile:
-            t_vf_start = time.perf_counter()
-        
-        if prefetched_flow_results is not None:
-            # 事前計算済みの結果を使用（プリフェッチャーから）
-            flow_results = prefetched_flow_results
-            if profile:
-                torch.cuda.synchronize()
-                t_vf_end = time.perf_counter()
-                t_voteflow_total = t_vf_end - t_vf_start
-                t_kdtree_total = 0.0
-                t_sp_corr_total = 0.0
-                t_loss_total = 0.0
-                self.logger.info(f'  [STC] Using prefetched flow results (n_samples={n_samples})')
-        else:
-            # リアルタイムで計算
-            n_gpus = len(self.voteflow_wrappers)
-            
-            if n_gpus == 1:
-                # 単一GPUの場合は従来通りバッチ処理
-                points_t_list = [task['points_t'] for task in voteflow_tasks]
-                points_t1_list = [task['points_t1'] for task in voteflow_tasks]
-                pose_t_list = [task['pose_t'] for task in voteflow_tasks]
-                pose_t1_list = [task['pose_t1'] for task in voteflow_tasks]
-                
-                voteflow = self.voteflow_wrappers[0]
-                flow_results = voteflow.compute_flow_batch(
-                    points_t_list, points_t1_list, pose_t_list, pose_t1_list
-                )
-            else:
-                # 複数GPUの場合はサンプルを分散して並列計算
-                # 各GPUに割り当てるサンプルを決定
-                gpu_tasks = [[] for _ in range(n_gpus)]
-                gpu_task_indices = [[] for _ in range(n_gpus)]  # 元のインデックスを保持
-                
-                for i, task in enumerate(voteflow_tasks):
-                    gpu_id = i % n_gpus
-                    gpu_tasks[gpu_id].append(task)
-                    gpu_task_indices[gpu_id].append(i)
-                
-                # 各GPUでの計算をスレッドプールで並列実行
-            def compute_on_gpu(gpu_id: int, tasks: list):
-                """指定GPUでバッチ計算を実行"""
-                if not tasks:
-                    return []
-                
-                wrapper = self.voteflow_wrappers[gpu_id]
-                points_t_list = [t['points_t'] for t in tasks]
-                points_t1_list = [t['points_t1'] for t in tasks]
-                pose_t_list = [t['pose_t'] for t in tasks]
-                pose_t1_list = [t['pose_t1'] for t in tasks]
-                
-                return wrapper.compute_flow_batch(
-                    points_t_list, points_t1_list, pose_t_list, pose_t1_list
-                )
-            
-            # スレッドプールで並列実行
-            flow_results = [None] * n_samples
-            
-            with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-                futures = {}
-                for gpu_id in range(n_gpus):
-                    if gpu_tasks[gpu_id]:
-                        future = executor.submit(compute_on_gpu, gpu_id, gpu_tasks[gpu_id])
-                        futures[future] = gpu_id
-                
-                for future in as_completed(futures):
-                    gpu_id = futures[future]
-                    try:
-                        results = future.result()
-                        # 元のインデックス順に結果を格納
-                        for local_idx, result in enumerate(results):
-                            original_idx = gpu_task_indices[gpu_id][local_idx]
-                            flow_results[original_idx] = result
-                    except Exception as e:
-                        self.logger.error(f'GPU {gpu_id} VoteFlow error: {e}')
-                        # エラーの場合は空の結果を設定
-                        for original_idx in gpu_task_indices[gpu_id]:
-                            flow_results[original_idx] = (
-                                np.zeros((0, 3), dtype=np.float32),
-                                np.array([], dtype=np.int64)
-                            )
-            
-            # リアルタイム計算の場合のプロファイル
-            if profile:
-                torch.cuda.synchronize()
-                t_vf_end = time.perf_counter()
-                t_voteflow_total = t_vf_end - t_vf_start
-                t_kdtree_total = 0.0
-                t_sp_corr_total = 0.0
-                t_loss_total = 0.0
         
         # === SPラベル統合: キャッシュから取得（kmeansをスキップ） ===
-        if profile:
-            t_merge_start = time.perf_counter()
         
         # 各サンプルの特徴量とSPラベルを準備
         sample_data_list = []
@@ -1056,8 +660,8 @@ class TCUSSTrainer:
             scene_feats_t1 = feats_t1[mask_t1]
             
             # init SPラベルを取得
-            init_sp_labels_t = sp_labels_t[batch_idx].to("cuda:0")
-            init_sp_labels_t1 = sp_labels_t1[batch_idx].to("cuda:0")
+            init_sp_labels_t = sp_labels_t[batch_idx].to(self.device)
+            init_sp_labels_t1 = sp_labels_t1[batch_idx].to(self.device)
             
             # キャッシュからinit SP → 統合SPのマッピングを取得
             if use_cache:
@@ -1074,8 +678,6 @@ class TCUSSTrainer:
                     scene_sp_labels_t1 = self._apply_sp_mapping(init_sp_labels_t1, sp_idx_t1)
                 else:
                     # キャッシュミス → フォールバック
-                    if profile and batch_idx == 0:
-                        self.logger.warning(f'  [STC] Cache miss for {name_t} or {name_t1}, falling back to kmeans')
                     scene_sp_labels_t = self._merge_init_sp_to_growsp(scene_feats_t, init_sp_labels_t, current_growsp)
                     scene_sp_labels_t1 = self._merge_init_sp_to_growsp(scene_feats_t1, init_sp_labels_t1, current_growsp)
             else:
@@ -1091,18 +693,12 @@ class TCUSSTrainer:
                 'scene_feats_t1': scene_feats_t1,
             })
         
-        if profile:
-            torch.cuda.synchronize()
-            t_merge_total = time.perf_counter() - t_merge_start
-            if use_cache:
-                self.logger.info(f'  [STC] Using cached SP labels (n_samples={n_samples})')
-        
         # === 各サンプルの対応点計算・損失計算 ===
-        total_loss = torch.tensor(0.0, device="cuda:0")
+        total_loss = torch.tensor(0.0, device=self.device)
         valid_batch_count = 0
         
         for batch_idx, batch_id in enumerate(batch_ids):
-            batch_id = int(batch_id.item())
+            batch_id_int = int(batch_id.item())
             
             # 事前計算した特徴量とSPラベルを取得
             sample_data = sample_data_list[batch_idx]
@@ -1110,46 +706,59 @@ class TCUSSTrainer:
             scene_feats_t1 = sample_data['scene_feats_t1']
             scene_sp_labels_t, scene_sp_labels_t1 = merged_labels_results[batch_idx]
             
-            # VoteFlow結果を取得
-            flow, valid_indices = flow_results[batch_idx]
+            # H5ファイルから読み込んだScene Flowを使用
+            flow_t = flow_t_list[batch_idx]
+            if torch.is_tensor(flow_t):
+                flow_t = flow_t.numpy()
             
-            if len(flow) == 0:
-                continue
+            # オリジナル座標を取得
+            scene_coords_t_orig = coords_t_original[batch_idx]
+            scene_coords_t1_orig = coords_t1_original[batch_idx]
+            if torch.is_tensor(scene_coords_t_orig):
+                scene_coords_t_orig = scene_coords_t_orig.numpy()
+            if torch.is_tensor(scene_coords_t1_orig):
+                scene_coords_t1_orig = scene_coords_t1_orig.numpy()
+            
+            # ground_maskを取得
+            ground_mask_t = ground_mask_t_list[batch_idx]
+            ground_mask_t1 = ground_mask_t1_list[batch_idx]
+            if torch.is_tensor(ground_mask_t):
+                ground_mask_t = ground_mask_t.numpy()
+            if torch.is_tensor(ground_mask_t1):
+                ground_mask_t1 = ground_mask_t1.numpy()
+            
+            # poseを取得
+            batch_pose_t = pose_t[batch_idx]
+            batch_pose_t1 = pose_t1[batch_idx]
+            if torch.is_tensor(batch_pose_t):
+                batch_pose_t = batch_pose_t.numpy()
+            if torch.is_tensor(batch_pose_t1):
+                batch_pose_t1 = batch_pose_t1.numpy()
             
             with torch.no_grad():
-                scene_coords_t_orig = voteflow_tasks[batch_idx]['points_t']
-                scene_coords_t1_orig = voteflow_tasks[batch_idx]['points_t1']
-                
-                # KD-Tree対応点計算
-                if profile:
-                    t_kd_start = time.perf_counter()
-                
-                correspondence_t, _ = compute_point_correspondence(
+                # KD-Tree対応点計算（改良版：ego motion除去 + SP/地面フィルタリング）
+                correspondence_t, _ = compute_point_correspondence_filtered(
                     scene_coords_t_orig,
                     scene_coords_t1_orig,
-                    flow,
-                    valid_indices,
-                    distance_threshold=self.config.stc.correspondence.distance_threshold
+                    flow_t,  # 全点分のflow
+                    scene_sp_labels_t.cpu().numpy(),
+                    scene_sp_labels_t1.cpu().numpy(),
+                    batch_pose_t,
+                    batch_pose_t1,
+                    ground_mask_t,
+                    ground_mask_t1,
+                    distance_threshold=self.config.stc.correspondence.distance_threshold,
+                    remove_ego_motion=self.config.stc.correspondence.remove_ego_motion,
+                    exclude_ground=self.config.stc.correspondence.exclude_ground
                 )
                 
-                if profile:
-                    t_kd_end = time.perf_counter()
-                    t_kdtree_total += t_kd_end - t_kd_start
-                
                 # SP対応行列計算
-                if profile:
-                    t_sp_start = time.perf_counter()
-                
                 corr_matrix, unique_sp_t, unique_sp_t1 = compute_superpoint_correspondence_matrix(
                     correspondence_t,
                     scene_sp_labels_t.cpu().numpy(),
                     scene_sp_labels_t1.cpu().numpy(),
                     min_points=self.config.stc.correspondence.min_points
                 )
-                
-                if profile:
-                    t_sp_end = time.perf_counter()
-                    t_sp_corr_total += t_sp_end - t_sp_start
                 
                 if corr_matrix.size == 0:
                     continue
@@ -1165,12 +774,9 @@ class TCUSSTrainer:
                     self.logger.info("vis_sp: Superpointの対応可視化を保存しました。プログラムを終了します。")
                     sys.exit(0)
                 
-                corr_matrix = torch.from_numpy(corr_matrix).float().to("cuda:0")
+                corr_matrix = torch.from_numpy(corr_matrix).float().to(self.device)
             
             # 損失計算
-            if profile:
-                t_loss_start = time.perf_counter()
-            
             sp_feats_t, valid_mask_t = compute_sp_features(
                 scene_feats_t, scene_sp_labels_t, 
                 num_sp=len(unique_sp_t) if len(unique_sp_t) > 0 else None
@@ -1189,30 +795,12 @@ class TCUSSTrainer:
                 min_correspondence=self.config.stc.correspondence.min_points
             )
             
-            if profile:
-                torch.cuda.synchronize()
-                t_loss_end = time.perf_counter()
-                t_loss_total += t_loss_end - t_loss_start
-            
             if loss.grad_fn is not None:
                 total_loss = total_loss + loss
                 valid_batch_count += 1
         
         if valid_batch_count > 0:
             total_loss = total_loss / valid_batch_count
-        
-        # プロファイル結果を出力
-        if profile:
-            n_gpus = len(self.voteflow_wrappers)
-            self.logger.info(
-                f'  [STC PROFILE] feat_extract={t_feat_end - t_feat_start:.3f}s | '
-                f'voteflow={t_voteflow_total:.3f}s ({n_gpus} GPUs, {n_samples} samples) | '
-                f'merge_sp={t_merge_total:.3f}s ({t_merge_total/n_samples:.3f}s/sample) | '
-                f'kdtree={t_kdtree_total:.3f}s ({t_kdtree_total/n_samples:.3f}s/sample) | '
-                f'sp_corr={t_sp_corr_total:.3f}s | '
-                f'loss={t_loss_total:.3f}s | '
-                f'n_samples={n_samples}'
-            )
         
         return total_loss
     
@@ -1330,7 +918,11 @@ class TCUSSTrainer:
         self.logger.info(f"  統計情報保存: {stats_path}")
     
     def cluster(self, cluster_loader: DataLoader, epoch: int, start_grow_epoch: Optional[int] = None, is_growing: bool = False):
-        """クラスタリングの実行"""
+        """クラスタリングの実行（DDP対応版）
+        
+        DDP時もメインプロセスのみで特徴抽出・クラスタリングを実行。
+        クラスタリング結果（primitive_centers）を全GPUにブロードキャスト。
+        """
         time_start = time.time()
         cluster_loader.dataset.mode = 'cluster'
         
@@ -1340,147 +932,213 @@ class TCUSSTrainer:
             current_growsp = int(self.config.growsp_start - ((epoch - start_grow_epoch)/self.config.max_epoch[1])*(self.config.growsp_start - self.config.growsp_end))
             if current_growsp < self.config.growsp_end:
                 current_growsp = self.config.growsp_end
-            self.logger.info(f'エポック: {epoch}, スーパーポイントが {current_growsp} に成長')
+            if self.is_main_process:
+                self.logger.info(f'エポック: {epoch}, スーパーポイントが {current_growsp} に成長')
         
-        # スーパーポイント特徴の抽出
-        feats, labels, sp_index, context = get_kittisp_feature(
-            self.config, cluster_loader, self.model_q, current_growsp, epoch
-        )
-        sp_feats = torch.cat(feats, dim=0)
+        # DDPラップを解除してモデルを取得（推論用）
+        model_q = self.model_q.module if self.use_ddp else self.model_q
         
-        # セマンティックプリミティブクラスタリング (SPC)
-        primitive_labels = get_kmeans_labels(self.config.primitive_num, sp_feats).to('cpu').detach().numpy()
+        # メインプロセスのみで特徴抽出・クラスタリングを実行
+        if self.is_main_process or not self.use_ddp:
+            feats, labels, sp_index, context = get_kittisp_feature(
+                self.config, cluster_loader, model_q, current_growsp, epoch
+            )
+            sp_feats = torch.cat(feats, dim=0)
+            
+            # セマンティックプリミティブクラスタリング (SPC)
+            primitive_labels = get_kmeans_labels(self.config.primitive_num, sp_feats).to('cpu').detach().numpy()
+            
+            # 幾何学的特徴を削除
+            sp_feats = sp_feats[:, :self.config.feats_dim]
+            
+            # プリミティブセンターの計算
+            primitive_centers = torch.zeros((self.config.primitive_num, self.config.feats_dim))
+            for cluster_idx in range(self.config.primitive_num):
+                indices = primitive_labels == cluster_idx
+                if indices.sum() > 0:
+                    cluster_avg = sp_feats[indices].mean(0, keepdims=True)
+                    primitive_centers[cluster_idx] = cluster_avg
+            primitive_centers = F.normalize(primitive_centers, dim=1)
+        else:
+            # 非メインプロセス：ダミーの値を用意（後でbroadcastで上書き）
+            feats, labels, sp_index, context = [], [], [], []
+            primitive_labels = np.array([], dtype=np.int64)
+            primitive_centers = torch.zeros((self.config.primitive_num, self.config.feats_dim))
         
-        # 幾何学的特徴を削除
-        sp_feats = sp_feats[:, :self.config.feats_dim]
+        # DDP時はprimitive_centersを全GPUにブロードキャスト
+        if self.use_ddp:
+            primitive_centers = primitive_centers.to(self.device)
+            dist.broadcast(primitive_centers, src=0)
+            primitive_centers = primitive_centers.cpu()
         
-        # プリミティブセンターの計算
-        primitive_centers = torch.zeros((self.config.primitive_num, self.config.feats_dim))
-        for cluster_idx in range(self.config.primitive_num):
-            indices = primitive_labels == cluster_idx
-            if indices.sum() > 0:  # クラスタにサンプルがある場合のみ
-                cluster_avg = sp_feats[indices].mean(0, keepdims=True)
-                primitive_centers[cluster_idx] = cluster_avg
-        primitive_centers = F.normalize(primitive_centers, dim=1)
-        
-        # 分類器の作成
+        # 分類器の作成（全プロセスで同じものを作成）
         classifier = get_fixclassifier(
             in_channel=self.config.feats_dim, 
             centroids_num=self.config.primitive_num, 
             centroids=primitive_centers
         )
         
-        # 疑似ラベルの計算と保存
-        all_pseudo, all_gt, all_pseudo_gt = get_pseudo_kitti(
-            self.config, context, primitive_labels, sp_index
-        )
-        
-        # STC用: init SP → 統合SP のマッピング（sp_idx）をキャッシュに保存
-        # context[i] = (scene_name, gt, raw_region, sp_idx)
-        # sp_idx = init SP ID → 統合SP ID のマッピング（点数に依存しない）
-        self.sp_index_cache.clear()
-        for i, ctx in enumerate(context):
-            scene_name = ctx[0]
-            sp_idx = ctx[3] if len(ctx) > 3 else None
-            if sp_idx is not None:
-                self.sp_index_cache[scene_name] = sp_idx
-        self.logger.info(f'STC用SPマッピングキャッシュを更新: {len(self.sp_index_cache)} シーン')
-        
-        self.logger.info(
-            'ラベル付けされたポイントの割合 %.2f クラスタリング時間: %.2fs', 
-            (all_pseudo != -1).sum() / all_pseudo.shape[0], 
-            time.time() - time_start
-        )
-        
-        # トレーニング中のスーパーポイント/プリミティブ精度のチェック
-        sem_num = self.config.semantic_class
-        mask = (all_pseudo_gt != -1)
-        histogram = np.bincount(
-            sem_num * all_gt.astype(np.int32)[mask] + all_pseudo_gt.astype(np.int32)[mask], 
-            minlength=sem_num ** 2
-        ).reshape(sem_num, sem_num)
-        
-        # 全体精度の計算
-        o_Acc = histogram[range(sem_num), range(sem_num)].sum() / histogram.sum() * 100
-        
-        # IoUの計算
-        tp = np.diag(histogram)
-        fp = np.sum(histogram, 0) - tp
-        fn = np.sum(histogram, 1) - tp
-        IoUs = tp / (tp + fp + fn + 1e-8)
-        m_IoU = np.nanmean(IoUs)
-        
-        # IoUの文字列表現
-        s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
-        for IoU in IoUs:
-            s += '{:5.2f} '.format(100 * IoU)
-        
-        # 結果のログ記録
-        self.logger.info('クラスタリング結果 - エポック: {:02d}, オール精度 {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, 100 * m_IoU))
-        wandb.log({
-            'epoch': epoch, 
-            'cluster/oAcc': o_Acc, 
-            'cluster/mIoU': m_IoU
-        })
-        
-        return classifier.to("cuda:0"), current_growsp
-    
-    def evaluate(self, epoch: int):
-        """モデルの評価"""
-        # モデルの保存
-        torch.save(
-            self.model_q.state_dict(), 
-            join(self.config.save_path, f'model_{epoch}_checkpoint.pth')
-        )
-        torch.save(
-            self.classifier.state_dict(), 
-            join(self.config.save_path, f'cls_{epoch}_checkpoint.pth')
-        )
-        
-        # 評価の実行
-        with torch.no_grad():
-            o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics = eval(epoch, self.config)
-            self.logger.info('エポック: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
+        # メインプロセスのみで疑似ラベル計算・統計・ログ処理
+        if self.is_main_process or not self.use_ddp:
+            # 疑似ラベルの計算と保存
+            all_pseudo, all_gt, all_pseudo_gt = get_pseudo_kitti(
+                self.config, context, primitive_labels, sp_index
+            )
+            
+            # STC用: init SP → 統合SP のマッピング（sp_idx）をキャッシュに保存
+            self.sp_index_cache.clear()
+            for i, ctx in enumerate(context):
+                scene_name = ctx[0]
+                sp_idx = ctx[3] if len(ctx) > 3 else None
+                if sp_idx is not None:
+                    self.sp_index_cache[scene_name] = sp_idx
+            self.logger.info(f'STC用SPマッピングキャッシュを更新: {len(self.sp_index_cache)} シーン')
+            
+            self.logger.info(
+                'ラベル付けされたポイントの割合 %.2f クラスタリング時間: %.2fs', 
+                (all_pseudo != -1).sum() / all_pseudo.shape[0], 
+                time.time() - time_start
+            )
+            
+            # トレーニング中のスーパーポイント/プリミティブ精度のチェック
+            sem_num = self.config.semantic_class
+            mask = (all_pseudo_gt != -1)
+            histogram = np.bincount(
+                sem_num * all_gt.astype(np.int32)[mask] + all_pseudo_gt.astype(np.int32)[mask], 
+                minlength=sem_num ** 2
+            ).reshape(sem_num, sem_num)
+            
+            # 全体精度の計算
+            o_Acc = histogram[range(sem_num), range(sem_num)].sum() / histogram.sum() * 100
+            
+            # IoUの計算
+            tp = np.diag(histogram)
+            fp = np.sum(histogram, 0) - tp
+            fn = np.sum(histogram, 1) - tp
+            IoUs = tp / (tp + fp + fn + 1e-8)
+            m_IoU = np.nanmean(IoUs)
+            
+            # IoUの文字列表現
+            s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
+            for IoU in IoUs:
+                s += '{:5.2f} '.format(100 * IoU)
             
             # 結果のログ記録
-            d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
-            d.update(IoU_dict)
-            wandb.log(d)
+            self.logger.info('クラスタリング結果 - エポック: {:02d}, オール精度 {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, 100 * m_IoU))
+            wandb.log({
+                'epoch': epoch, 
+                'cluster/oAcc': o_Acc, 
+                'cluster/mIoU': m_IoU
+            })
+        
+        # DDP時は全プロセスでバリア同期
+        if self.use_ddp:
+            dist.barrier()
+        
+        return classifier.to(self.device), current_growsp
+    
+    def evaluate(self, epoch: int):
+        """モデルの評価（DDP対応版：全GPUで分散評価）"""
+        # モデルの保存（メインプロセスのみ）
+        if self.is_main_process:
+            model_q_state = self.model_q.module.state_dict() if self.use_ddp else self.model_q.state_dict()
+            torch.save(
+                model_q_state, 
+                join(self.config.save_path, f'model_{epoch}_checkpoint.pth')
+            )
+            torch.save(
+                self.classifier.state_dict(), 
+                join(self.config.save_path, f'cls_{epoch}_checkpoint.pth')
+            )
+        
+        # DDP時は全プロセスでモデル保存を待つ
+        if self.use_ddp:
+            dist.barrier()
+        
+        # DDPラップを解除してモデルを取得
+        model_q = self.model_q.module if self.use_ddp else self.model_q
+        
+        # 評価用分類器の作成: primitive重心 (500) をk=semantic_class (19) でkmeansして19クラス分類器を作成
+        # self.classifier.weight は (primitive_num, feats_dim) = (500, 128)
+        primitive_centers = self.classifier.weight.data.clone()  # (500, 128)
+        
+        # DDP時はメインプロセスでのみKMeansを実行し、結果をブロードキャスト
+        # （KMeansは非決定的なため、各GPUで実行すると異なる結果になる）
+        if self.use_ddp:
+            # semantic_centersを格納するテンソルを全GPUで準備
+            semantic_centers = torch.zeros(
+                (self.config.semantic_class, self.config.feats_dim), 
+                device=self.device
+            )
             
-            # 距離別メトリクスのログ記録
-            if distance_metrics:
-                self._log_distance_metrics(epoch, distance_metrics)
+            if self.is_main_process:
+                # メインプロセスでのみKMeansを実行
+                semantic_labels = get_kmeans_labels(self.config.semantic_class, primitive_centers)  # (500,)
+                
+                # 各semantic classの重心を計算
+                for cls_idx in range(self.config.semantic_class):
+                    mask = semantic_labels == cls_idx
+                    if mask.sum() > 0:
+                        semantic_centers[cls_idx] = primitive_centers[mask].mean(dim=0)
+                semantic_centers = F.normalize(semantic_centers, dim=1)
             
-            # 移動/静止別メトリクスのログ記録
-            if moving_static_metrics:
-                self._log_moving_static_metrics(epoch, moving_static_metrics)
+            # メインプロセスの結果を全GPUにブロードキャスト
+            dist.broadcast(semantic_centers, src=0)
+        else:
+            # 非DDP時は従来通り
+            semantic_labels = get_kmeans_labels(self.config.semantic_class, primitive_centers)  # (500,)
             
-            # 早期停止判定
+            # 各semantic classの重心を計算
+            semantic_centers = torch.zeros((self.config.semantic_class, self.config.feats_dim))
+            for cls_idx in range(self.config.semantic_class):
+                mask = semantic_labels == cls_idx
+                if mask.sum() > 0:
+                    semantic_centers[cls_idx] = primitive_centers[mask].mean(dim=0)
+            semantic_centers = F.normalize(semantic_centers, dim=1)
+        
+        # 19クラス分類器を作成
+        eval_classifier = get_fixclassifier(
+            in_channel=self.config.feats_dim,
+            centroids_num=self.config.semantic_class,
+            centroids=semantic_centers
+        ).to(self.device)
+        
+        # 評価の実行（全GPUで分散処理）
+        with torch.no_grad():
+            o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics = eval_ddp(
+                epoch, 
+                self.config,
+                model_q,
+                eval_classifier,
+                local_rank=self.local_rank,
+                world_size=self.world_size,
+                is_main_process=self.is_main_process
+            )
+            
+            # メインプロセスのみログ記録
+            if self.is_main_process:
+                self.logger.info('エポック: {:02d}, oAcc {:.2f}  mAcc {:.2f} IoUs'.format(epoch, o_Acc, m_Acc) + s)
+                
+                # 結果のログ記録
+                d = {'epoch': epoch, 'oAcc': o_Acc, 'mAcc': m_Acc, 'mIoU': m_IoU}
+                d.update(IoU_dict)
+                wandb.log(d)
+                
+                # 距離別メトリクスのログ記録
+                if distance_metrics:
+                    self._log_distance_metrics(epoch, distance_metrics)
+                
+                # 移動/静止別メトリクスのログ記録
+                if moving_static_metrics:
+                    self._log_moving_static_metrics(epoch, moving_static_metrics)
+            
+            # 早期停止判定（メインプロセスで判定、結果をブロードキャスト）
             if self.config.early_stopping and not self.early_stopped:
                 self._check_early_stopping(epoch, m_IoU)
-            
-            # シルエットスコアの計算（オプション）
-            if self.config.silhouette:
-                # SPCの評価
-                feats, *_ = get_kittisp_feature(
-                    self.config, self.cluster_loader, self.model_q, self.current_growsp, epoch
-                )
-                sp_feats = torch.cat(feats, dim=0)
-                primitive_labels = get_kmeans_labels(
-                    self.config.primitive_num, sp_feats
-                ).to('cpu').detach().numpy()
-                
-                # クラスタリングメトリクスの計算
-                sl_score, db_score, ch_score, t = calc_cluster_metrics(sp_feats, primitive_labels)
-                
-                # メトリクスのログ記録
-                wandb.log({
-                    'epoch': epoch, 
-                    'SPC/Silhouette': sl_score, 
-                    'SPC/Davies-Bouldin': db_score, 
-                    'SPC/Calinski-Harabasz': ch_score, 
-                    'SPC/time': t
-                })
+        
+        # DDP同期のためにバリアを設置
+        if self.use_ddp:
+            dist.barrier()
     
     def _log_distance_metrics(self, epoch: int, distance_metrics: dict):
         """距離別メトリクスをwandbにログする
@@ -1541,9 +1199,9 @@ class TCUSSTrainer:
         wandb.log(flat_metrics) 
 
     def _check_early_stopping(self, epoch: int, val_miou: float):
-        """早期停止判定を行う（新仕様）"""
-        # lmb依存の収束判定しきい値
-        loss_plateau = 0.003 if self.config.lmb <= 1.0 else 0.005 if self.config.lmb <= 2.0 else 0.01
+        """早期停止判定を行う"""
+        # 収束判定しきい値（固定）
+        loss_plateau = 0.003
         
         # 改善判定
         if val_miou > self.best_metric_score + self.config.early_stopping_min_delta:
@@ -1552,9 +1210,10 @@ class TCUSSTrainer:
             self.best_epoch = epoch
             self.patience_counter = 0
             
-            # ベストモデルの保存
+            # ベストモデルの保存（DDPラップを解除）
+            model_q_state = self.model_q.module.state_dict() if self.use_ddp else self.model_q.state_dict()
             torch.save(
-                self.model_q.state_dict(), 
+                model_q_state, 
                 join(self.config.save_path, 'best_model.pth')
             )
             torch.save(
@@ -1613,13 +1272,15 @@ class TCUSSTrainer:
                     self.logger.info("収束・過学習条件未達成。学習継続")
                     
     def _load_best_model(self):
-        """ベストモデルをロードする"""
+        """ベストモデルをロードする（DDP対応版）"""
         best_model_path = join(self.config.save_path, 'best_model.pth')
         best_classifier_path = join(self.config.save_path, 'best_classifier.pth')
         
         if os.path.exists(best_model_path) and os.path.exists(best_classifier_path):
-            self.model_q.load_state_dict(torch.load(best_model_path))
-            self.classifier.load_state_dict(torch.load(best_classifier_path))
+            # DDPラップを解除してロード
+            model_q = self.model_q.module if self.use_ddp else self.model_q
+            model_q.load_state_dict(torch.load(best_model_path, map_location=self.device))
+            self.classifier.load_state_dict(torch.load(best_classifier_path, map_location=self.device))
             self.logger.info(f'ベストモデル（エポック {self.best_epoch}）をロードしました')
         else:
             self.logger.warning('ベストモデルファイルが見つかりません') 

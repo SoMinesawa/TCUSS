@@ -52,27 +52,25 @@ stc:
   correspondence:
     distance_threshold: 0.3
     min_points: 5
+    exclude_ground: true
+    remove_ego_motion: true
   enabled: true
   loss:
     temperature: 0.1
-  scene_flow:
-    checkpoint: scene_flow/VoteFlow/checkpoints/voteflow_best_m8n128_ori.ckpt
-    model: voteflow
-    point_cloud_range:
-    - -51.2
-    - -51.2
-    - -3
-    - 51.2
-    - 51.2
-    - 3
-    voxel_size:
-    - 0.2
-    - 0.2
-    - 6
+  voteflow_preprocess_path: data/dataset/semantickitti/voteflow_preprocess_fixed
   weight: 1.0
 tarl_lr: 0.0002
 vis: false
+vis_sp: false
 voxel_size: 0.15
 wandb_run_id: null
 weight_decay: 0.01
 workers: 24
+log_interval: 1000000
+max_iter:
+- 10000
+- 30000
+evaluation:
+  distance_evaluation: true
+  distance_bins: [10, 20, 30, 40, 50, 60, 70, 80]
+  moving_static_evaluation: true

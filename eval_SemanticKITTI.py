@@ -1,9 +1,11 @@
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from datasets.SemanticKITTI import KITTIval, cfl_collate_fn_val
 import numpy as np
 import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 try:
     # 古い scikit-learn がある場合（バージョン0.22.2等）
     from sklearn.utils.linear_assignment_ import linear_assignment
@@ -79,8 +81,16 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.enabled = False
 
-def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: DataLoader, classifier: torch.nn.Module, epoch: int) -> Tuple[List, List, List, List]:
-    """一回の評価を実行する関数
+def eval_once(
+    args: argparse.Namespace, 
+    model: torch.nn.Module, 
+    test_loader: DataLoader, 
+    classifier: torch.nn.Module, 
+    epoch: int,
+    device: int = 0,
+    is_main_process: bool = True
+) -> Tuple[List, List, List, List]:
+    """一回の評価を実行する関数（DDP対応版）
     
     Args:
         args: コマンドライン引数
@@ -88,6 +98,8 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
         test_loader: テストデータローダー
         classifier: 分類器
         epoch: 評価するエポック
+        device: GPUデバイスID
+        is_main_process: メインプロセスかどうか（tqdm表示用）
     
     Returns:
         all_preds: すべての予測結果
@@ -97,12 +109,17 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
     """
     all_preds, all_label, all_distances, all_is_moving = [], [], [], []
     
-    for data in tqdm(test_loader, desc=f'Eval Epoch: {epoch}'):
+    # メインプロセスのみtqdmで表示
+    iterator = test_loader
+    if is_main_process:
+        iterator = tqdm(test_loader, desc=f'Eval Epoch: {epoch}')
+    
+    for data in iterator:
         with torch.no_grad():
             coords, features, inverse_map, labels, index, region, original_coords, raw_labels = data
 
-            # TensorFieldを作成
-            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
+            # TensorFieldを作成（DDPデバイスを指定）
+            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=device)
             feats = model(in_field)
             feats = F.normalize(feats, dim=1)
 
@@ -129,10 +146,6 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
             all_label.append(labels)
             all_distances.append(distances)
             all_is_moving.append(is_moving)
-
-            # メモリ解放
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(torch.device("cuda"))
 
     return all_preds, all_label, all_distances, all_is_moving
 
@@ -166,15 +179,32 @@ def compute_metrics_for_subset(
         minlength=sem_num ** 2
     ).reshape(sem_num, sem_num)
     
+    return compute_metrics_from_histogram(histogram, sem_num, matching)
+
+
+def compute_metrics_from_histogram(
+    histogram: np.ndarray,
+    sem_num: int,
+    matching: np.ndarray
+) -> Tuple[float, float, float]:
+    """混同行列からメトリクスを計算する
+    
+    Args:
+        histogram: 混同行列 (sem_num, sem_num)
+        sem_num: セマンティッククラス数
+        matching: ハンガリアンマッチング結果
+    
+    Returns:
+        o_Acc, m_Acc, m_IoU
+    """
+    total = histogram.sum()
+    if total == 0:
+        return 0.0, 0.0, 0.0
+    
     # 既存のマッチングを使用してhistogramを再配置
     hist_new = np.zeros((sem_num, sem_num))
     for idx in range(sem_num):
         hist_new[:, idx] = histogram[:, matching[idx, 1]]
-    
-    # メトリクスを計算
-    total = histogram.sum()
-    if total == 0:
-        return 0.0, 0.0, 0.0
     
     o_Acc = histogram[matching[:, 0], matching[:, 1]].sum() / total * 100.0
     
@@ -193,132 +223,359 @@ def compute_metrics_for_subset(
     return o_Acc, m_Acc, m_IoU
 
 
-def compute_distance_metrics(
-    all_preds: np.ndarray,
-    all_labels: np.ndarray,
-    all_distances: np.ndarray,
+def compute_distance_histograms(
+    preds: np.ndarray,
+    labels: np.ndarray,
+    distances: np.ndarray,
     distance_bins: List[int],
+    sem_num: int
+) -> Dict[str, np.ndarray]:
+    """距離帯ごとの混同行列を計算する（histogram形式）
+    
+    Args:
+        preds: 予測ラベル
+        labels: 正解ラベル
+        distances: 距離
+        distance_bins: 距離区切り
+        sem_num: セマンティッククラス数
+    
+    Returns:
+        距離帯ごとの混同行列辞書
+    """
+    result = {}
+    valid_mask = (labels >= 0) & (labels < sem_num)
+    
+    prev_dist = 0
+    for dist in distance_bins:
+        mask = valid_mask & (distances >= prev_dist) & (distances < dist)
+        key = f'{prev_dist}-{dist}'
+        
+        if mask.sum() > 0:
+            histogram = np.bincount(
+                sem_num * labels[mask] + preds[mask],
+                minlength=sem_num ** 2
+            ).reshape(sem_num, sem_num)
+        else:
+            histogram = np.zeros((sem_num, sem_num), dtype=np.int64)
+        
+        result[key] = histogram
+        prev_dist = dist
+    
+    # 最後の距離帯以降
+    mask = valid_mask & (distances >= distance_bins[-1])
+    key = f'{distance_bins[-1]}+'
+    
+    if mask.sum() > 0:
+        histogram = np.bincount(
+            sem_num * labels[mask] + preds[mask],
+            minlength=sem_num ** 2
+        ).reshape(sem_num, sem_num)
+    else:
+        histogram = np.zeros((sem_num, sem_num), dtype=np.int64)
+    
+    result[key] = histogram
+    
+    return result
+
+
+def compute_moving_static_histograms(
+    preds: np.ndarray,
+    labels: np.ndarray,
+    is_moving: np.ndarray,
+    sem_num: int
+) -> Dict[str, np.ndarray]:
+    """移動/静止別の混同行列を計算する（histogram形式）
+    
+    Args:
+        preds: 予測ラベル
+        labels: 正解ラベル
+        is_moving: 移動物体フラグ
+        sem_num: セマンティッククラス数
+    
+    Returns:
+        移動/静止別の混同行列辞書
+    """
+    result = {}
+    valid_mask = (labels >= 0) & (labels < sem_num)
+    
+    # 移動物体
+    mask = valid_mask & is_moving
+    if mask.sum() > 0:
+        histogram = np.bincount(
+            sem_num * labels[mask] + preds[mask],
+            minlength=sem_num ** 2
+        ).reshape(sem_num, sem_num)
+    else:
+        histogram = np.zeros((sem_num, sem_num), dtype=np.int64)
+    result['moving'] = histogram
+    
+    # 静止物体
+    mask = valid_mask & ~is_moving
+    if mask.sum() > 0:
+        histogram = np.bincount(
+            sem_num * labels[mask] + preds[mask],
+            minlength=sem_num ** 2
+        ).reshape(sem_num, sem_num)
+    else:
+        histogram = np.zeros((sem_num, sem_num), dtype=np.int64)
+    result['static'] = histogram
+    
+    return result
+
+
+def compute_distance_metrics_from_histograms(
+    distance_histograms: Dict[str, np.ndarray],
     sem_num: int,
     matching: np.ndarray
 ) -> Dict[str, Dict[str, float]]:
-    """距離帯ごとにメトリクスを計算する
+    """距離帯ごとの混同行列からメトリクスを計算する
     
     Args:
-        all_preds: 全予測ラベル
-        all_labels: 全正解ラベル
-        all_distances: 全距離
-        distance_bins: 距離区切り（例: [10, 20, 30, 40, 50, 60, 70, 80]）
+        distance_histograms: 距離帯ごとの混同行列辞書
         sem_num: セマンティッククラス数
         matching: ハンガリアンマッチング結果
     
     Returns:
         距離帯ごとのメトリクス辞書
-        例: {'0-10': {'oAcc': ..., 'mAcc': ..., 'mIoU': ...}, ...}
     """
     result = {}
     
-    prev_dist = 0
-    for dist in distance_bins:
-        # この距離帯のマスク
-        mask = (all_distances >= prev_dist) & (all_distances < dist)
-        
-        if mask.sum() > 0:
-            subset_preds = all_preds[mask]
-            subset_labels = all_labels[mask]
-            o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
-                subset_preds, subset_labels, sem_num, matching
-            )
+    for key, histogram in distance_histograms.items():
+        count = int(histogram.sum())
+        if count > 0:
+            o_Acc, m_Acc, m_IoU = compute_metrics_from_histogram(histogram, sem_num, matching)
         else:
             o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
         
-        key = f'{prev_dist}-{dist}'
         result[key] = {
             'oAcc': o_Acc,
             'mAcc': m_Acc,
             'mIoU': m_IoU,
-            'count': int(mask.sum())
+            'count': count
         }
-        prev_dist = dist
-    
-    # 最後の距離帯以降（distance_bins[-1]以上）
-    mask = all_distances >= distance_bins[-1]
-    if mask.sum() > 0:
-        subset_preds = all_preds[mask]
-        subset_labels = all_labels[mask]
-        o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
-            subset_preds, subset_labels, sem_num, matching
-        )
-    else:
-        o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
-    
-    key = f'{distance_bins[-1]}+'
-    result[key] = {
-        'oAcc': o_Acc,
-        'mAcc': m_Acc,
-        'mIoU': m_IoU,
-        'count': int(mask.sum())
-    }
     
     return result
 
 
-def compute_moving_static_metrics(
-    all_preds: np.ndarray,
-    all_labels: np.ndarray,
-    all_is_moving: np.ndarray,
+def compute_moving_static_metrics_from_histograms(
+    moving_static_histograms: Dict[str, np.ndarray],
     sem_num: int,
     matching: np.ndarray
 ) -> Dict[str, Dict[str, float]]:
-    """移動物体/静止物体ごとにメトリクスを計算する
+    """移動/静止別の混同行列からメトリクスを計算する
     
     Args:
-        all_preds: 全予測ラベル
-        all_labels: 全正解ラベル
-        all_is_moving: 移動物体フラグ
+        moving_static_histograms: 移動/静止別の混同行列辞書
         sem_num: セマンティッククラス数
         matching: ハンガリアンマッチング結果
     
     Returns:
         移動/静止ごとのメトリクス辞書
-        例: {'moving': {'oAcc': ..., 'mAcc': ..., 'mIoU': ...}, 'static': {...}}
     """
     result = {}
     
-    # 移動物体
-    moving_mask = all_is_moving
-    if moving_mask.sum() > 0:
-        o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
-            all_preds[moving_mask], all_labels[moving_mask], sem_num, matching
-        )
-    else:
-        o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
-    result['moving'] = {
-        'oAcc': o_Acc,
-        'mAcc': m_Acc,
-        'mIoU': m_IoU,
-        'count': int(moving_mask.sum())
-    }
-    
-    # 静止物体
-    static_mask = ~all_is_moving
-    if static_mask.sum() > 0:
-        o_Acc, m_Acc, m_IoU = compute_metrics_for_subset(
-            all_preds[static_mask], all_labels[static_mask], sem_num, matching
-        )
-    else:
-        o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
-    result['static'] = {
-        'oAcc': o_Acc,
-        'mAcc': m_Acc,
-        'mIoU': m_IoU,
-        'count': int(static_mask.sum())
-    }
+    for key, histogram in moving_static_histograms.items():
+        count = int(histogram.sum())
+        if count > 0:
+            o_Acc, m_Acc, m_IoU = compute_metrics_from_histogram(histogram, sem_num, matching)
+        else:
+            o_Acc, m_Acc, m_IoU = 0.0, 0.0, 0.0
+        
+        result[key] = {
+            'oAcc': o_Acc,
+            'mAcc': m_Acc,
+            'mIoU': m_IoU,
+            'count': count
+        }
     
     return result
 
 
+def eval_ddp(
+    epoch: int, 
+    args: Union[argparse.Namespace, 'TCUSSConfig'],
+    model: torch.nn.Module,
+    classifier: torch.nn.Module,
+    local_rank: int = 0,
+    world_size: int = 1,
+    is_main_process: bool = True
+) -> Tuple[float, float, float, str, Dict[str, float], Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    """モデルを評価する関数（DDP対応版）
+    
+    Args:
+        epoch: 評価するエポック
+        args: コマンドライン引数またはTCUSSConfig
+        model: 評価するモデル（DDPラップされている可能性あり）
+        classifier: 分類器
+        local_rank: このプロセスのローカルランク
+        world_size: 総プロセス数
+        is_main_process: メインプロセスかどうか
+    
+    Returns:
+        o_Acc: 全体の精度
+        m_Acc: 平均精度
+        m_IoU: 平均IoU
+        s: IoU情報の文字列
+        IoU_dict: クラスごとのIoU辞書
+        distance_metrics: 距離別メトリクス
+        moving_static_metrics: 移動/静止別メトリクス
+    """
+    use_ddp = world_size > 1
+    device = f"cuda:{local_rank}"
+    
+    # モデルを評価モードに
+    model.eval()
+    classifier.eval()
+    
+    # 評価用バッチサイズを取得
+    eval_batch_size = getattr(args, 'eval_batch_size', 32)
+    persistent_workers = getattr(args, 'persistent_workers', True)
+    prefetch_factor = getattr(args, 'prefetch_factor', 4)
+    num_workers = args.cluster_workers
+    
+    # 検証データセットを作成
+    val_dataset = KITTIval(args)
+    
+    # DDP時はDistributedSamplerを使用
+    val_sampler = None
+    if use_ddp:
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=eval_batch_size, 
+        collate_fn=cfl_collate_fn_val(), 
+        num_workers=num_workers, 
+        pin_memory=True,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        sampler=val_sampler,
+        shuffle=False
+    )
+
+    # 評価を実行（各GPUで一部のデータを処理）
+    preds, labels, distances, is_moving = eval_once(
+        args, model, val_loader, classifier, epoch, 
+        device=local_rank, is_main_process=is_main_process
+    )
+    
+    # 結果を連結
+    if len(preds) > 0:
+        local_preds = torch.cat(preds)
+        local_labels = torch.cat(labels)
+        local_distances = torch.cat(distances)
+        local_is_moving = torch.cat(is_moving)
+    else:
+        local_preds = torch.tensor([], dtype=torch.long)
+        local_labels = torch.tensor([], dtype=torch.long)
+        local_distances = torch.tensor([], dtype=torch.float)
+        local_is_moving = torch.tensor([], dtype=torch.bool)
+    
+    sem_num = args.semantic_class
+    
+    # numpy配列に変換
+    local_preds_np = local_preds.numpy()
+    local_labels_np = local_labels.numpy()
+    local_distances_np = local_distances.numpy()
+    local_is_moving_np = local_is_moving.numpy()
+    
+    # ローカルhistogramを計算（グローバルメトリクス用）
+    mask = (local_labels_np >= 0) & (local_labels_np < sem_num)
+    if mask.sum() > 0:
+        local_histogram = np.bincount(
+            sem_num * local_labels_np[mask] + local_preds_np[mask], 
+            minlength=sem_num ** 2
+        ).reshape(sem_num, sem_num)
+    else:
+        local_histogram = np.zeros((sem_num, sem_num), dtype=np.int64)
+    
+    # 距離別・移動/静止別のローカルhistogramを計算
+    local_distance_histograms = None
+    local_moving_static_histograms = None
+    
+    if hasattr(args, 'evaluation') and args.evaluation.distance_evaluation:
+        local_distance_histograms = compute_distance_histograms(
+            local_preds_np, local_labels_np, local_distances_np,
+            args.evaluation.distance_bins, sem_num
+        )
+    
+    if hasattr(args, 'evaluation') and args.evaluation.moving_static_evaluation:
+        local_moving_static_histograms = compute_moving_static_histograms(
+            local_preds_np, local_labels_np, local_is_moving_np, sem_num
+        )
+    
+    # DDP時はhistogramを集約（全点データではなくhistogramのみ）
+    if use_ddp:
+        # グローバルhistogramを集約
+        histogram_tensor = torch.from_numpy(local_histogram).to(device)
+        dist.all_reduce(histogram_tensor, op=dist.ReduceOp.SUM)
+        histogram = histogram_tensor.cpu().numpy()
+        
+        # 距離別histogramを集約
+        if local_distance_histograms is not None:
+            distance_histograms = {}
+            for key, local_hist in local_distance_histograms.items():
+                hist_tensor = torch.from_numpy(local_hist.astype(np.int64)).to(device)
+                dist.all_reduce(hist_tensor, op=dist.ReduceOp.SUM)
+                distance_histograms[key] = hist_tensor.cpu().numpy()
+        else:
+            distance_histograms = None
+        
+        # 移動/静止別histogramを集約
+        if local_moving_static_histograms is not None:
+            moving_static_histograms = {}
+            for key, local_hist in local_moving_static_histograms.items():
+                hist_tensor = torch.from_numpy(local_hist.astype(np.int64)).to(device)
+                dist.all_reduce(hist_tensor, op=dist.ReduceOp.SUM)
+                moving_static_histograms[key] = hist_tensor.cpu().numpy()
+        else:
+            moving_static_histograms = None
+    else:
+        histogram = local_histogram
+        distance_histograms = local_distance_histograms
+        moving_static_histograms = local_moving_static_histograms
+    
+    # ハンガリアンマッチング（集約後のグローバルhistogramで決定）
+    matching = assignment_function(histogram.max() - histogram)
+    o_Acc = histogram[matching[:, 0], matching[:, 1]].sum() / histogram.sum() * 100.
+    m_Acc = np.mean(histogram[matching[:, 0], matching[:, 1]] / histogram.sum(1)) * 100
+    hist_new = np.zeros((sem_num, sem_num))
+    for idx in range(sem_num):
+        hist_new[:, idx] = histogram[:, matching[idx, 1]]
+
+    # 最終評価指標を計算
+    tp = np.diag(hist_new)
+    fp = np.sum(hist_new, 0) - tp
+    fn = np.sum(hist_new, 1) - tp
+    IoUs = (100 * tp) / (tp + fp + fn + 1e-8)
+    m_IoU = np.nanmean(IoUs)
+    IoU_list = []
+    class_name_IoU_list = ["IoU_unlabeled", "IoU_car", "IoU_bicycle", "IoU_motorcycle", "IoU_truck", "IoU_other-vehicle", "IoU_person", "IoU_bicyclist", "IoU_motorcyclist", "IoU_road", "IoU_parking", "IoU_sidewalk", "IoU_other-ground", "IoU_building", "IoU_fence", "IoU_vegetation", "IoU_trunck", "IoU_terrian", "IoU_pole", "IoU_traffic-sign"]
+    s = '| mIoU {:5.2f} | '.format(m_IoU)
+    for IoU in IoUs:
+        s += '{:5.2f} '.format(IoU)
+        IoU_list.append(IoU)
+    IoU_dict = dict(zip(class_name_IoU_list, IoU_list))
+    
+    # 距離別メトリクス計算（集約後のhistogramとマッチングを使用）
+    distance_metrics = {}
+    if distance_histograms is not None:
+        distance_metrics = compute_distance_metrics_from_histograms(
+            distance_histograms, sem_num, matching
+        )
+    
+    # 移動/静止別メトリクス計算（集約後のhistogramとマッチングを使用）
+    moving_static_metrics = {}
+    if moving_static_histograms is not None:
+        moving_static_metrics = compute_moving_static_metrics_from_histograms(
+            moving_static_histograms, sem_num, matching
+        )
+    
+    return o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics
+
+
 def eval(epoch: int, args: Union[argparse.Namespace, 'TCUSSConfig']) -> Tuple[float, float, float, str, Dict[str, float], Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
-    """モデルを評価する関数
+    """モデルを評価する関数（スタンドアロン実行用）
     
     Args:
         epoch: 評価するエポック
@@ -359,9 +616,23 @@ def eval(epoch: int, args: Union[argparse.Namespace, 'TCUSSConfig']) -> Tuple[fl
     classifier = get_fixclassifier(in_channel=args.feats_dim, centroids_num=args.semantic_class, centroids=centroids).cuda()
     classifier.eval()
 
+    # 評価用バッチサイズを取得（grad不要なので大きくできる）
+    eval_batch_size = getattr(args, 'eval_batch_size', 32)
+    persistent_workers = getattr(args, 'persistent_workers', True)
+    prefetch_factor = getattr(args, 'prefetch_factor', 4)
+    num_workers = args.cluster_workers
+    
     # 検証データセットを作成
     val_dataset = KITTIval(args)
-    val_loader = DataLoader(val_dataset, batch_size=1, collate_fn=cfl_collate_fn_val(), num_workers=args.cluster_workers, pin_memory=True)
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=eval_batch_size, 
+        collate_fn=cfl_collate_fn_val(), 
+        num_workers=num_workers, 
+        pin_memory=True,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None
+    )
 
     # 評価を実行
     preds, labels, distances, is_moving = eval_once(args, model, val_loader, classifier, epoch)
@@ -373,6 +644,7 @@ def eval(epoch: int, args: Union[argparse.Namespace, 'TCUSSConfig']) -> Tuple[fl
     all_is_moving = torch.cat(is_moving).numpy()
 
     # 教師なし評価：予測をGTにマッチング
+    # classifierは19クラスなので、予測も0-18の範囲
     sem_num = args.semantic_class
     mask = (all_labels >= 0) & (all_labels < sem_num)
     histogram = np.bincount(sem_num * all_labels[mask] + all_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
@@ -399,20 +671,25 @@ def eval(epoch: int, args: Union[argparse.Namespace, 'TCUSSConfig']) -> Tuple[fl
         IoU_list.append(IoU)
     IoU_dict = dict(zip(class_name_IoU_list, IoU_list))
     
-    # 距離別メトリクス計算
+    # 距離別メトリクス計算（histogram形式で計算してメトリクスを算出）
     distance_metrics = {}
     if hasattr(args, 'evaluation') and args.evaluation.distance_evaluation:
-        distance_metrics = compute_distance_metrics(
+        distance_histograms = compute_distance_histograms(
             all_preds, all_labels, all_distances,
-            args.evaluation.distance_bins, sem_num, matching
+            args.evaluation.distance_bins, sem_num
+        )
+        distance_metrics = compute_distance_metrics_from_histograms(
+            distance_histograms, sem_num, matching
         )
     
-    # 移動/静止別メトリクス計算
+    # 移動/静止別メトリクス計算（histogram形式で計算してメトリクスを算出）
     moving_static_metrics = {}
     if hasattr(args, 'evaluation') and args.evaluation.moving_static_evaluation:
-        moving_static_metrics = compute_moving_static_metrics(
-            all_preds, all_labels, all_is_moving,
-            sem_num, matching
+        moving_static_histograms = compute_moving_static_histograms(
+            all_preds, all_labels, all_is_moving, sem_num
+        )
+        moving_static_metrics = compute_moving_static_metrics_from_histograms(
+            moving_static_histograms, sem_num, matching
         )
     
     return o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics

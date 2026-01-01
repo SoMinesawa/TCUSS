@@ -7,6 +7,7 @@ import random
 import os
 import sys
 import open3d as o3d
+import h5py
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
 from lib.utils import get_kmeans_labels
 from tqdm import tqdm
@@ -17,27 +18,137 @@ from typing import List, Tuple, Dict, Optional, Union, Any, Set
 # 252: moving-car, 253: moving-bicyclist, 254: moving-person, 255: moving-motorcyclist,
 # 256: moving-on-rails, 257: moving-bus, 258: moving-truck, 259: moving-other-vehicle
 MOVING_RAW_LABELS: Set[int] = {252, 253, 254, 255, 256, 257, 258, 259}
-                
-                
+
+# SemanticKITTIの各シーケンスのスキャン数
+SEQ_TO_SCAN_NUM: Dict[int, int] = {
+    0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 
+    5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201
+}
+TOTAL_TRAIN_SCANS = sum(SEQ_TO_SCAN_NUM.values())  # 19130
+
+
+def generate_scene_pairs(
+    select_num: int, 
+    scan_window: int, 
+    seed: int
+) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+    """シーンペア（t1, t2）を生成する
+    
+    全GPUで同じ結果を得るため、固定シードを使用する。
+    t1をランダムに選択し、t2をt1からscan_window以内でランダムに選択する。
+    
+    cluster_loaderのシーン数がおおよそselect_numになるように、
+    ペア数は select_num // 2 とする。
+    （t1とt2がほぼ異なるので、ユニークシーン数 ≈ select_num）
+    
+    Args:
+        select_num: cluster_loaderに使用するおおよそのシーン数
+        scan_window: t1からt2を選ぶ際の最大フレーム差
+        seed: 乱数シード（全GPUで同じ値を使用すること）
+    
+    Returns:
+        scene_pairs: [(t1_global_idx, t2_global_idx), ...] のリスト（長さ = select_num // 2）
+        scene_idx_t1: t1のグローバルインデックスリスト
+        scene_idx_t2: t2のグローバルインデックスリスト
+    """
+    rng = np.random.RandomState(seed)
+    
+    # ペア数 = select_num // 2 （cluster_loaderのシーン数がselect_num程度になるように）
+    num_pairs = select_num // 2
+    
+    # t1をランダムに選択
+    t1_global_indices = rng.choice(TOTAL_TRAIN_SCANS, num_pairs, replace=False).tolist()
+    
+    scene_pairs = []
+    scene_idx_t1 = []
+    scene_idx_t2 = []
+    
+    for t1_global in t1_global_indices:
+        # グローバルインデックスからseq, local_idxに変換
+        seq, local_idx = _global_to_seq_local(t1_global)
+        seq_scan_num = SEQ_TO_SCAN_NUM[seq]
+        
+        # t2の候補範囲を計算（同じシーケンス内でscan_window以内）
+        t2_min = max(0, local_idx - scan_window)
+        t2_max = min(seq_scan_num - 1, local_idx + scan_window)
+        
+        # t1自身を除いた候補からランダム選択
+        t2_candidates = [i for i in range(t2_min, t2_max + 1) if i != local_idx]
+        if len(t2_candidates) == 0:
+            # 候補がない場合（非常にまれ）はt1と同じにする
+            t2_local = local_idx
+        else:
+            t2_local = rng.choice(t2_candidates)
+        
+        # ローカルインデックスからグローバルインデックスに変換
+        t2_global = _seq_local_to_global(seq, t2_local)
+        
+        scene_pairs.append((t1_global, t2_global))
+        scene_idx_t1.append(t1_global)
+        scene_idx_t2.append(t2_global)
+    
+    return scene_pairs, scene_idx_t1, scene_idx_t2
+
+
+def _global_to_seq_local(global_idx: int) -> Tuple[int, int]:
+    """グローバルインデックスからシーケンス番号とローカルインデックスに変換"""
+    cumsum = 0
+    for seq, scan_num in SEQ_TO_SCAN_NUM.items():
+        if global_idx < cumsum + scan_num:
+            return seq, global_idx - cumsum
+        cumsum += scan_num
+    raise ValueError(f"Invalid global index: {global_idx}")
+
+
+def _seq_local_to_global(seq: int, local_idx: int) -> int:
+    """シーケンス番号とローカルインデックスからグローバルインデックスに変換"""
+    cumsum = 0
+    for s, scan_num in SEQ_TO_SCAN_NUM.items():
+        if s == seq:
+            return cumsum + local_idx
+        cumsum += scan_num
+    raise ValueError(f"Invalid sequence: {seq}")
+
+
+def get_unique_scene_indices(scene_idx_t1: List[int], scene_idx_t2: List[int]) -> List[int]:
+    """t1とt2の重複を除いたユニークなシーンインデックスを取得"""
+    return list(set(scene_idx_t1 + scene_idx_t2))
+
+
 class cfl_collate_fn:
-    """データセットの出力を適切なフォーマットに変換するコレート関数"""
+    """データセットの出力を適切なフォーマットに変換するコレート関数
+    
+    Note: KITTItrainではMixupでcoordsだけが連結されるため、
+    coordsとfeatsのサイズが異なる。indsのオフセットはcoordsではなく
+    featsの点数で計算する。
+    
+    Returns:
+        coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, 
+        pseudo_batch, inds_batch, region_batch, index, feats_sizes
+        
+        feats_sizes: 各シーンのfeatsサイズのリスト（バッチ分割用）
+    """
 
     def __call__(self, list_data):
         coords, feats, normals, labels, inverse_map, pseudo, inds, region, index = list(zip(*list_data))
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch = [], [], [], [], [], [], []
         region_batch = []
-        accm_num = 0
+        feats_sizes = []  # 各シーンのfeatsサイズを記録
+        accm_feats = 0   # feats/inds用オフセット
         for batch_id, _ in enumerate(coords):
-            num_points = coords[batch_id].shape[0]
-            coords_batch.append(torch.cat((torch.ones(num_points, 1).int() * batch_id, torch.from_numpy(coords[batch_id]).int()), 1))
+            num_coords = coords[batch_id].shape[0]
+            num_feats = feats[batch_id].shape[0]
+            feats_sizes.append(num_feats)
+            coords_batch.append(torch.cat((torch.ones(num_coords, 1).int() * batch_id, torch.from_numpy(coords[batch_id]).int()), 1))
             feats_batch.append(torch.from_numpy(feats[batch_id]))
             normal_batch.append(torch.from_numpy(normals[batch_id]))
             labels_batch.append(torch.from_numpy(labels[batch_id]).int())
             inverse_batch.append(torch.from_numpy(inverse_map[batch_id]))
             pseudo_batch.append(torch.from_numpy(pseudo[batch_id]))
-            inds_batch.append(torch.from_numpy(inds[batch_id] + accm_num).int())
+            # indsのオフセットはfeatsの点数で計算（Mixupでcoordsだけ大きくなるため）
+            inds_batch.append(torch.from_numpy(inds[batch_id] + accm_feats).int())
             region_batch.append(torch.from_numpy(region[batch_id])[:,None])
-            accm_num += coords[batch_id].shape[0]
+            accm_feats += num_feats
 
         # Concatenate all lists
         coords_batch = torch.cat(coords_batch, 0).float()
@@ -49,114 +160,7 @@ class cfl_collate_fn:
         inds_batch = torch.cat(inds_batch, 0)
         region_batch = torch.cat(region_batch, 0)
 
-        return coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch, region_batch, index
-
-
-class cfl_collate_fn_temporal:
-    """時間的な情報を含むデータセットの出力を適切なフォーマットに変換するコレート関数"""
-
-    def __call__(self, list_data):
-        coords_q, coords_k, segs_q, segs_k = list(zip(*list_data))
-        coords_q_batch, coords_k_batch = [], []
-        for batch_id, _ in enumerate(coords_q):
-            num_points_q = coords_q[batch_id].shape[0]
-            coords_q_batch.append(torch.cat((torch.ones(num_points_q, 1).int() * batch_id, torch.from_numpy(coords_q[batch_id]).int()), 1))
-
-        for batch_id, _ in enumerate(coords_k):
-            num_points_k = coords_k[batch_id].shape[0]
-            coords_k_batch.append(torch.cat((torch.ones(num_points_k, 1).int() * batch_id, torch.from_numpy(coords_k[batch_id]).int()), 1))
-
-        # Concatenate all lists
-        coords_q_batch = torch.cat(coords_q_batch, 0).float()
-        coords_k_batch = torch.cat(coords_k_batch, 0).float()
-        
-        segs_q = [torch.from_numpy(seg_q) for seg_q in segs_q]
-        segs_k = [torch.from_numpy(seg_k) for seg_k in segs_k]
-        return coords_q_batch, coords_k_batch, segs_q, segs_k
-    
-
-class cfl_collate_fn_tcuss:
-    """TCUSS学習に使用する複合的なデータセットの出力を適切なフォーマットに変換するコレート関数"""
-    
-    def __init__(self):
-        self.growsp_t1_collate_fn = cfl_collate_fn()
-        self.growsp_t2_collate_fn = cfl_collate_fn()
-        self.tarl_collate_fn = cfl_collate_fn_temporal()
-
-    def __call__(self, list_data):
-        # TCUSSフェーズに応じて処理を分岐
-        if list_data[0][2] is None:
-            # TARLなしの場合の処理
-            growsp_t1_data, growsp_t2_data, _ = list(zip(*list_data))
-
-            # 各コレート関数を使用して処理
-            (coords_t1_batch, feats_t1_batch, normal_t1_batch, labels_t1_batch,
-            inverse_t1_batch, pseudo_t1_batch, inds_t1_batch, region_t1_batch, index_t1) = self.growsp_t1_collate_fn(growsp_t1_data)
-            (coords_t2_batch, feats_t2_batch, normal_t2_batch, labels_t2_batch,
-            inverse_t2_batch, pseudo_t2_batch, inds_t2_batch, region_t2_batch, index_t2) = self.growsp_t2_collate_fn(growsp_t2_data)
-
-            # 出力を統合
-            return [
-                [coords_t1_batch, pseudo_t1_batch, inds_t1_batch],
-                [coords_t2_batch, pseudo_t2_batch, inds_t2_batch],
-                None
-            ]
-        else:
-            # TARLありの場合の処理
-            growsp_t1_data, growsp_t2_data, tarl_data = list(zip(*list_data))
-
-            # 各コレート関数を使用して処理
-            (coords_q_batch, coords_k_batch, segs_q, segs_k) = self.tarl_collate_fn(tarl_data)
-            (coords_t1_batch, feats_t1_batch, normal_t1_batch, labels_t1_batch,
-            inverse_t1_batch, pseudo_t1_batch, inds_t1_batch, region_t1_batch, index_t1) = self.growsp_t1_collate_fn(growsp_t1_data)
-            (coords_t2_batch, feats_t2_batch, normal_t2_batch, labels_t2_batch,
-            inverse_t2_batch, pseudo_t2_batch, inds_t2_batch, region_t2_batch, index_t2) = self.growsp_t2_collate_fn(growsp_t2_data)
-
-            # 出力を統合
-            return [
-                [coords_t1_batch, pseudo_t1_batch, inds_t1_batch],
-                [coords_t2_batch, pseudo_t2_batch, inds_t2_batch],
-                [coords_q_batch, coords_k_batch, segs_q, segs_k]
-            ]
-
-
-class KITTItcuss(Dataset):
-    """TCUSS学習用の複合データセット"""
-    
-    def __init__(self, args):
-        self.args = args
-        self.phase = 0
-        self.kittitrain_t1 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
-        self.kittitrain_t2 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
-        self.kittitemporal = KITTItemporal(args)
-        
-        self.scene_idx_all = None
-        self.random_select_sample()
-            
-    def __len__(self) -> int:
-        return self.kittitemporal.__len__()
-    
-    def __getitem__(self, index: int) -> Tuple:
-        growsp_t1 = self.kittitrain_t1.__getitem__(index)
-        growsp_t2 = self.kittitrain_t2.__getitem__(index)
-        # phase 0でもTARL学習を行うように変更
-        tcuss = self.kittitemporal.__getitem__(index)
-        return growsp_t1, growsp_t2, tcuss
-
-    def random_select_sample(self):
-        """ランダムにサンプルを選択"""
-        self.kittitemporal._random_select_samples()
-        scene_idx_t1 = [self.kittitemporal._tuple_to_scene_idx(tup) for tup in self.kittitemporal.scene_locates]
-        scene_idx_t2 = [self.kittitemporal._tuple_to_scene_idx(tup) for tup in self.kittitemporal.scene_diff_locates]
-        self.kittitrain_t1.scene_idx = scene_idx_t1
-        self.kittitrain_t2.scene_idx = scene_idx_t2
-        self.kittitrain_t1.random_select_sample(scene_idx_t1)
-        self.kittitrain_t2.random_select_sample(scene_idx_t2)
-        scene_idx_all = []
-        for i in range(len(scene_idx_t1)):
-            scene_idx_all.append(scene_idx_t1[i])
-            scene_idx_all.append(scene_idx_t2[i])
-        self.scene_idx_all = scene_idx_all
+        return coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch, region_batch, index, feats_sizes
 
 
 class KITTItrain(Dataset):
@@ -241,9 +245,6 @@ class KITTItrain(Dataset):
         # return coords.numpy(), feats, labels, unique_map, inverse_map.numpy()
         return coords, feats, labels, unique_map, inverse_map
 
-
-    def __len__(self):
-        return len(self.file_selected)
 
     def __getitem__(self, index):
         file = self.file_selected[index]
@@ -330,374 +331,41 @@ class KITTItrain(Dataset):
         else:
             normals = np.zeros_like(coords)
             scene_name = self.name[index]
-            file_path = os.path.join(self.args.pseudo_label_path, scene_name.lstrip("/") + '.npy')
+            file_path = os.path.join(self.args.pseudo_label_path, scene_name.lstrip("/") + '.npy')            
             pseudo = np.array(np.load(file_path), dtype=np.int64)
+            
+            # サイズ不一致チェック
+            expected_size = len(inds)
+            if len(pseudo) != expected_size:
+                # デバッグ: 保存時に記録されたサイズを確認
+                size_file = file_path.replace('.npy', '_size.txt')
+                recorded_size = None
+                if os.path.exists(size_file):
+                    with open(size_file, 'r') as f:
+                        recorded_size = int(f.read().strip())
+                
+                # デバッグ: 同じファイルを再読み込みして処理し、サイズを確認
+                debug_file = self.file_selected[index]
+                debug_data = read_ply(debug_file)
+                debug_coords = np.array([debug_data['x'], debug_data['y'], debug_data['z']], dtype=np.float32).T
+                debug_feats = np.array(debug_data['remission'])[:, np.newaxis]
+                debug_labels = np.array(debug_data['class'])
+                debug_coords = debug_coords.astype(np.float32)
+                debug_coords -= debug_coords.mean(0)
+                debug_coords, debug_feats, debug_labels, _, _ = self.voxelize(debug_coords, debug_feats, debug_labels)
+                debug_coords = debug_coords.astype(np.float32)
+                debug_mask = np.sqrt(((debug_coords * self.args.voxel_size) ** 2).sum(-1)) < self.args.r_crop
+                debug_size = debug_mask.sum()
+                
+                raise ValueError(
+                    f"pseudo ファイルのサイズが一致しません: "
+                    f"scene={scene_name}, pseudo={len(pseudo)}, expected={expected_size}, "
+                    f"labels={len(labels)}, recorded_size={recorded_size}, "
+                    f"debug_reprocess_size={debug_size}, ply_file={debug_file}"
+                )
 
         return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
 
-
-
-class KITTItemporal(Dataset):
-    """時間的な情報を含むKITTIデータセット"""
-    
-    def __init__(self, args):
-        self.args = args
-        self.n_clusters = None
-        self.seq_to_scan_num = {0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201}
-        
-        # 外れ値IDを追跡するための属性
-        self.current_outlier_ids = {}  # バッチごとの外れ値IDを保存
-        self.vis_saved = False  # vis時に一度だけ書き出すためのフラグ
-        
-        self.file = []
-        seq_list = np.sort(os.listdir(self.args.data_path))
-        for seq_id in seq_list:
-            seq_path = os.path.join(self.args.data_path, seq_id)
-            if seq_id in ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10']:
-                for f in np.sort(os.listdir(seq_path)):
-                    self.file.append(os.path.join(seq_path, f))
-
-        self.scene_locates, self.scene_diff_locates, self.window_start_locates = (None, None, None) # [(seq, idx), ...]
-        self.trans_coords = trans_coords(shift_ratio=50)  ### 50%
-        self.rota_coords = rota_coords(rotation_bound = ((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
-        self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
-        
-        
-    def _random_select_samples(self):
-        scan_range = list(range(-1*self.args.scan_window+1, self.args.scan_window))
-        scan_range.remove(0)
-        scene_idx = np.random.choice(19130, self.args.select_num//2, replace=False).tolist()
-        scene_locates = []
-        for idx in scene_idx:
-            scan_num = 0
-            for seq, seq_scan_num in self.seq_to_scan_num.items():
-                if idx < scan_num + seq_scan_num:
-                    scene_locates.append((seq, idx - scan_num))
-                    break
-                scan_num += seq_scan_num
-        
-        scene_diff = np.random.choice(scan_range, self.args.select_num//2, replace=True).tolist()
-        window_pattern = [random.randint(0, self.args.scan_window-abs(diff)-1) for diff in scene_diff]
-        scene_diff_locates = []
-        window_start_locates = []
-        for (seq, idx), diff, pat in zip(scene_locates, scene_diff, window_pattern):
-            t2_idx = idx + diff
-            # この処理だと稀にt1とt2が重なることがあるけどそれもよき
-            if t2_idx >= self.seq_to_scan_num[seq]:
-                t2_idx = self.seq_to_scan_num[seq] - 1
-            elif t2_idx < 0:
-                t2_idx = 0
-            scene_diff_locates.append((seq, t2_idx))
-            # self.window_start_locate.append((seq, x))をしたい。ただし、idxとt2_idxを含むウィンドウの候補の複数考えられる場合があるので、候補からランダムにウィンドウを決定したときの最初のインデックスをxとする。
-            window_idx = min(idx, t2_idx) - pat
-            if window_idx < 0:
-                window_idx = 0
-            elif window_idx > self.seq_to_scan_num[seq] - self.args.scan_window:
-                window_idx = self.seq_to_scan_num[seq] - self.args.scan_window
-            window_start_locates.append((seq, window_idx))
-    
-        self.scene_locates = scene_locates
-        self.scene_diff_locates = scene_diff_locates
-        self.window_start_locates = window_start_locates
-
-
-    def __getitem__(self, index):
-        seq_t1, idx_t1 = self.scene_locates[index]
-        seq_t2, idx_t2 = self.scene_diff_locates[index]
-        coords_t1, labels_t1, _, _, _, region_num_t1 = self._get_item_one_scene(seq_t1, idx_t1, aug=True)
-        coords_t2, labels_t2, _, _, _, region_num_t2 = self._get_item_one_scene(seq_t2, idx_t2, aug=True)
-        scene_idx_in_window = [(self.window_start_locates[index][0], self.window_start_locates[index][1]+i) for i in range(self.args.scan_window)]
-        coords_tn, labels_tn, unique_map_tn, _, mask_tn, _ = map(list, zip(*[self._get_item_one_scene(seq, idx, False) for seq, idx in scene_idx_in_window]))
-        agg_coords, agg_ground_labels, elements_nums = self._aggretate_pcds(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn)
-        agg_segs, outlier_id = self._clusterize_pcds(agg_coords, agg_ground_labels, region_num_t1, region_num_t2)
-        
-        # 外れ値IDを特別なマーカー(-2)に変換
-        if outlier_id is not None:
-            agg_segs[agg_segs == outlier_id] = -2
-        
-        # vis用にフル長保持
-        agg_segs_full = agg_segs.copy()
-        
-        segs_tn = []
-        start = 0
-        for elements_num in elements_nums:
-            segs_tn.append(agg_segs_full[start:start+elements_num])
-            start += elements_num
-        idx_t1_in_window = scene_idx_in_window.index((seq_t1, idx_t1))
-        idx_t2_in_window = scene_idx_in_window.index((seq_t2, idx_t2))
-        segs_t1 = segs_tn[idx_t1_in_window]
-        segs_t2 = segs_tn[idx_t2_in_window]
-        
-        if self.args.vis and not self.vis_saved:
-            self._save_vis_results(scene_idx_in_window, agg_coords, agg_segs_full, elements_nums)
-            self.vis_saved = True
-            
-        return coords_t1, coords_t2, segs_t1, segs_t2
-
-
-    def _save_vis_results(self, scene_idx_in_window: List[Tuple[int, int]], agg_coords: np.ndarray,
-                          agg_segs: np.ndarray, elements_nums: List[int]) -> None:
-        """visモードのときに集約結果と各フレームのセグをPLYで保存する"""
-        # ラベルに応じたカラー付き ASCII PLY を書き出す簡易ヘルパ
-        def _write_colored_ascii_ply(path: str, coords: np.ndarray, labels: np.ndarray) -> None:
-            palette = np.array([
-                (166, 206, 227), (31, 120, 180), (178, 223, 138), (51, 160, 44), (251, 154, 153),
-                (227, 26, 28), (253, 191, 111), (255, 127, 0), (202, 178, 214), (106, 61, 154),
-                (255, 255, 153), (177, 89, 40), (141, 211, 199), (255, 255, 179), (190, 186, 218),
-                (251, 128, 114), (128, 177, 211), (253, 180, 98), (179, 222, 105), (252, 205, 229)
-            ], dtype=np.uint8)
-
-            coords = coords.astype(np.float32)
-            labels = np.asarray(labels, dtype=np.int32).reshape(-1)
-
-            with open(path, 'w', encoding='ascii') as f:
-                f.write('ply\n')
-                f.write('format ascii 1.0\n')
-                f.write(f'element vertex {coords.shape[0]}\n')
-                f.write('property float x\n')
-                f.write('property float y\n')
-                f.write('property float z\n')
-                f.write('property uchar red\n')
-                f.write('property uchar green\n')
-                f.write('property uchar blue\n')
-                f.write('property int label\n')
-                f.write('end_header\n')
-                for (x, y, z), label in zip(coords, labels):
-                    r, g, b = palette[label % len(palette)]
-                    f.write(f'{x} {y} {z} {r} {g} {b} {int(label)}\n')
-
-        seq = scene_idx_in_window[0][0]
-        last_idx = scene_idx_in_window[-1][1]
-        save_root = os.path.join(self.args.save_path, 'vis', 'tarl_kmeans80', str(seq).zfill(2))
-        os.makedirs(save_root, exist_ok=True)
-
-        # 集約した点群（最後のフレーム座標系）を保存
-        agg_path = os.path.join(save_root, f"{last_idx:06d}_agg.ply")
-        _write_colored_ascii_ply(agg_path, agg_coords, agg_segs)
-
-        # 各フレームの点群（同一座標系）を保存
-        start = 0
-        for (_, idx), num in zip(scene_idx_in_window, elements_nums):
-            coords_frame = agg_coords[start:start+num]
-            segs_frame = agg_segs[start:start+num]
-            frame_path = os.path.join(save_root, f"{idx:06d}.ply")
-            _write_colored_ascii_ply(frame_path, coords_frame, segs_frame)
-            start += num
-
-        # 1回出力したら終了
-        sys.exit(0)
-
-    
-    def _aggretate_pcds(self, scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn): # labels_tnはvis用
-        poses = self._load_poses(scene_idx_in_window[0][0])
-        points_set = np.empty((0, 3))
-        ground_label = np.empty((0, 1))
-        label_set = np.empty((0, 1))
-        element_nums = []
-        for (seq, idx), coords, unique_map, mask, labels in zip(scene_idx_in_window, coords_tn, unique_map_tn, mask_tn, labels_tn):
-            pose = poses[idx]
-            coords = self._apply_transform(coords, pose)
-            g_set = np.fromfile(self._tuple_to_patchwork_path((seq, idx)), dtype=np.uint32)
-            g_set = g_set[unique_map]
-            g_set = g_set[mask]
-            g_set = g_set.reshape((-1))[:, np.newaxis]
-            points_set = np.vstack((points_set, coords))
-            ground_label = np.vstack((ground_label, g_set))
-            label_set = np.vstack((label_set, np.expand_dims(labels, 1)))
-            element_nums.append(coords.shape[0])
-        last_pose = poses[scene_idx_in_window[-1][1]]
-        points_set = self._undo_transform(points_set, last_pose)
-        return points_set, ground_label, element_nums
-        
-    
-    def _clusterize_pcds(self, agg_coords, agg_ground_labels, region_num_t1, region_num_t2):
-        """
-        Clusterize point clouds with a simple k-means (k=80). Temporary change.
-        
-        Args:
-            agg_coords: Aggregated coordinates
-            agg_ground_labels: Ground labels (1 for ground, 0 for non-ground)
-            region_num_t1: Number of regions at time t1
-            region_num_t2: Number of regions at time t2
-            
-        Returns:
-            agg_segs: Segmentation labels
-            outlier_id: Always None for k-means (kept for interface compatibility)
-        """
-        
-        # 地面マスクの作成（元のコードと同様）
-        mask_ground = agg_ground_labels == 1
-        mask_ground = mask_ground.flatten()
-        non_ground_coords = agg_coords[~mask_ground]
-        
-        outlier_id = None
-        
-        if len(non_ground_coords) > 0:
-            labels = get_kmeans_labels(n_clusters=80, pcds=non_ground_coords)
-            labels = labels.to('cpu').numpy().astype(np.int64).flatten()
-            dynamic_ground_label = labels.max() + 1 if len(labels) > 0 else 0
-        else:
-            labels = np.array([], dtype=np.int64)
-            dynamic_ground_label = 0
-            
-        # セグメンテーション配列の作成（元のコードと同様）
-        agg_segs = np.zeros_like(agg_ground_labels).flatten()
-        agg_segs[~mask_ground] = labels
-        agg_segs[mask_ground] = dynamic_ground_label  # 地面ラベルを動的に決定
-        
-            
-        return agg_segs.astype(np.int64), outlier_id
-        
-        
-    def _get_item_one_scene(self, seq:int, idx:int, aug:bool=True):
-        coords, feats, labels = self._load_ply(seq, idx)
-        coords_original = coords.copy()
-        means = coords.mean(0)
-        coords -= means
-        
-        coords, feats, labels, unique_map, inverse_map = self._voxelize(coords, feats, labels) # (123008, x) -> (41342, x)
-        coords = coords.astype(np.float32)
-        
-        mask = np.sqrt(((coords*self.args.voxel_size)**2).sum(-1))< self.args.r_crop
-        coords, feats, labels = coords[mask], feats[mask], labels[mask] # (41342, x) -> (39521, x)
-
-        region_num = None
-        if (self.n_clusters is None) and aug: # run_stage=0のとき
-            region_file = self._tuple_to_sp_path((seq, idx))
-            region = np.load(region_file) # (123008,)
-            region = region[unique_map] # (41342,)
-            region = region[mask] # (39521,)
-            region_num = len(np.unique(region))
-        
-        if aug:
-            coords = self._augs(coords)
-            coords, feats, labels = self._augment_coords_to_feats(coords, feats, labels)
-        else:
-            coords = coords_original[unique_map][mask]
-        
-        return coords, labels, unique_map, inverse_map, mask, region_num # オリジナルのtrainでは、coords, pseudo_labels, indsしかつかってない。 # labelsはvis用
-    
-    
-    def _load_ply(self, seq:int, idx:int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        ply_path = self._tuple_to_path((seq, idx))
-        data = read_ply(ply_path)
-        coords = np.array([data['x'], data['y'], data['z']], dtype=np.float32).T # (123008, 3)
-        feats = np.array(data['remission'])[:, np.newaxis] # (123008, 1)
-        labels = np.array(data['class']) # (123008,)
-        coords = coords.astype(np.float32)
-        return coords, feats, labels
-    
-    
-    def _augs(self, coords):
-        coords = self.rota_coords(coords)
-        coords = self.trans_coords(coords)
-        coords = self.scale_coords(coords)
-        return coords
-
-
-    def _augment_coords_to_feats(self, coords, feats, labels=None):
-        coords_center = coords.mean(0, keepdims=True)
-        coords_center[0, 2] = 0
-        norm_coords = (coords - coords_center)
-        return norm_coords, feats, labels
-
-
-    def _voxelize(self, coords, feats, labels) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        scale = 1 / self.args.voxel_size
-        coords = np.floor(coords * scale)
-        coords, feats, labels, unique_map, inverse_map = ME.utils.sparse_quantize(np.ascontiguousarray(coords), feats, labels=labels, ignore_label=-1, return_index=True, return_inverse=True)
-        return coords, feats, labels, unique_map, inverse_map
-    
-    
-    def _load_poses(self, seq:int) -> np.ndarray:
-        calib_fname = self._seq_to_calib_path(seq)
-        poses_fname = self._seq_to_poses_path(seq)
-        calibration = self._parse_calibration(calib_fname)
-        poses_file = open(poses_fname)
-
-        Tr = calibration["Tr"]
-        Tr_inv = np.linalg.inv(Tr)
-
-        poses = []
-
-        for line in poses_file:
-            values = [float(v) for v in line.strip().split()]
-
-            pose = np.zeros((4, 4))
-            pose[0, 0:4] = values[0:4]
-            pose[1, 0:4] = values[4:8]
-            pose[2, 0:4] = values[8:12]
-            pose[3, 3] = 1.0
-
-            poses.append(np.matmul(Tr_inv, np.matmul(pose, Tr)))
-
-        return poses
-    
-    
-    def _apply_transform(self, points, pose):
-        hpoints = np.hstack((points[:, :3], np.ones_like(points[:, :1])))
-        return np.sum(np.expand_dims(hpoints, 2) * pose.T, axis=1)[:,:3]
-
-
-    def _undo_transform(self, points, pose):
-        hpoints = np.hstack((points[:, :3], np.ones_like(points[:, :1])))
-        return np.sum(np.expand_dims(hpoints, 2) * np.linalg.inv(pose).T, axis=1)[:,:3]
-    
-    
-    def _parse_calibration(self, filename):
-        calib = {}
-
-        calib_file = open(filename)
-        for line in calib_file:
-            key, content = line.strip().split(":")
-            values = [float(v) for v in content.strip().split()]
-
-            pose = np.zeros((4, 4))
-            pose[0, 0:4] = values[0:4]
-            pose[1, 0:4] = values[4:8]
-            pose[2, 0:4] = values[8:12]
-            pose[3, 3] = 1.0
-
-            calib[key] = pose
-
-        calib_file.close()
-
-        return calib
-    
-    
-    def _tuple_to_path(self, tup:Tuple[int, int]) -> str:
-        return os.path.join(self.args.data_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.ply')
-
-    def _tuple_to_sp_path(self, tup:Tuple[int, int]) -> str:
-        return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
-
-    # def _tuple_to_psuedo_path(self, tup:Tuple[int, int]) -> str:
-    #     return os.path.join(self.args.pseudo_label_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.npy')
-    
-    def _seq_to_calib_path(self, seq:int) -> str:
-        return os.path.join(self.args.original_data_path, str(seq).zfill(2), 'calib.txt')
-    
-    def _seq_to_poses_path(self, seq:int) -> str:
-        return os.path.join(self.args.original_data_path, str(seq).zfill(2), 'poses.txt')
-    
-    def _tuple_to_patchwork_path(self, tup:Tuple[int, int]) -> str:
-        return os.path.join(self.args.patchwork_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.label')
-
-    def _tuple_to_scene_idx(self, tup: Tuple[int, int]) -> int:
-        seq, idx = tup
-        scene_idx = 0
-        for s in self.seq_to_scan_num.keys():
-            if s < seq:
-                scene_idx += self.seq_to_scan_num[s]
-        scene_idx += idx
-        return scene_idx
-    
-    def __len__(self):
-        return len(self.scene_locates)
-    
-
-
-    
 
 class KITTIval(Dataset):
     def __init__(self, args, split='val'):
@@ -904,12 +572,18 @@ class cfl_collate_fn_val:
         region_batch = []
         original_coords_batch = []
         raw_labels_batch = []
+        
+        # inverse_mapのオフセット計算用（batch_size>1対応）
+        accm_voxel_num = 0
+        
         for batch_id, _ in enumerate(coords):
             num_points = coords[batch_id].shape[0]
             coords_batch.append(
                 torch.cat((torch.ones(num_points, 1).int() * batch_id, torch.from_numpy(coords[batch_id]).int()), 1))
             feats_batch.append(torch.from_numpy(feats[batch_id]))
-            inverse_batch.append(torch.from_numpy(inverse_map[batch_id]))
+            # inverse_mapにオフセットを追加（batch_size>1対応）
+            inverse_batch.append(torch.from_numpy(inverse_map[batch_id]) + accm_voxel_num)
+            accm_voxel_num += num_points  # 次のバッチ用にオフセットを更新
             labels_batch.append(torch.from_numpy(labels[batch_id]).int())
             region_batch.append(torch.from_numpy(region[batch_id])[:, None])
             # 追加: 元座標とraw labels
@@ -958,11 +632,13 @@ class KITTIstc(Dataset):
     
     連続する2フレーム（時刻tとt+1）のデータを返す。
     各フレームは独立してSPラベルを持つ。
+    VoteFlowで事前計算されたScene Flowデータ（H5ファイル）を使用する。
+    
+    シーン選択は外部から set_scene_pairs() で設定する。
     """
     
     def __init__(self, args):
         self.args = args
-        self.seq_to_scan_num = {0: 4541, 1: 1101, 2: 4661, 3: 801, 4: 271, 5: 2761, 6: 1101, 7: 1101, 9: 1591, 10: 1201}
         
         self.file = []
         seq_list = np.sort(os.listdir(self.args.data_path))
@@ -972,101 +648,120 @@ class KITTIstc(Dataset):
                 for f in np.sort(os.listdir(seq_path)):
                     self.file.append(os.path.join(seq_path, f))
         
-        self.scene_locates = None
-        self.scene_diff_locates = None
+        self.scene_locates = []  # [(seq, local_idx), ...] for t1
+        self.scene_diff_locates = []  # [(seq, local_idx), ...] for t2
         self.trans_coords = trans_coords(shift_ratio=50)
         self.rota_coords = rota_coords(rotation_bound=((-np.pi/32, np.pi/32), (-np.pi/32, np.pi/32), (-np.pi, np.pi)))
         self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
+        
+        # VoteFlow前処理済みH5ファイルのパス
+        self.voteflow_h5_path = args.stc.voteflow_preprocess_path
+        # H5ファイルハンドルのキャッシュ（シーケンス番号 -> ファイルハンドル）
+        self._h5_handles: Dict[int, h5py.File] = {}
     
-    def _random_select_samples(self):
-        """ランダムに連続フレームペアを選択（scan_window=1固定）"""
-        scene_idx = np.random.choice(19130, self.args.select_num // 2, replace=False).tolist()
-        scene_locates = []
+    def set_scene_pairs(self, scene_idx_t1: List[int], scene_idx_t2: List[int]):
+        """シーンペアを設定する
         
-        for idx in scene_idx:
-            scan_num = 0
-            for seq, seq_scan_num in self.seq_to_scan_num.items():
-                if idx < scan_num + seq_scan_num:
-                    scene_locates.append((seq, idx - scan_num))
-                    break
-                scan_num += seq_scan_num
-        
-        # t+1は常に1フレーム後（連続フレーム）
-        scene_diff_locates = []
-        for seq, idx in scene_locates:
-            t1_idx = idx + 1
-            if t1_idx >= self.seq_to_scan_num[seq]:
-                t1_idx = idx - 1  # シーケンス末尾の場合は1つ前
-                if t1_idx < 0:
-                    t1_idx = idx  # それも無理なら同じフレーム
-            scene_diff_locates.append((seq, t1_idx))
-        
-        self.scene_locates = scene_locates
-        self.scene_diff_locates = scene_diff_locates
+        Args:
+            scene_idx_t1: t1のグローバルインデックスリスト
+            scene_idx_t2: t2のグローバルインデックスリスト
+        """
+        self.scene_locates = [_global_to_seq_local(idx) for idx in scene_idx_t1]
+        self.scene_diff_locates = [_global_to_seq_local(idx) for idx in scene_idx_t2]
+    
+    def _get_h5_handle(self, seq: int) -> h5py.File:
+        """H5ファイルハンドルを取得（キャッシュ機構付き）"""
+        if seq not in self._h5_handles:
+            h5_path = os.path.join(self.voteflow_h5_path, f'{str(seq).zfill(2)}.h5')
+            if not os.path.exists(h5_path):
+                raise FileNotFoundError(f'VoteFlow H5ファイルが見つかりません: {h5_path}')
+            self._h5_handles[seq] = h5py.File(h5_path, 'r')
+        return self._h5_handles[seq]
+    
+    def _close_h5_handles(self):
+        """H5ファイルハンドルを閉じる"""
+        for handle in self._h5_handles.values():
+            handle.close()
+        self._h5_handles.clear()
+    
+    def __del__(self):
+        """デストラクタでH5ファイルを閉じる"""
+        self._close_h5_handles()
     
     def __len__(self):
-        return len(self.scene_locates) if self.scene_locates else 0
+        return len(self.scene_locates)
     
     def __getitem__(self, index):
         seq_t, idx_t = self.scene_locates[index]
         seq_t1, idx_t1 = self.scene_diff_locates[index]
         
-        # 時刻tのデータ
-        coords_t, coords_t_original, sp_labels_t, pose_t = self._get_item_one_scene(seq_t, idx_t)
+        # 時刻tのデータ（座標、SPラベル、pose、Scene Flow）
+        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t = self._get_item_one_scene(seq_t, idx_t)
         # 時刻t+1のデータ
-        coords_t1, coords_t1_original, sp_labels_t1, pose_t1 = self._get_item_one_scene(seq_t1, idx_t1)
+        coords_t1, coords_t1_original, sp_labels_t1, pose_t1, _, ground_mask_t1 = self._get_item_one_scene(seq_t1, idx_t1)
         
         # scene_name（キャッシュ参照用）
         scene_name_t = self._tuple_to_scene_name((seq_t, idx_t))
         scene_name_t1 = self._tuple_to_scene_name((seq_t1, idx_t1))
         
-        return coords_t, coords_t1, coords_t_original, coords_t1_original, sp_labels_t, sp_labels_t1, pose_t, pose_t1, scene_name_t, scene_name_t1
+        return (coords_t, coords_t1, coords_t_original, coords_t1_original, 
+                sp_labels_t, sp_labels_t1, pose_t, pose_t1, 
+                scene_name_t, scene_name_t1, flow_t, ground_mask_t, ground_mask_t1)
     
     def _tuple_to_scene_name(self, tup: Tuple[int, int]) -> str:
         """シーン名を生成（KITTItrainと同じフォーマット）"""
         return f'/{str(tup[0]).zfill(2)}/{str(tup[1]).zfill(6)}'
     
     def _get_item_one_scene(self, seq: int, idx: int):
-        """1シーンのデータを取得"""
-        coords, feats, labels = self._load_ply(seq, idx)
+        """1シーンのデータをH5ファイルから取得"""
+        h5_file = self._get_h5_handle(seq)
+        timestamp = str(idx).zfill(6)
+        
+        if timestamp not in h5_file:
+            raise KeyError(f'タイムスタンプ {timestamp} がH5ファイル（seq={seq}）に存在しません')
+        
+        frame_data = h5_file[timestamp]
+        
+        # H5ファイルからデータを読み込み
+        coords = frame_data['lidar'][:]  # (N, 3) Velodyne座標系
+        pose = frame_data['pose'][:]  # (4, 4)
+        ground_mask = frame_data['ground_mask'][:]  # (N,) bool
+        
+        # Scene Flowデータを取得（存在する場合）
+        if 'flow_est_fixed' in frame_data:
+            flow = frame_data['flow_est_fixed'][:]  # (N, 3)
+        else:
+            flow = np.zeros_like(coords)  # フローがない場合はゼロ
+        
         coords_original = coords.copy()
         means = coords.mean(0)
-        coords -= means
-        
-        coords, feats, labels, unique_map, inverse_map = self._voxelize(coords, feats, labels)
-        coords = coords.astype(np.float32)
-        
-        mask = np.sqrt(((coords * self.args.voxel_size) ** 2).sum(-1)) < self.args.r_crop
-        coords = coords[mask]
+        coords = coords - means
         
         # SPラベルを取得
         sp_file = self._tuple_to_sp_path((seq, idx))
-        sp_labels = np.load(sp_file)
-        sp_labels = sp_labels[unique_map]
-        sp_labels = sp_labels[mask]
+        sp_labels_full = np.load(sp_file)
         
-        # poseを取得
-        poses = self._load_poses(seq)
-        pose = poses[idx]
+        # voxelize
+        coords_vox, _, _, unique_map, _ = self._voxelize(coords)
+        coords_vox = coords_vox.astype(np.float32)
+        
+        # r_cropでマスク
+        mask = np.sqrt(((coords_vox * self.args.voxel_size) ** 2).sum(-1)) < self.args.r_crop
+        coords_vox = coords_vox[mask]
+        
+        # SPラベル、ground_mask、flowもマッピング
+        sp_labels = sp_labels_full[unique_map][mask]
+        ground_mask_vox = ground_mask[unique_map][mask]
+        flow_vox = flow[unique_map][mask]
         
         # オリジナル座標（mask後）
         coords_original_masked = coords_original[unique_map][mask]
         
-        return coords, coords_original_masked, sp_labels, pose
+        return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox
     
-    def _load_ply(self, seq: int, idx: int):
-        ply_path = self._tuple_to_path((seq, idx))
-        data = read_ply(ply_path)
-        coords = np.array([data['x'], data['y'], data['z']], dtype=np.float32).T
-        feats = np.array(data['remission'])[:, np.newaxis]
-        labels = np.array(data['class'])
-        return coords, feats, labels
-    
-    def _voxelize(self, coords, feats, labels):
-        # MinkowskiEngineはcontiguousな入力を要求するため明示的に整形
+    def _voxelize(self, coords):
+        """点群をvoxel化"""
         coords = np.ascontiguousarray(coords)
-        feats = np.ascontiguousarray(feats)
-        labels = np.ascontiguousarray(labels)
 
         res = ME.utils.sparse_quantize(
             coords,
@@ -1076,79 +771,30 @@ class KITTIstc(Dataset):
             return_maps_only=True
         )
 
-        # MEの戻り値はreturn_maps_only=Trueの場合 (unique_map, inverse_map) の2要素
         if len(res) == 2:
             unique_map, inverse_map = res
         else:
-            # safety fallback
             quantized_coords, voxel_idx, inverse_map, voxel_counts = res
             original_idx = np.arange(len(coords))
             unique_map = original_idx[voxel_idx]
 
         quantized_coords = coords[unique_map]
-        feats = feats[unique_map]
-        labels = labels[unique_map]
         quantized_coords = (quantized_coords / self.args.voxel_size)
         
-        return quantized_coords, feats, labels, unique_map, inverse_map
-    
-    def _tuple_to_path(self, tup):
-        return os.path.join(self.args.data_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '.ply')
+        return quantized_coords, None, None, unique_map, inverse_map
     
     def _tuple_to_sp_path(self, tup):
         # 他クラスと同様に"_superpoint.npy"の命名規則に統一
         return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
-    
-    def _load_poses(self, seq: int):
-        calib_fname = os.path.join(self.args.original_data_path, str(seq).zfill(2), 'calib.txt')
-        poses_fname = os.path.join(self.args.original_data_path, str(seq).zfill(2), 'poses.txt')
-        calibration = self._parse_calibration(calib_fname)
-        
-        Tr = calibration["Tr"]
-        Tr_inv = np.linalg.inv(Tr)
-        
-        poses = []
-        with open(poses_fname) as poses_file:
-            for line in poses_file:
-                values = [float(v) for v in line.strip().split()]
-                pose = np.zeros((4, 4))
-                pose[0, 0:4] = values[0:4]
-                pose[1, 0:4] = values[4:8]
-                pose[2, 0:4] = values[8:12]
-                pose[3, 3] = 1.0
-                poses.append(np.matmul(Tr_inv, np.matmul(pose, Tr)))
-        
-        return np.array(poses)
-    
-    def _parse_calibration(self, filename):
-        calibration = {}
-        with open(filename) as calib_file:
-            for line in calib_file:
-                key, content = line.strip().split(":")
-                values = [float(v) for v in content.strip().split()]
-                pose = np.zeros((4, 4))
-                pose[0, 0:4] = values[0:4]
-                pose[1, 0:4] = values[4:8]
-                pose[2, 0:4] = values[8:12]
-                pose[3, 3] = 1.0
-                calibration[key] = pose
-        return calibration
-    
-    def _tuple_to_scene_idx(self, tup):
-        seq, idx = tup
-        scene_idx = 0
-        for s in self.seq_to_scan_num.keys():
-            if s < seq:
-                scene_idx += self.seq_to_scan_num[s]
-        scene_idx += idx
-        return scene_idx
 
 
 class cfl_collate_fn_stc:
     """STC用collate関数"""
     
     def __call__(self, list_data):
-        coords_t, coords_t1, coords_t_original, coords_t1_original, sp_labels_t, sp_labels_t1, pose_t, pose_t1, scene_name_t, scene_name_t1 = list(zip(*list_data))
+        (coords_t, coords_t1, coords_t_original, coords_t1_original, 
+         sp_labels_t, sp_labels_t1, pose_t, pose_t1, 
+         scene_name_t, scene_name_t1, flow_t, ground_mask_t, ground_mask_t1) = list(zip(*list_data))
         
         coords_t_batch = []
         coords_t1_batch = []
@@ -1169,13 +815,16 @@ class cfl_collate_fn_stc:
         coords_t_batch = torch.cat(coords_t_batch, 0).float()
         coords_t1_batch = torch.cat(coords_t1_batch, 0).float()
         
-        # オリジナル座標とSPラベルはリストのまま返す
+        # オリジナル座標、SPラベル、flowなどはリストのまま返す
         coords_t_original = [torch.from_numpy(c).float() for c in coords_t_original]
         coords_t1_original = [torch.from_numpy(c).float() for c in coords_t1_original]
         sp_labels_t = [torch.from_numpy(s).long() for s in sp_labels_t]
         sp_labels_t1 = [torch.from_numpy(s).long() for s in sp_labels_t1]
         pose_t = [torch.from_numpy(p).float() for p in pose_t]
         pose_t1 = [torch.from_numpy(p).float() for p in pose_t1]
+        flow_t = [torch.from_numpy(f).float() for f in flow_t]
+        ground_mask_t = [torch.from_numpy(g) for g in ground_mask_t]
+        ground_mask_t1 = [torch.from_numpy(g) for g in ground_mask_t1]
         
         return {
             'coords_t': coords_t_batch,
@@ -1187,50 +836,82 @@ class cfl_collate_fn_stc:
             'pose_t': pose_t,
             'pose_t1': pose_t1,
             'scene_name_t': list(scene_name_t),
-            'scene_name_t1': list(scene_name_t1)
+            'scene_name_t1': list(scene_name_t1),
+            'flow_t': flow_t,
+            'ground_mask_t': ground_mask_t,
+            'ground_mask_t1': ground_mask_t1
         }
 
 
 class KITTItcuss_stc(Dataset):
-    """TCUSS学習用の複合データセット（STC版）"""
+    """TCUSS学習用の複合データセット
+    
+    stc.enabled=True: GrowSP + STC
+    stc.enabled=False: GrowSPのみ（STCもTARLも不要）
+    
+    シーン選択は外部から set_scene_pairs() で設定する。
+    これにより、trainsetとclustersetで同じシーンを使用でき、
+    マルチGPUでも全プロセスで同じシーンを使用できる。
+    """
     
     def __init__(self, args):
         self.args = args
         self.phase = 0
-        self.kittitrain_t1 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
-        self.kittitrain_t2 = KITTItrain(args, scene_idx=range(args.select_num//2), split='train')
-        self.kittistc = KITTIstc(args)
+        self.stc_enabled = args.stc.enabled
         
-        self.scene_idx_all = None
-        self.random_select_sample()
+        # GrowSP用データセット（初期状態では空のscene_idx）
+        self.kittitrain_t1 = KITTItrain(args, scene_idx=[], split='train')
+        self.kittitrain_t2 = KITTItrain(args, scene_idx=[], split='train')
+        
+        # STC用データセット（STC有効時のみ）
+        if self.stc_enabled:
+            self.kittistc = KITTIstc(args)
+        else:
+            self.kittistc = None
+        
+        self.scene_idx_t1 = []
+        self.scene_idx_t2 = []
+        self.scene_idx_all = []
+    
+    def set_scene_pairs(self, scene_idx_t1: List[int], scene_idx_t2: List[int]):
+        """シーンペアを設定する
+        
+        Args:
+            scene_idx_t1: t1のグローバルインデックスリスト
+            scene_idx_t2: t2のグローバルインデックスリスト
+        """
+        self.scene_idx_t1 = scene_idx_t1
+        self.scene_idx_t2 = scene_idx_t2
+        self.scene_idx_all = get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
+        
+        # GrowSP用データセットにシーンを設定
+        self.kittitrain_t1.random_select_sample(scene_idx_t1)
+        self.kittitrain_t2.random_select_sample(scene_idx_t2)
+        
+        # STC用データセットにシーンを設定（STC有効時のみ）
+        if self.stc_enabled and self.kittistc is not None:
+            self.kittistc.set_scene_pairs(scene_idx_t1, scene_idx_t2)
     
     def __len__(self):
-        return self.kittistc.__len__()
+        return len(self.scene_idx_t1)
     
     def __getitem__(self, index):
         growsp_t1 = self.kittitrain_t1.__getitem__(index)
         growsp_t2 = self.kittitrain_t2.__getitem__(index)
-        stc_data = self.kittistc.__getitem__(index)
+        
+        if self.stc_enabled:
+            stc_data = self.kittistc.__getitem__(index)
+        else:
+            stc_data = None
+        
         return growsp_t1, growsp_t2, stc_data
-    
-    def random_select_sample(self):
-        """ランダムにサンプルを選択"""
-        self.kittistc._random_select_samples()
-        scene_idx_t = [self.kittistc._tuple_to_scene_idx(tup) for tup in self.kittistc.scene_locates]
-        scene_idx_t1 = [self.kittistc._tuple_to_scene_idx(tup) for tup in self.kittistc.scene_diff_locates]
-        self.kittitrain_t1.scene_idx = scene_idx_t
-        self.kittitrain_t2.scene_idx = scene_idx_t1
-        self.kittitrain_t1.random_select_sample(scene_idx_t)
-        self.kittitrain_t2.random_select_sample(scene_idx_t1)
-        scene_idx_all = []
-        for i in range(len(scene_idx_t)):
-            scene_idx_all.append(scene_idx_t[i])
-            scene_idx_all.append(scene_idx_t1[i])
-        self.scene_idx_all = scene_idx_all
 
 
 class cfl_collate_fn_tcuss_stc:
-    """TCUSS STC用collate関数"""
+    """TCUSS用collate関数
+    
+    stc_dataがNoneの場合（STC無効時）はstc=Noneを返す
+    """
     
     def __init__(self):
         self.growsp_collate = cfl_collate_fn()
@@ -1241,6 +922,11 @@ class cfl_collate_fn_tcuss_stc:
         
         growsp_t1 = self.growsp_collate(growsp_t1_data)
         growsp_t2 = self.growsp_collate(growsp_t2_data)
-        stc = self.stc_collate(stc_data)
+        
+        # STC無効時はstc_dataがNoneのタプル
+        if stc_data[0] is None:
+            stc = None
+        else:
+            stc = self.stc_collate(stc_data)
         
         return growsp_t1, growsp_t2, stc

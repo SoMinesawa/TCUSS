@@ -6,19 +6,12 @@ import yaml
 
 
 @dataclass
-class STCSceneFlowConfig:
-    """Scene Flow設定"""
-    model: str = "voteflow"
-    checkpoint: str = "scene_flow/VoteFlow/checkpoints/voteflow_best_m8n128_ori.ckpt"
-    voxel_size: List[float] = field(default_factory=lambda: [0.2, 0.2, 6])
-    point_cloud_range: List[float] = field(default_factory=lambda: [-51.2, -51.2, -3, 51.2, 51.2, 3])
-
-
-@dataclass
 class STCCorrespondenceConfig:
     """対応点計算設定"""
     distance_threshold: float = 0.3
     min_points: int = 5
+    exclude_ground: bool = True  # 地面点を対応計算から除外するかどうか
+    remove_ego_motion: bool = True  # エゴモーションを除去してobject_flowを使用するかどうか
 
 
 @dataclass
@@ -38,9 +31,9 @@ class EvaluationConfig:
 @dataclass
 class STCConfig:
     """STC (Superpoint Time Consistency) 設定"""
-    enabled: bool = False  # デフォルトは無効（TARLモード）
+    enabled: bool = False  # デフォルトは無効
     weight: float = 1.0
-    scene_flow: STCSceneFlowConfig = field(default_factory=STCSceneFlowConfig)
+    voteflow_preprocess_path: str = "data/dataset/semantickitti/voteflow_preprocess_fixed"  # VoteFlow前処理済みH5データパス
     correspondence: STCCorrespondenceConfig = field(default_factory=STCCorrespondenceConfig)
     loss: STCLossConfig = field(default_factory=STCLossConfig)
 
@@ -68,17 +61,23 @@ class TCUSSConfig:
     
     # 最適化設定
     lr: float = 1e-2  # バックボーンネットワークの学習率
-    tarl_lr: float = 0.0002  # Transformerプロジェクタとプレディクタの学習率
     weight_decay: float = 1e-2  # 重み減衰
     accum_step: int = 1  # 勾配蓄積ステップ
-    # TARL設定
-    lmb: float = 1.0  # TARL損失の重み
-    ignore_hdbscan_outliers: bool = True  # hdbscanの外れ値を学習から除外するかどうか
     
     # データロード設定
     workers: int = 24  # データローディング用ワーカー数
     cluster_workers: int = 24  # クラスタリング用ワーカー数
-    batch_size: List[int] = field(default_factory=lambda: [16, 16])  # バッチサイズ [GrowSP, TARL]
+    batch_size: List[int] = field(default_factory=lambda: [16, 16])  # バッチサイズ
+    eval_batch_size: int = 32  # 評価時のバッチサイズ（grad不要なので大きくできる）
+    cluster_batch_size: int = 16  # クラスタリング時のバッチサイズ（grad不要なので大きくできる）
+    
+    # DataLoader最適化
+    persistent_workers: bool = True  # ワーカープロセスを維持
+    prefetch_factor: int = 4  # プリフェッチ数
+    
+    # マルチGPU設定
+    use_ddp: bool = True  # DistributedDataParallelを使用
+    ddp_backend: str = "nccl"  # DDPバックエンド
     
     # 実験設定
     seed: int = 2022  # 乱数シード
@@ -104,6 +103,7 @@ class TCUSSConfig:
     select_num: int = 1500  # 各ラウンドで選択されるシーン数
     eval_select_num: int = 4071  # 評価時に選択されるシーン数
     r_crop: float = 50.0  # トレーニング時のクロッピング半径
+    scan_window: int = 12  # t1からt2を選ぶ際の最大フレーム差
     
     # 評価設定
     cluster_interval: int = 10  # クラスタリング間隔
@@ -118,13 +118,9 @@ class TCUSSConfig:
     early_stopping_mode: str = 'max'  # 早期停止のモード
     rel_drop_window: int = 15  # train_loss収束判定用窓幅
     overfit_drop: float = 0.30  # val過学習判定差分
-    # lmb依存の収束判定しきい値は動的に計算
     
     # デバッグ設定
     debug: bool = False  # デバッグモード
-    
-    # 時間設定
-    scan_window: int = 12  # スキャンウィンドウサイズ
     
     # 視覚化設定
     vis: bool = False  # 視覚化フラグ
@@ -134,7 +130,7 @@ class TCUSSConfig:
     resume: bool = False  # 学習再開フラグ
     wandb_run_id: Optional[str] = None  # wandbのrun ID
     
-    # STC設定（新規）
+    # STC設定
     stc: STCConfig = field(default_factory=STCConfig)
     
     # 評価設定（詳細）
@@ -170,7 +166,7 @@ class TCUSSConfig:
         stc_config = STCConfig(
             enabled=stc_dict.get('enabled', False),
             weight=stc_dict.get('weight', 1.0),
-            scene_flow=STCSceneFlowConfig(**stc_dict.get('scene_flow', {})),
+            voteflow_preprocess_path=stc_dict.get('voteflow_preprocess_path', 'data/dataset/semantickitti/voteflow_preprocess_fixed'),
             correspondence=STCCorrespondenceConfig(**stc_dict.get('correspondence', {})),
             loss=STCLossConfig(**stc_dict.get('loss', {}))
         )

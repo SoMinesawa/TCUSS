@@ -1,0 +1,55 @@
+# Initial Superpoint Preparation Configuration for SemanticKITTI
+# 
+# 使用方法:
+#   python data_prepare/initialSP_prepare_SemanticKITTI.py
+
+# 入出力パス
+input_path: "data/users/minesawa/semantickitti/growsp"
+sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
+
+# 地面検出設定
+# ground_detection_method: "ransac" または "patchwork++"
+ground_detection_method: "ransac"
+
+# RANSAC設定 (ground_detection_method: "ransac" の場合に使用)
+ransac:
+  distance_threshold: 0.06
+  ransac_n: 3
+  num_iterations: 1000
+
+# Patchwork++設定 (ground_detection_method: "patchwork++" の場合に使用)
+patchwork:
+  path: "data/users/minesawa/semantickitti/patchwork-plusplus/sequences"
+  # patchwork++のラベルで地面として扱う値 (通常1が地面)
+  ground_label: 1
+
+# クラスタリング設定 (地面以外の点のクラスタリング)
+# clustering_method: "dbscan" または "hdbscan"
+clustering_method: "hdbscan"
+
+# DBSCAN設定 (clustering_method: "dbscan" の場合に使用)
+dbscan:
+  eps: 0.8
+  min_points: 10
+
+# HDBSCAN設定 (clustering_method: "hdbscan" の場合に使用)
+hdbscan:
+  min_cluster_size: 10
+  min_samples: 5
+  metric: "euclidean"  # 距離メトリック: euclidean, manhattan, etc.
+  cluster_selection_method: "eom"  # クラスタ選択方法: eom (Excess of Mass), leaf
+
+# 可視化設定
+vis: true
+
+# 並列処理設定
+max_workers: 32
+
+# データセット設定 (SemanticKITTI)
+semantic_class: 19
+
+# 処理対象シーケンス設定
+# null または [] の場合は全シーケンスを処理
+# 特定のシーケンスのみ処理する場合はリストで指定 (例: [0, 1, 8])
+sequences: null
+
