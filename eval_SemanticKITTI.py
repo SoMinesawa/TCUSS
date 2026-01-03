@@ -427,11 +427,11 @@ def eval_ddp(
     model.eval()
     classifier.eval()
     
-    # 評価用バッチサイズを取得
+    # 評価用バッチサイズとワーカー数を取得
     eval_batch_size = getattr(args, 'eval_batch_size', 32)
     persistent_workers = getattr(args, 'persistent_workers', True)
     prefetch_factor = getattr(args, 'prefetch_factor', 4)
-    num_workers = args.cluster_workers
+    num_workers = getattr(args, 'eval_workers', args.cluster_workers)
     
     # 検証データセットを作成
     val_dataset = KITTIval(args)
@@ -616,11 +616,11 @@ def eval(epoch: int, args: Union[argparse.Namespace, 'TCUSSConfig']) -> Tuple[fl
     classifier = get_fixclassifier(in_channel=args.feats_dim, centroids_num=args.semantic_class, centroids=centroids).cuda()
     classifier.eval()
 
-    # 評価用バッチサイズを取得（grad不要なので大きくできる）
+    # 評価用バッチサイズとワーカー数を取得（grad不要なので大きくできる）
     eval_batch_size = getattr(args, 'eval_batch_size', 32)
     persistent_workers = getattr(args, 'persistent_workers', True)
     prefetch_factor = getattr(args, 'prefetch_factor', 4)
-    num_workers = args.cluster_workers
+    num_workers = getattr(args, 'eval_workers', args.cluster_workers)
     
     # 検証データセットを作成
     val_dataset = KITTIval(args)

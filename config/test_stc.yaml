@@ -5,6 +5,7 @@ batch_size:
 bn_momentum: 0.02
 cluster_interval: 10
 cluster_workers: 24
+eval_workers: 44
 conv1_kernel_size: 5
 data_path: data/users/minesawa/semantickitti/growsp
 debug: false

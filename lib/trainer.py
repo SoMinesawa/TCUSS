@@ -459,9 +459,16 @@ class TCUSSTrainer:
                 # オプティマイザのリセット
                 self.optimizer.zero_grad()
         
-        # エポック全体の損失をログに記録（メインプロセスのみ）
+        # エポック全体の損失を計算
         temporal_weight = self.config.stc.weight if self.config.stc.enabled else 0.0
         train_loss = loss_growsp_display + temporal_weight * loss_temporal_display
+        
+        # DDP時はtrain_lossを全プロセスで平均化して同期（early_stoppingの収束判定に使用）
+        if self.use_ddp:
+            train_loss_tensor = torch.tensor([train_loss], device=self.device)
+            dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
+            train_loss = train_loss_tensor.item() / self.world_size
+        
         self.loss_history.append(train_loss)
         
         if self.is_main_process:
@@ -1134,7 +1141,14 @@ class TCUSSTrainer:
             
             # 早期停止判定（メインプロセスで判定、結果をブロードキャスト）
             if self.config.early_stopping and not self.early_stopped:
-                self._check_early_stopping(epoch, m_IoU)
+                if self.is_main_process:
+                    self._check_early_stopping(epoch, m_IoU)
+                
+                # DDP時はearly_stoppedフラグを全プロセスに同期
+                if self.use_ddp:
+                    early_stopped_tensor = torch.tensor([1 if self.early_stopped else 0], device=self.device)
+                    dist.broadcast(early_stopped_tensor, src=0)
+                    self.early_stopped = early_stopped_tensor.item() == 1
         
         # DDP同期のためにバリアを設置
         if self.use_ddp:
@@ -1199,7 +1213,11 @@ class TCUSSTrainer:
         wandb.log(flat_metrics) 
 
     def _check_early_stopping(self, epoch: int, val_miou: float):
-        """早期停止判定を行う"""
+        """早期停止判定を行う
+        
+        注意: このメソッドはメインプロセス（rank=0）でのみ呼び出されることを前提としています。
+        呼び出し後、self.early_stoppedフラグを全プロセスにブロードキャストする必要があります。
+        """
         # 収束判定しきい値（固定）
         loss_plateau = 0.003
         

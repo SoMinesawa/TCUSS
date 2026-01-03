@@ -119,8 +119,9 @@ class cfl_collate_fn:
     """データセットの出力を適切なフォーマットに変換するコレート関数
     
     Note: KITTItrainではMixupでcoordsだけが連結されるため、
-    coordsとfeatsのサイズが異なる。indsのオフセットはcoordsではなく
-    featsの点数で計算する。
+    coordsとfeatsのサイズが異なる。indsはモデル出力（coordsサイズ）から
+    original部分を取り出すためのインデックスなので、オフセットはcoordsの
+    点数で計算する必要がある。
     
     Returns:
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, 
@@ -134,7 +135,7 @@ class cfl_collate_fn:
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch = [], [], [], [], [], [], []
         region_batch = []
         feats_sizes = []  # 各シーンのfeatsサイズを記録
-        accm_feats = 0   # feats/inds用オフセット
+        accm_coords = 0   # inds用オフセット（coordsのサイズで計算）
         for batch_id, _ in enumerate(coords):
             num_coords = coords[batch_id].shape[0]
             num_feats = feats[batch_id].shape[0]
@@ -145,10 +146,10 @@ class cfl_collate_fn:
             labels_batch.append(torch.from_numpy(labels[batch_id]).int())
             inverse_batch.append(torch.from_numpy(inverse_map[batch_id]))
             pseudo_batch.append(torch.from_numpy(pseudo[batch_id]))
-            # indsのオフセットはfeatsの点数で計算（Mixupでcoordsだけ大きくなるため）
-            inds_batch.append(torch.from_numpy(inds[batch_id] + accm_feats).int())
+            # indsのオフセットはcoordsの点数で計算（モデル出力がcoordsサイズに対応するため）
+            inds_batch.append(torch.from_numpy(inds[batch_id] + accm_coords).int())
             region_batch.append(torch.from_numpy(region[batch_id])[:,None])
-            accm_feats += num_feats
+            accm_coords += num_coords
 
         # Concatenate all lists
         coords_batch = torch.cat(coords_batch, 0).float()

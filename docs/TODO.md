@@ -17,10 +17,10 @@ growsp自体の精度向上 - epoch 30とかでk = 19でSuperpoint作って良�
 - init spをましにする
 - 再実行 → 全体にバグ or リトライにバグ 動くようにはなった。→ 精度低い。　persistanse? → 多分違う。GPU1~8でも変わらない。cluster前のにしてもダメ。→ dataloaderはpersistanceでも更新はされている。→ torchrun廃止してもダメ。マルチGPUだからではない。→batch sizeや！ or lr ß解決。
 - trainsetとclustersetで別物になってしまっていた。
-- STCは事前にgrowspでforwardしているんだから最適化できるはず。getitem時点でSP対応まで取っておきたい。
+- STCは事前にgrowspでforwardしているんだから最適化できるはず。getitem時点でSP対応まで取っておきたい。ç
 - 直ったら 
 - Semantic Primitive 19でやってみる
-- 
+- t_1とt_2で異なるdata augすれば、いい感じ？
 
 train_SemanticKITTI.pyでは、マルチプロセスの設定をしているけど、これは確かpytorchのDataLoader内でcudaやgpuを使用したからだった気がする。今って、DataLoader内でgpuとか使うコードのまま？この設定は削除まだできない？確認して。default.yamlで実行している。
 
@@ -29,3 +29,12 @@ train_SemanticKITTI.pyでは、マルチプロセスの設定をしているけ�
 - loss.backward一つにまとめる
 - persistance対応
 - evalのGPU使いきれていない感じ。CPUも8COREぐらいしか使っていない。
+- clusterのバッチ対応とマルチGPU
+- kmeansのマルチGPUの調整
+- kmeans++
+
+
+## 精度下がらない時
+- lossも下がっていない場合
+    - cluster_intervalごとに上昇する場合
+        - 学習率と各epochごとのstep数を見直す。

@@ -6,16 +6,16 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "growsp_test"
+name: "growsp_fast"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/growsp_test"
+save_path: "data/users/minesawa/semantickitti/growsp_fast"
 pseudo_label_path: "pseudo_label_kitti/"
 
 # エポック設定
-max_epoch: [60, 350]  # [非成長フェーズ, 成長フェーズ]
+max_epoch: [100, 350]  # [非成長フェーズ, 成長フェーズ]
 max_iter: [10000, 30000]
 
 # モデル設定
@@ -23,19 +23,20 @@ bn_momentum: 0.02
 conv1_kernel_size: 5
 
 # 最適化設定
-lr: 0.01  # バックボーンの学習率
+lr: 0.05  # バックボーンの学習率
 weight_decay: 0.01
-accum_step: 2
+accum_step: 1
 
 # データロード設定
 workers: 24
 cluster_workers: 24
-batch_size: [1, 1]
+eval_workers: 44  # 評価時のワーカー数（GPU boundなので多めに設定）
+batch_size: [8, 8]
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
 
 # DataLoader最適化
-persistent_workers: false  # ワーカープロセスを維持
+persistent_workers: false  # false推奨
 prefetch_factor: 4  # プリフェッチ数
 
 # マルチGPU設定
@@ -93,7 +94,7 @@ early_stopping:
 # デバッグ設定
 debug: false
 vis: false
-vis_sp: false 
+vis_sp: false
 # 学習再開設定
 resume: false
 wandb_run_id: null

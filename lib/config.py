@@ -67,6 +67,7 @@ class TCUSSConfig:
     # データロード設定
     workers: int = 24  # データローディング用ワーカー数
     cluster_workers: int = 24  # クラスタリング用ワーカー数
+    eval_workers: int = 44  # 評価時のワーカー数
     batch_size: List[int] = field(default_factory=lambda: [16, 16])  # バッチサイズ
     eval_batch_size: int = 32  # 評価時のバッチサイズ（grad不要なので大きくできる）
     cluster_batch_size: int = 16  # クラスタリング時のバッチサイズ（grad不要なので大きくできる）
