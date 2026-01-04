@@ -38,3 +38,7 @@ train_SemanticKITTI.pyでは、マルチプロセスの設定をしているけ�
 - lossも下がっていない場合
     - cluster_intervalごとに上昇する場合
         - 学習率と各epochごとのstep数を見直す。
+
+
+AttnPnP
+53.85, 22.85, 14.79

@@ -6,12 +6,12 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "growsp_fast"
+name: "growsp_sp1_6000"
 data_path: "data/users/minesawa/semantickitti/growsp"
-sp_path: "data/users/minesawa/semantickitti/growsp_sp"
+sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/growsp_fast"
+save_path: "data/users/minesawa/semantickitti/growsp_sp1_6000"
 pseudo_label_path: "pseudo_label_kitti/"
 
 # エポック設定
@@ -23,7 +23,7 @@ bn_momentum: 0.02
 conv1_kernel_size: 5
 
 # 最適化設定
-lr: 0.05  # バックボーンの学習率
+lr: 0.02  # バックボーンの学習率
 weight_decay: 0.01
 accum_step: 1
 
@@ -50,7 +50,7 @@ log_interval: 1000000
 # モデル構成設定
 voxel_size: 0.15
 input_dim: 3
-primitive_num: 500
+primitive_num: 128
 semantic_class: 19
 feats_dim: 128
 ignore_label: -1
@@ -65,7 +65,7 @@ growsp:
   c_shape: 5.0
 
 # データセット設定
-select_num: 1500
+select_num: 6000
 eval_select_num: 4071
 r_crop: 50.0
 scan_window: 12  # t1からt2を選ぶ際の最大フレーム差
