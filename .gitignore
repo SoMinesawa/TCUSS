@@ -171,6 +171,7 @@ cython_debug/
 /tcuss/
 /tcuss_copy/
 /semantickitti/
+/sp_id_kitti/
 
 tcuss.tar.gz
 /tcuss_310/

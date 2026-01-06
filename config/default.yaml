@@ -13,6 +13,7 @@ original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
 save_path: "data/users/minesawa/semantickitti/growsp_sp1_6000"
 pseudo_label_path: "pseudo_label_kitti/"
+sp_id_path: "sp_id_kitti/" 
 
 # エポック設定
 max_epoch: [100, 350]  # [非成長フェーズ, 成長フェーズ]
@@ -28,7 +29,7 @@ weight_decay: 0.01
 accum_step: 1
 
 # データロード設定
-workers: 24
+workers: 3
 cluster_workers: 24
 eval_workers: 44  # 評価時のワーカー数（GPU boundなので多めに設定）
 batch_size: [8, 8]
@@ -104,18 +105,30 @@ wandb_run_id: null
 # ===========================================
 stc:
   enabled: false  # 元のTARLモードでテスト用に一時的に無効化
-  weight: 1.0  # loss_stc の重み
+  weight: 0.2  # loss_stc の重み
 
   # VoteFlow前処理済みデータのパス（H5ファイル）
   voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
 
   # 対応点計算
   correspondence:
-    distance_threshold: 0.3  # meters
+    # 静止物体用の閾値
+    distance_threshold: 0.3  # 静止物体のベース閾値 (meters, 1フレーム時)
+    distance_threshold_per_frame: 0.1  # フレーム数に応じて追加する閾値 (meters)
+    
+    # 動いている物体用の閾値
+    distance_threshold_moving: 0.6  # 動いている物体のベース閾値 (meters, 1フレーム時)
+    distance_threshold_moving_per_frame: 0.2  # フレーム数に応じて追加する閾値 (meters)
+    
+    # moving判定（SPごとの平均object_flowで判定）
+    moving_flow_threshold: 0.5  # m/frame（この値以上ならmoving SPと判定）
+    
     min_points: 5  # SPペアを有効とする最小対応点数
-    exclude_ground: true  # 地面点を対応計算から除外
-    remove_ego_motion: true  # エゴモーションを除去してobject_flowを使用
+    min_sp_points: 10  # この点数以下のSPは対応計算から除外
+    exclude_ground: false  # 地面点を対応計算から除外
+    remove_ego_motion: false  # flow_est_fixedは既に時刻t+1座標系への変換を含む
 
   # 損失関数設定
   loss:
     temperature: 0.1  # 将来的に使う可能性
+    correspondence_ratio_weight: true  # SPの対応点割合で重み付けするかどうか

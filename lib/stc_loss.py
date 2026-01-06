@@ -13,45 +13,58 @@ from typing import Tuple, Optional
 def compute_sp_features(
     point_features: torch.Tensor,
     sp_labels: torch.Tensor,
-    num_sp: Optional[int] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    target_sp_ids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     点の特徴量からSuperpointの特徴量を計算（平均）
+    
+    対応行列と整合性を取るため、target_sp_ids（フィルタリング後のSPリスト）に
+    対応した特徴量のみを計算する。
     
     Args:
         point_features: 点の特徴量 [N, D]
         sp_labels: 各点のSuperpointラベル [N]、-1は無効
-        num_sp: Superpointの数（Noneの場合は自動検出）
+        target_sp_ids: 対象とするSPのIDリスト [M]（対応行列の次元と一致）
         
     Returns:
-        sp_features: Superpoint特徴量 [M, D]
+        sp_features: Superpoint特徴量 [M, D]（target_sp_idsの順序に対応）
         valid_mask: 有効なSPのマスク [M]（点が存在するSPはTrue）
+        sp_counts: 各SPの点数 [M]（対応点割合の計算用）
     """
     device = point_features.device
     D = point_features.shape[1]
+    num_sp = len(target_sp_ids)
     
-    # 有効な点のみを使用
-    valid_mask = sp_labels >= 0
-    valid_features = point_features[valid_mask]
-    valid_labels = sp_labels[valid_mask]
+    if num_sp == 0:
+        return (torch.zeros(0, D, device=device), 
+                torch.zeros(0, dtype=torch.bool, device=device),
+                torch.zeros(0, device=device))
     
-    if len(valid_labels) == 0:
-        if num_sp is None:
-            num_sp = 1
-        return torch.zeros(num_sp, D, device=device), torch.zeros(num_sp, dtype=torch.bool, device=device)
+    # target_sp_idsをtensorに変換（必要な場合）
+    if not isinstance(target_sp_ids, torch.Tensor):
+        target_sp_ids = torch.tensor(target_sp_ids, device=device, dtype=torch.long)
+    else:
+        target_sp_ids = target_sp_ids.to(device)
     
-    # ラベルを連番（0..M-1）に圧縮して安全にindex_addできるようにする
-    unique_labels, inverse = torch.unique(valid_labels, sorted=True, return_inverse=True)
-    
-    # Superpointの数を決定（unique数と合わせる）
-    num_sp = len(unique_labels)
+    # SP IDからインデックスへのマッピングを作成
+    # target_sp_ids[i] -> i
+    sp_id_to_idx = {int(sp_id): i for i, sp_id in enumerate(target_sp_ids.cpu().numpy())}
     
     # 各SPの特徴量の合計と点数を計算
     sp_features_sum = torch.zeros(num_sp, D, device=device)
     sp_counts = torch.zeros(num_sp, device=device)
     
-    sp_features_sum.index_add_(0, inverse, valid_features)
-    sp_counts.index_add_(0, inverse, torch.ones_like(inverse, dtype=torch.float))
+    # 有効な点のみを処理
+    valid_point_mask = sp_labels >= 0
+    valid_features = point_features[valid_point_mask]
+    valid_labels = sp_labels[valid_point_mask].cpu().numpy()
+    
+    # 各点について、target_sp_idsに含まれるSPのみ集計
+    for pt_idx, sp_id in enumerate(valid_labels):
+        if sp_id in sp_id_to_idx:
+            sp_idx = sp_id_to_idx[sp_id]
+            sp_features_sum[sp_idx] += valid_features[pt_idx]
+            sp_counts[sp_idx] += 1
     
     # 平均を計算（点がないSPはゼロベクトル）
     sp_valid_mask = sp_counts > 0
@@ -61,7 +74,7 @@ def compute_sp_features(
         torch.zeros_like(sp_features_sum)
     )
     
-    return sp_features, sp_valid_mask
+    return sp_features, sp_valid_mask, sp_counts
 
 
 def loss_stc_similarity(
@@ -70,7 +83,9 @@ def loss_stc_similarity(
     correspondence_matrix: torch.Tensor,
     valid_mask_t: Optional[torch.Tensor] = None,
     valid_mask_t1: Optional[torch.Tensor] = None,
-    min_correspondence: int = 5
+    min_correspondence: int = 5,
+    sp_counts_t: Optional[torch.Tensor] = None,
+    correspondence_ratio_weight: bool = True
 ) -> torch.Tensor:
     """
     対応するSuperpointの特徴量を近づける損失（類似度最大化）
@@ -84,6 +99,8 @@ def loss_stc_similarity(
         valid_mask_t: 時刻tの有効SPマスク [M]（Noneの場合は全て有効）
         valid_mask_t1: 時刻t+1の有効SPマスク [N]（Noneの場合は全て有効）
         min_correspondence: 有効な対応とみなす最小点数
+        sp_counts_t: 時刻tの各SPの総点数 [M]（対応点割合の重み付け用、Noneなら無効）
+        correspondence_ratio_weight: SPの対応点割合で重み付けするかどうか
         
     Returns:
         loss: スカラーの損失値
@@ -128,8 +145,24 @@ def loss_stc_similarity(
     # weights[i, j] > 0 のペアのみが損失に寄与
     weighted_similarity = (weights * similarity).sum(dim=1)  # [M']
     
-    # 負の平均類似度を損失とする（類似度を最大化したいので）
-    loss = -weighted_similarity.mean()
+    # 対応点割合による重み付け
+    # SPの総点数に対する対応付けられた点数の割合でlossの寄与を調整
+    if correspondence_ratio_weight and sp_counts_t is not None:
+        valid_sp_counts = sp_counts_t[valid_rows]  # [M']
+        valid_row_sum = row_sum[valid_rows]  # [M'] 対応付けられた点数
+        # 対応点割合 = 対応付けられた点数 / SPの総点数
+        corr_ratio = valid_row_sum / (valid_sp_counts + 1e-8)  # [M']
+        corr_ratio = torch.clamp(corr_ratio, 0.0, 1.0)  # 0~1にクランプ
+        
+        # 対応点割合で重み付けした平均
+        total_weight = corr_ratio.sum()
+        if total_weight > 0:
+            loss = -(corr_ratio * weighted_similarity).sum() / total_weight
+        else:
+            loss = -weighted_similarity.mean()
+    else:
+        # 負の平均類似度を損失とする（類似度を最大化したいので）
+        loss = -weighted_similarity.mean()
     
     return loss
 
@@ -140,7 +173,9 @@ def loss_stc_mse(
     correspondence_matrix: torch.Tensor,
     valid_mask_t: Optional[torch.Tensor] = None,
     valid_mask_t1: Optional[torch.Tensor] = None,
-    min_correspondence: int = 5
+    min_correspondence: int = 5,
+    sp_counts_t: Optional[torch.Tensor] = None,
+    correspondence_ratio_weight: bool = True
 ) -> torch.Tensor:
     """
     対応するSuperpointの特徴量を近づける損失（MSE版）
@@ -154,6 +189,8 @@ def loss_stc_mse(
         valid_mask_t: 時刻tの有効SPマスク [M]
         valid_mask_t1: 時刻t+1の有効SPマスク [N]
         min_correspondence: 有効な対応とみなす最小点数
+        sp_counts_t: 時刻tの各SPの総点数 [M]（対応点割合の重み付け用、Noneなら無効）
+        correspondence_ratio_weight: SPの対応点割合で重み付けするかどうか
         
     Returns:
         loss: スカラーの損失値
@@ -189,8 +226,26 @@ def loss_stc_mse(
     # 対応SPの加重平均を計算
     target_features = torch.mm(weights, sp_features_t1)  # [M', D]
     
-    # MSE損失
-    loss = F.mse_loss(valid_sp_features_t, target_features)
+    # 対応点割合による重み付け
+    if correspondence_ratio_weight and sp_counts_t is not None:
+        valid_sp_counts = sp_counts_t[valid_rows]  # [M']
+        valid_row_sum = row_sum[valid_rows]  # [M'] 対応付けられた点数
+        # 対応点割合 = 対応付けられた点数 / SPの総点数
+        corr_ratio = valid_row_sum / (valid_sp_counts + 1e-8)  # [M']
+        corr_ratio = torch.clamp(corr_ratio, 0.0, 1.0)  # 0~1にクランプ
+        
+        # 各SPのMSEを計算
+        per_sp_mse = ((valid_sp_features_t - target_features) ** 2).mean(dim=1)  # [M']
+        
+        # 対応点割合で重み付けした平均MSE
+        total_weight = corr_ratio.sum()
+        if total_weight > 0:
+            loss = (corr_ratio * per_sp_mse).sum() / total_weight
+        else:
+            loss = per_sp_mse.mean()
+    else:
+        # MSE損失
+        loss = F.mse_loss(valid_sp_features_t, target_features)
     
     return loss
 
@@ -203,16 +258,19 @@ class STCLoss(nn.Module):
     def __init__(
         self,
         loss_type: str = "similarity",
-        min_correspondence: int = 5
+        min_correspondence: int = 5,
+        correspondence_ratio_weight: bool = True
     ):
         """
         Args:
             loss_type: "similarity" または "mse"
             min_correspondence: 有効な対応とみなす最小点数
+            correspondence_ratio_weight: SPの対応点割合で重み付けするかどうか
         """
         super().__init__()
         self.loss_type = loss_type
         self.min_correspondence = min_correspondence
+        self.correspondence_ratio_weight = correspondence_ratio_weight
         
         if loss_type == "similarity":
             self.loss_fn = loss_stc_similarity
@@ -227,7 +285,8 @@ class STCLoss(nn.Module):
         sp_features_t1: torch.Tensor,
         correspondence_matrix: torch.Tensor,
         valid_mask_t: Optional[torch.Tensor] = None,
-        valid_mask_t1: Optional[torch.Tensor] = None
+        valid_mask_t1: Optional[torch.Tensor] = None,
+        sp_counts_t: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         return self.loss_fn(
             sp_features_t,
@@ -235,7 +294,9 @@ class STCLoss(nn.Module):
             correspondence_matrix,
             valid_mask_t,
             valid_mask_t1,
-            self.min_correspondence
+            self.min_correspondence,
+            sp_counts_t,
+            self.correspondence_ratio_weight
         )
 
 

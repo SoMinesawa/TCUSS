@@ -6,17 +6,17 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "debug"
+name: "stc_first_debug"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/debug"
+save_path: "data/users/minesawa/semantickitti/stc_first_debug"
 pseudo_label_path: "pseudo_label_kitti/"
 sp_id_path: "sp_id_kitti/" 
 
 # エポック設定
-max_epoch: [4, 2]  # [非成長フェーズ, 成長フェーズ]
+max_epoch: [20, 350]  # [非成長フェーズ, 成長フェーズ]
 max_iter: [10000, 30000]
 
 # モデル設定
@@ -24,24 +24,24 @@ bn_momentum: 0.02
 conv1_kernel_size: 5
 
 # 最適化設定
-lr: 0.01  # バックボーンの学習率
+lr: 0.05  # バックボーンの学習率
 weight_decay: 0.01
-accum_step: 2
+accum_step: 1
 
 # データロード設定
-workers: 24
+workers: 3
 cluster_workers: 24
-eval_workers: 44
+eval_workers: 44  # 評価時のワーカー数（GPU boundなので多めに設定）
 batch_size: [8, 8]
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
 
 # DataLoader最適化
-persistent_workers: false  # ワーカープロセスを維持
+persistent_workers: false  # false推奨
 prefetch_factor: 4  # プリフェッチ数
 
-# マルチGPU設定、
-use_ddp: false  # DistributedDataParallelを使用
+# マルチGPU設定
+use_ddp: true  # DistributedDataParallelを使用
 ddp_backend: "nccl"  # DDPバックエンド
 
 # 実験設定
@@ -51,7 +51,7 @@ log_interval: 1000000
 # モデル構成設定
 voxel_size: 0.15
 input_dim: 3
-primitive_num: 500
+primitive_num: 128
 semantic_class: 19
 feats_dim: 128
 ignore_label: -1
@@ -66,13 +66,13 @@ growsp:
   c_shape: 5.0
 
 # データセット設定
-select_num: 128
-eval_select_num: 128
+select_num: 1500
+eval_select_num: 4071
 r_crop: 50.0
-scan_window: 12  # t1からt2を選ぶ際の最大フレーム差
+scan_window: 1  # t1からt2を選ぶ際の最大フレーム差
 
 # 評価設定
-cluster_interval: 2
+cluster_interval: 3
 eval_interval: 10
 silhouette: false
 
@@ -80,7 +80,7 @@ silhouette: false
 evaluation:
   distance_evaluation: true  # 距離別評価を有効にするかどうか
   distance_bins: [10, 20, 30, 40, 50, 60, 70, 80]  # 距離区切り（m）、10m刻み
-  moving_static_evaluation: true  # 移動物体/静止物体の分離評価を有効にするかどうか
+  moving_static_evaluation: true # 移動物体/静止物体の分離評価を有効にするかどうか
 
 # 早期停止設定
 early_stopping:
@@ -95,7 +95,7 @@ early_stopping:
 # デバッグ設定
 debug: false
 vis: false
-vis_sp: true 
+vis_sp: false
 # 学習再開設定
 resume: false
 wandb_run_id: null
@@ -105,7 +105,7 @@ wandb_run_id: null
 # ===========================================
 stc:
   enabled: true  # 元のTARLモードでテスト用に一時的に無効化
-  weight: 1.0  # loss_stc の重み
+  weight: 0.5  # loss_stc の重み
 
   # VoteFlow前処理済みデータのパス（H5ファイル）
   voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
@@ -113,12 +113,12 @@ stc:
   # 対応点計算
   correspondence:
     # 静止物体用の閾値
-    distance_threshold: 0.3  # 静止物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_per_frame: 0.1  # フレーム数に応じて追加する閾値 (meters)
+    distance_threshold: 0.2  # 静止物体のベース閾値 (meters, 1フレーム時)
+    distance_threshold_per_frame: 0.05  # フレーム数に応じて追加する閾値 (meters)
     
     # 動いている物体用の閾値
     distance_threshold_moving: 0.6  # 動いている物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_moving_per_frame: 0.5  # フレーム数に応じて追加する閾値 (meters)
+    distance_threshold_moving_per_frame: 0.2  # フレーム数に応じて追加する閾値 (meters)
     
     # moving判定（SPごとの平均object_flowで判定）
     moving_flow_threshold: 0.5  # m/frame（この値以上ならmoving SPと判定）
@@ -126,9 +126,9 @@ stc:
     min_points: 5  # SPペアを有効とする最小対応点数
     min_sp_points: 10  # この点数以下のSPは対応計算から除外
     exclude_ground: false  # 地面点を対応計算から除外
-    remove_ego_motion: false  # エゴモーションを除去してobject_flowを使用
+    remove_ego_motion: false  # flow_est_fixedは既に時刻t+1座標系への変換を含む
 
   # 損失関数設定
   loss:
-    correspondence_ratio_weight: true  # SPの対応点割合で重み付けするかどうか
     temperature: 0.1  # 将来的に使う可能性
+    correspondence_ratio_weight: true  # SPの対応点割合で重み付けするかどうか

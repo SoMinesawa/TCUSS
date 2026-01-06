@@ -8,8 +8,19 @@ import yaml
 @dataclass
 class STCCorrespondenceConfig:
     """対応点計算設定"""
-    distance_threshold: float = 0.3
+    # 静止物体用の閾値
+    distance_threshold: float = 0.3  # 静止物体のベース閾値 (meters, 1フレーム時)
+    distance_threshold_per_frame: float = 0.1  # フレーム数に応じて追加する閾値 (meters)
+    
+    # 動いている物体用の閾値
+    distance_threshold_moving: float = 0.6  # 動いている物体のベース閾値 (meters, 1フレーム時)
+    distance_threshold_moving_per_frame: float = 0.2  # フレーム数に応じて追加する閾値 (meters)
+    
+    # moving判定（SPごとの平均object_flowで判定）
+    moving_flow_threshold: float = 0.1  # m/frame（この値以上ならmoving SPと判定）
+    
     min_points: int = 5
+    min_sp_points: int = 0  # この点数以下のSPは対応計算から除外（0なら除外しない）
     exclude_ground: bool = True  # 地面点を対応計算から除外するかどうか
     remove_ego_motion: bool = True  # エゴモーションを除去してobject_flowを使用するかどうか
 
@@ -17,6 +28,7 @@ class STCCorrespondenceConfig:
 @dataclass
 class STCLossConfig:
     """STC損失設定"""
+    correspondence_ratio_weight: bool = True  # SPの対応点割合で重み付けするかどうか
     temperature: float = 0.1
 
 
@@ -50,6 +62,7 @@ class TCUSSConfig:
     patchwork_path: str = 'data/users/minesawa/semantickitti/patchwork'  # パッチワークデータパス
     save_path: str = 'data/users/minesawa/semantickitti/growsp_model'  # モデル保存パス
     pseudo_label_path: str = 'pseudo_label_kitti/'  # 疑似ラベル保存パス
+    sp_id_path: str = 'sp_id_kitti/'  # 各点の統合SPラベル保存パス（毎クラスタリング時に上書き）
     
     # エポック設定
     max_epoch: List[int] = field(default_factory=lambda: [100, 350])  # 各ステージの最大エポック数

@@ -17,13 +17,23 @@ growsp自体の精度向上 - epoch 30とかでk = 19でSuperpoint作って良�
 - init spをましにする
 - 再実行 → 全体にバグ or リトライにバグ 動くようにはなった。→ 精度低い。　persistanse? → 多分違う。GPU1~8でも変わらない。cluster前のにしてもダメ。→ dataloaderはpersistanceでも更新はされている。→ torchrun廃止してもダメ。マルチGPUだからではない。→batch sizeや！ or lr ß解決。
 - trainsetとclustersetで別物になってしまっていた。
-- STCは事前にgrowspでforwardしているんだから最適化できるはず。getitem時点でSP対応まで取っておきたい。ç
+- STCは事前にgrowspでforwardしているんだから最適化できるはず。getitem時点でSP対応まで取っておきたい。
 - 直ったら 
 - Semantic Primitive 19でやってみる
 - t_1とt_2で異なるdata augすれば、いい感じ？
+- 意外とinit sp時点でノイズ多い。こいつらは完全に無視された前提で学習進むはず。入力にすら含まれない？
 
 train_SemanticKITTI.pyでは、マルチプロセスの設定をしているけど、これは確かpytorchのDataLoader内でcudaやgpuを使用したからだった気がする。今って、DataLoader内でgpuとか使うコードのまま？この設定は削除まだできない？確認して。default.yamlで実行している。
 
+## やる実験 → unsupervised SSでSOTA。移動物体も静止物体の精度も上がっている。時系列一貫性上がっているよ。
+- 何とか高速化したい。→ superpointの位置と点の数と分散とかでマッチングとればいけそう。これってそもそもscene flow必要？まあ欲しいか。
+- Unsupersised Semantic Segmentation
+    - SemanticKITTI
+    - nuScenes
+    - (Waymo Open Dataset)
+    - 距離ごとの比較 → 車とかは視点の変化激しい。でも異なる視点同士を対応づけられるから強い。
+- 定性的評価
+    - フレームによる飛びがない図
 
 ## 軽微な実装改善
 - loss.backward一つにまとめる

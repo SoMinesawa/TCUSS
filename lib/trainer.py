@@ -25,10 +25,6 @@ from lib.utils import (
 )
 from datasets.SemanticKITTI import generate_scene_pairs, get_unique_scene_indices
 from lib.stc_loss import compute_sp_features, loss_stc_similarity
-from scene_flow.correspondence import (
-    compute_point_correspondence_filtered,
-    compute_superpoint_correspondence_matrix
-)
 from eval_SemanticKITTI import eval, eval_ddp
 import sys
 
@@ -142,9 +138,6 @@ class TCUSSTrainer:
         self.classifier = None
         self.current_growsp = None
         self.resume_epoch = None
-        
-        # STC用: 統合後SPラベルのキャッシュ（scene_name -> sp_labels）
-        self.sp_index_cache: Dict[str, np.ndarray] = {}
         
         # 早期停止関連の変数
         self.best_metric_score = float('-inf')  # best_val
@@ -416,21 +409,16 @@ class TCUSSTrainer:
                 growsp_t2_loss.backward()
             
             if self.config.stc.enabled:
-                # STCモード
-                # Phase 0（Phase 1）ではSTC lossを計算しない
-                if phase == 0:
-                    temporal_loss = torch.tensor(0.0, device=self.device)
-                elif stc_data is not None:
-                    temporal_loss = self.train_stc(
-                        stc_data, 
-                        phase=phase,
-                        current_growsp=self.current_growsp
-                    ) / self.config.accum_step
-                    if temporal_loss.grad_fn is not None:
-                        (self.config.stc.weight * temporal_loss).backward()
+                # STCモード（Phase 0からSTC lossを計算）
+                if stc_data is not None:
+                    temporal_loss = self.train_stc(stc_data) / self.config.accum_step
                 else:
                     temporal_loss = torch.tensor(0.0, device=self.device)
                 temporal_weight = self.config.stc.weight
+                
+                # STC損失の個別backward
+                if temporal_loss.grad_fn is not None:
+                    (temporal_weight * temporal_loss).backward()
             else:
                 # GrowSPのみモード（STC無効）
                 temporal_loss = torch.tensor(0.0, device=self.device)
@@ -474,23 +462,29 @@ class TCUSSTrainer:
         if self.is_main_process:
             loss_name = 'loss_stc' if self.config.stc.enabled else 'loss_temporal'
             wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, loss_name: loss_temporal_display, 'train_loss': train_loss})
+        
+        # vis_spモードでは1 epoch終了後に終了
+        if self.config.vis_sp:
+            self.logger.info("vis_sp: 1 epoch終了。可視化データは vis_sp_debug/ に保存されました。プログラムを終了します。")
+            sys.exit(0)
     
     def train_growsp(self, growsp_data):
         """GrowSPのトレーニング（DDP対応版）
         
-        growsp_dataはcollate結果で、10要素タプル:
-        (coords, feats, normal, labels, inverse, pseudo, inds, region, index, feats_sizes)
+        growsp_dataはcollate結果で、11要素タプル:
+        (coords, feats, normal, labels, inverse, pseudo, inds, region, index, feats_sizes, unique_vals_list)
         """
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.config.ignore_label).to(self.device)
         
-        # データ形式をアンパック（10要素タプルのみ対応）
-        if len(growsp_data) != 10:
-            raise ValueError(f"Unexpected growsp_data length: {len(growsp_data)}. Expected 10.")
+        # データ形式をアンパック（11要素タプルのみ対応）
+        if len(growsp_data) != 11:
+            raise ValueError(f"Unexpected growsp_data length: {len(growsp_data)}. Expected 11.")
         
         coords = growsp_data[0]
         pseudo_labels = growsp_data[5]
         inds = growsp_data[6]
         feats_sizes = growsp_data[9]
+        # unique_vals_list = growsp_data[10]  # STC用（train_growspでは使用しない）
         
         # サイズ不一致チェック
         if len(inds) != len(pseudo_labels):
@@ -514,292 +508,110 @@ class TCUSSTrainer:
         loss_sem = loss_fn(logits * 5, pseudo_labels_comp).mean()
         return loss_sem
     
-    def _merge_init_sp_to_growsp(
-        self,
-        point_feats: torch.Tensor,
-        init_sp_labels: torch.Tensor,
-        current_growsp: Optional[int]
-    ) -> torch.Tensor:
+    def train_stc(self, stc_data: Dict) -> torch.Tensor:
         """
-        init SPラベルをSuperpoint Constructor（kmeans）で統合したSPラベルに変換
+        STC (Superpoint Time Consistency) 損失の計算
         
-        get_kittisp_featureの処理と同様に、init SPの特徴量を計算してkmeansで統合する。
+        対応点計算・SP対応行列計算はデータセット側（KITTIstc）で事前に行われる。
+        ここでは特徴抽出とロス計算のみを行う。
+        統合SPラベルはsp_id_pathから読み込まれている。
         
         Args:
-            point_feats: 点の特徴量 [N, D]
-            init_sp_labels: init SPラベル [N]
-            current_growsp: 統合後のSP数
-            
-        Returns:
-            統合後のSPラベル [N]
+            stc_data: STC用データ（corr_matrix, sp_labels等を含む）
         """
-        device = point_feats.device
-        
-        # current_growspがNoneの場合はinit SPをそのまま返す
-        if current_growsp is None:
-            return init_sp_labels
-        
-        # 有効な点のみを処理（-1以外）
-        valid_mask = init_sp_labels >= 0
-        if not valid_mask.any():
-            return init_sp_labels
-        
-        valid_feats = point_feats[valid_mask]
-        valid_init_labels = init_sp_labels[valid_mask]
-        
-        # init SPのユニークラベルを取得
-        unique_init_sp = torch.unique(valid_init_labels)
-        init_sp_num = len(unique_init_sp)
-        
-        # init SPが統合後の数より少ない場合はそのまま返す
-        if init_sp_num <= current_growsp:
-            return init_sp_labels
-        
-        # init SPラベルを連番（0..M-1）にリマップ
-        label_to_idx = {label.item(): idx for idx, label in enumerate(unique_init_sp)}
-        remapped_labels = torch.tensor(
-            [label_to_idx[l.item()] for l in valid_init_labels],
-            device=device, dtype=torch.long
-        )
-        
-        # init SPの特徴量を計算（各SPの点特徴量の平均）
-        init_sp_corr = F.one_hot(remapped_labels, num_classes=init_sp_num).float()
-        per_init_sp_num = init_sp_corr.sum(0, keepdim=True).t()  # [M, 1]
-        init_sp_feats = F.linear(init_sp_corr.t(), valid_feats.t()) / per_init_sp_num  # [M, D]
-        init_sp_feats = F.normalize(init_sp_feats, dim=-1)
-        
-        # kmeansでinit SPを統合
-        merged_sp_idx = get_kmeans_labels(n_clusters=current_growsp, pcds=init_sp_feats).long()
-        
-        # 各点のラベルを統合後SPラベルに変換
-        merged_labels = torch.full_like(init_sp_labels, -1)
-        merged_labels[valid_mask] = merged_sp_idx[remapped_labels]
-        
-        return merged_labels
-    
-    def _apply_sp_mapping(
-        self,
-        init_sp_labels: torch.Tensor,
-        sp_idx: np.ndarray
-    ) -> torch.Tensor:
-        """
-        init SPラベルを統合後SPラベルに変換（キャッシュされたマッピングを使用）
-        
-        Args:
-            init_sp_labels: init SPラベル [N]
-            sp_idx: init SP ID → 統合SP ID のマッピング [M]
-            
-        Returns:
-            統合後のSPラベル [N]
-        """
-        device = init_sp_labels.device
-        sp_idx_tensor = torch.from_numpy(sp_idx).long().to(device)
-        
-        # 結果テンソル（-1で初期化）
-        merged_labels = torch.full_like(init_sp_labels, -1)
-        
-        # 有効な点（init SPラベルが-1でなく、マッピングの範囲内）を変換
-        valid_mask = (init_sp_labels >= 0) & (init_sp_labels < len(sp_idx_tensor))
-        if valid_mask.any():
-            merged_labels[valid_mask] = sp_idx_tensor[init_sp_labels[valid_mask]]
-        
-        return merged_labels
-    
-    def train_stc(
-        self, 
-        stc_data: Dict, 
-        phase: int = 0,
-        current_growsp: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        STC (Superpoint Time Consistency) 損失の計算（DDP対応版）
-        VoteFlowで事前計算されたScene Flowデータ（H5ファイル）を使用する。
-        
-        Phase 0ではSTC lossを計算せず、Phase 1以降でSuperpoint Constructor（kmeans）で
-        統合したSP単位で対応をとる。
-        
-        Args:
-            stc_data: STC用データ（flow_t, ground_mask_t等を含む）
-            phase: トレーニングフェーズ（0: Phase 1, 1: Phase 2）
-            current_growsp: 統合後のSP数（Phase 2で使用）
-        """
-        # Phase 0（Phase 1）ではSTC lossを計算しない
-        if phase == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=False)
-        
         coords_t = stc_data['coords_t']
-        coords_t1 = stc_data['coords_t1']
-        coords_t_original = stc_data['coords_t_original']
-        coords_t1_original = stc_data['coords_t1_original']
-        sp_labels_t = stc_data['sp_labels_t']  # init SPラベル
-        sp_labels_t1 = stc_data['sp_labels_t1']  # init SPラベル
-        pose_t = stc_data['pose_t']
-        pose_t1 = stc_data['pose_t1']
-        scene_name_t = stc_data.get('scene_name_t', None)  # キャッシュ参照用
-        scene_name_t1 = stc_data.get('scene_name_t1', None)
-        flow_t_list = stc_data['flow_t']  # H5ファイルから読み込んだScene Flow
-        ground_mask_t_list = stc_data['ground_mask_t']  # 地面マスク（時刻t）
-        ground_mask_t1_list = stc_data['ground_mask_t1']  # 地面マスク（時刻t+1）
+        coords_t2 = stc_data['coords_t2']
+        sp_labels_t_list = stc_data['sp_labels_t']  # 統合SPラベル（リスト）
+        sp_labels_t2_list = stc_data['sp_labels_t2']  # 統合SPラベル（リスト）
+        corr_matrix_list = stc_data['corr_matrix']  # SP対応行列（リスト）
+        unique_sp_t_list = stc_data['unique_sp_t']  # ユニークSP（リスト）
+        unique_sp_t2_list = stc_data['unique_sp_t2']  # ユニークSP（リスト）
         
-        # 特徴抽出（DDPデバイスを使用）
-        in_field_t = ME.TensorField(coords_t[:, 1:] * self.config.voxel_size, coords_t, device=self.local_rank)
-        in_field_t1 = ME.TensorField(coords_t1[:, 1:] * self.config.voxel_size, coords_t1, device=self.local_rank)
+        # === 特徴抽出（tとt2を1つのバッチにまとめて1回のforwardで処理） ===
+        # これによりBatchNormのinplace更新問題を回避（DDP対応）
+        n_t = coords_t.shape[0]
         
-        feats_t = self.model_q(in_field_t)
-        feats_t1 = self.model_q(in_field_t1)
+        # coords_t2のバッチIDをシフト（forward時のみ、マスク処理では元のIDを使用）
+        batch_size = int(coords_t[:, 0].max().item()) + 1
+        coords_t2_shifted = coords_t2.clone()
+        coords_t2_shifted[:, 0] = coords_t2_shifted[:, 0] + batch_size
+        
+        # 結合して1回のforward
+        coords_combined = torch.cat([coords_t, coords_t2_shifted], dim=0)
+        in_field_combined = ME.TensorField(
+            coords_combined[:, 1:] * self.config.voxel_size, 
+            coords_combined, 
+            device=self.local_rank
+        )
+        feats_combined = self.model_q(in_field_combined)
+        
+        # 出力を分割
+        feats_t = feats_combined[:n_t]
+        feats_t2 = feats_combined[n_t:]
         
         batch_ids = torch.unique(coords_t[:, 0])
         
-        # === SPラベル統合: キャッシュから取得（kmeansをスキップ） ===
-        
-        # 各サンプルの特徴量とSPラベルを準備
-        sample_data_list = []
-        merged_labels_results = {}
-        use_cache = bool(self.sp_index_cache and scene_name_t and scene_name_t1)
-        
-        for batch_idx, batch_id in enumerate(batch_ids):
-            batch_id_int = int(batch_id.item())
-            
-            mask_t = coords_t[:, 0] == batch_id_int
-            scene_feats_t = feats_t[mask_t]
-            
-            mask_t1 = coords_t1[:, 0] == batch_id_int
-            scene_feats_t1 = feats_t1[mask_t1]
-            
-            # init SPラベルを取得
-            init_sp_labels_t = sp_labels_t[batch_idx].to(self.device)
-            init_sp_labels_t1 = sp_labels_t1[batch_idx].to(self.device)
-            
-            # キャッシュからinit SP → 統合SPのマッピングを取得
-            if use_cache:
-                name_t = scene_name_t[batch_idx]
-                name_t1 = scene_name_t1[batch_idx]
-                
-                if name_t in self.sp_index_cache and name_t1 in self.sp_index_cache:
-                    # キャッシュヒット: マッピングを使ってinit SPラベルを統合SPラベルに変換
-                    sp_idx_t = self.sp_index_cache[name_t]  # init SP ID → 統合SP ID
-                    sp_idx_t1 = self.sp_index_cache[name_t1]
-                    
-                    # init SPラベルをマッピングで変換（-1は維持）
-                    scene_sp_labels_t = self._apply_sp_mapping(init_sp_labels_t, sp_idx_t)
-                    scene_sp_labels_t1 = self._apply_sp_mapping(init_sp_labels_t1, sp_idx_t1)
-                else:
-                    # キャッシュミス → フォールバック
-                    scene_sp_labels_t = self._merge_init_sp_to_growsp(scene_feats_t, init_sp_labels_t, current_growsp)
-                    scene_sp_labels_t1 = self._merge_init_sp_to_growsp(scene_feats_t1, init_sp_labels_t1, current_growsp)
-            else:
-                # キャッシュなし → 従来通りkmeans
-                scene_sp_labels_t = self._merge_init_sp_to_growsp(scene_feats_t, init_sp_labels_t, current_growsp)
-                scene_sp_labels_t1 = self._merge_init_sp_to_growsp(scene_feats_t1, init_sp_labels_t1, current_growsp)
-            
-            merged_labels_results[batch_idx] = (scene_sp_labels_t, scene_sp_labels_t1)
-            sample_data_list.append({
-                'batch_idx': batch_idx,
-                'batch_id': batch_id_int,
-                'scene_feats_t': scene_feats_t,
-                'scene_feats_t1': scene_feats_t1,
-            })
-        
-        # === 各サンプルの対応点計算・損失計算 ===
+        # === 各サンプルの損失計算 ===
         total_loss = torch.tensor(0.0, device=self.device)
         valid_batch_count = 0
         
         for batch_idx, batch_id in enumerate(batch_ids):
             batch_id_int = int(batch_id.item())
             
-            # 事前計算した特徴量とSPラベルを取得
-            sample_data = sample_data_list[batch_idx]
-            scene_feats_t = sample_data['scene_feats_t']
-            scene_feats_t1 = sample_data['scene_feats_t1']
-            scene_sp_labels_t, scene_sp_labels_t1 = merged_labels_results[batch_idx]
+            # このバッチの特徴量を取得
+            mask_t = coords_t[:, 0] == batch_id_int
+            scene_feats_t = feats_t[mask_t]
             
-            # H5ファイルから読み込んだScene Flowを使用
-            flow_t = flow_t_list[batch_idx]
-            if torch.is_tensor(flow_t):
-                flow_t = flow_t.numpy()
+            mask_t2 = coords_t2[:, 0] == batch_id_int
+            scene_feats_t2 = feats_t2[mask_t2]
             
-            # オリジナル座標を取得
-            scene_coords_t_orig = coords_t_original[batch_idx]
-            scene_coords_t1_orig = coords_t1_original[batch_idx]
-            if torch.is_tensor(scene_coords_t_orig):
-                scene_coords_t_orig = scene_coords_t_orig.numpy()
-            if torch.is_tensor(scene_coords_t1_orig):
-                scene_coords_t1_orig = scene_coords_t1_orig.numpy()
+            # SPラベルを取得
+            scene_sp_labels_t = sp_labels_t_list[batch_idx].to(self.device)
+            scene_sp_labels_t2 = sp_labels_t2_list[batch_idx].to(self.device)
             
-            # ground_maskを取得
-            ground_mask_t = ground_mask_t_list[batch_idx]
-            ground_mask_t1 = ground_mask_t1_list[batch_idx]
-            if torch.is_tensor(ground_mask_t):
-                ground_mask_t = ground_mask_t.numpy()
-            if torch.is_tensor(ground_mask_t1):
-                ground_mask_t1 = ground_mask_t1.numpy()
+            # 対応行列を取得
+            corr_matrix = corr_matrix_list[batch_idx].to(self.device)
+            unique_sp_t = unique_sp_t_list[batch_idx]
+            unique_sp_t2 = unique_sp_t2_list[batch_idx]
             
-            # poseを取得
-            batch_pose_t = pose_t[batch_idx]
-            batch_pose_t1 = pose_t1[batch_idx]
-            if torch.is_tensor(batch_pose_t):
-                batch_pose_t = batch_pose_t.numpy()
-            if torch.is_tensor(batch_pose_t1):
-                batch_pose_t1 = batch_pose_t1.numpy()
+            if corr_matrix.numel() == 0 or len(unique_sp_t) == 0 or len(unique_sp_t2) == 0:
+                continue
             
-            with torch.no_grad():
-                # KD-Tree対応点計算（改良版：ego motion除去 + SP/地面フィルタリング）
-                correspondence_t, _ = compute_point_correspondence_filtered(
-                    scene_coords_t_orig,
-                    scene_coords_t1_orig,
-                    flow_t,  # 全点分のflow
-                    scene_sp_labels_t.cpu().numpy(),
-                    scene_sp_labels_t1.cpu().numpy(),
-                    batch_pose_t,
-                    batch_pose_t1,
-                    ground_mask_t,
-                    ground_mask_t1,
-                    distance_threshold=self.config.stc.correspondence.distance_threshold,
-                    remove_ego_motion=self.config.stc.correspondence.remove_ego_motion,
-                    exclude_ground=self.config.stc.correspondence.exclude_ground
+            # === vis_sp: Superpoint対応可視化 ===
+            if self.config.vis_sp:
+                # coords_originalがないため、voxel座標を使用
+                scene_coords_t = (coords_t[mask_t, 1:] * self.config.voxel_size).cpu().numpy()
+                scene_coords_t2 = (coords_t2[mask_t2, 1:] * self.config.voxel_size).cpu().numpy()
+                # シーン名を取得
+                scene_name_t = stc_data['scene_name_t'][batch_idx]
+                scene_name_t2 = stc_data['scene_name_t2'][batch_idx]
+                self._visualize_sp_correspondence(
+                    scene_coords_t, scene_coords_t2,
+                    scene_sp_labels_t.cpu().numpy(), scene_sp_labels_t2.cpu().numpy(),
+                    corr_matrix.cpu().numpy(), unique_sp_t, unique_sp_t2, batch_idx,
+                    scene_name_t, scene_name_t2
                 )
-                
-                # SP対応行列計算
-                corr_matrix, unique_sp_t, unique_sp_t1 = compute_superpoint_correspondence_matrix(
-                    correspondence_t,
-                    scene_sp_labels_t.cpu().numpy(),
-                    scene_sp_labels_t1.cpu().numpy(),
-                    min_points=self.config.stc.correspondence.min_points
-                )
-                
-                if corr_matrix.size == 0:
-                    continue
-                
-                # === vis_sp: Superpoint対応可視化 ===
-                if self.config.vis_sp:
-                    self._visualize_sp_correspondence(
-                        scene_coords_t_orig, scene_coords_t1_orig,
-                        scene_sp_labels_t.cpu().numpy(), scene_sp_labels_t1.cpu().numpy(),
-                        corr_matrix, unique_sp_t, unique_sp_t1, batch_idx
-                    )
-                    # 保存したら終了
-                    self.logger.info("vis_sp: Superpointの対応可視化を保存しました。プログラムを終了します。")
-                    sys.exit(0)
-                
-                corr_matrix = torch.from_numpy(corr_matrix).float().to(self.device)
+                # 1 epoch終了まで可視化を継続（各バッチで保存）
             
-            # 損失計算
-            sp_feats_t, valid_mask_t = compute_sp_features(
+            # 損失計算（unique_sp_tはフィルタリング後のSPリストで、corr_matrixの次元と一致）
+            sp_feats_t, valid_mask_t, sp_counts_t = compute_sp_features(
                 scene_feats_t, scene_sp_labels_t, 
-                num_sp=len(unique_sp_t) if len(unique_sp_t) > 0 else None
+                target_sp_ids=unique_sp_t
             )
-            sp_feats_t1, valid_mask_t1 = compute_sp_features(
-                scene_feats_t1, scene_sp_labels_t1, 
-                num_sp=len(unique_sp_t1) if len(unique_sp_t1) > 0 else None
+            sp_feats_t2, valid_mask_t2, _ = compute_sp_features(
+                scene_feats_t2, scene_sp_labels_t2, 
+                target_sp_ids=unique_sp_t2
             )
             
             loss = loss_stc_similarity(
                 sp_feats_t,
-                sp_feats_t1,
+                sp_feats_t2,
                 corr_matrix,
                 valid_mask_t,
-                valid_mask_t1,
-                min_correspondence=self.config.stc.correspondence.min_points
+                valid_mask_t2,
+                min_correspondence=self.config.stc.correspondence.min_points,
+                sp_counts_t=sp_counts_t,
+                correspondence_ratio_weight=self.config.stc.loss.correspondence_ratio_weight
             )
             
             if loss.grad_fn is not None:
@@ -820,13 +632,18 @@ class TCUSSTrainer:
         corr_matrix: np.ndarray,
         unique_sp_t: np.ndarray,
         unique_sp_t1: np.ndarray,
-        batch_idx: int
+        batch_idx: int,
+        scene_name_t: str = "",
+        scene_name_t2: str = ""
     ):
         """
         Superpointの対応を可視化してPLYファイルで保存
         
-        対応する時刻tと時刻t+nのsuperpointを同じ色で着色し、2つのplyファイルを出力。
-        対応がないSPはグレーで表示。
+        出力ファイル:
+        1. batch{idx}_t_independent.ply / batch{idx}_t2_independent.ply
+           - 各時刻で独立したSP（対応を考慮せず、各SPに異なる色）
+        2. batch{idx}_t_matched.ply / batch{idx}_t2_matched.ply
+           - 対応するSPを同じ色で着色（対応がないSPはグレー）
         
         Args:
             points_t: 時刻tの点群 [N, 3]
@@ -837,32 +654,82 @@ class TCUSSTrainer:
             unique_sp_t: 時刻tのユニークSPラベル
             unique_sp_t1: 時刻t+nのユニークSPラベル
             batch_idx: バッチインデックス
+            scene_name_t: 時刻tのシーン名（例: /00/000100）
+            scene_name_t2: 時刻t2のシーン名（例: /00/000112）
         """
-        import random
+        import colorsys
+        
+        def hsv_to_rgb(h, s, v):
+            """HSV -> RGB変換 (h: 0-360, s,v: 0-1)"""
+            r, g, b = colorsys.hsv_to_rgb(h/360.0, s, v)
+            return (int(r * 255), int(g * 255), int(b * 255))
         
         # 出力ディレクトリ
         output_dir = os.path.join(self.config.save_path, "vis_sp_debug")
         os.makedirs(output_dir, exist_ok=True)
         
+        # scene_nameからseqとidxを抽出（例: "/00/000100" -> seq="00", idx="000100"）
+        def parse_scene_name(scene_name: str):
+            parts = scene_name.strip('/').split('/')
+            if len(parts) >= 2:
+                return parts[0], parts[1]
+            return "unknown", "unknown"
+        
+        seq_t, idx_t = parse_scene_name(scene_name_t)
+        seq_t2, idx_t2 = parse_scene_name(scene_name_t2)
+        
+        # ファイル名のプレフィックス（seq_idx形式）
+        prefix_t = f"seq{seq_t}_idx{idx_t}"
+        prefix_t2 = f"seq{seq_t2}_idx{idx_t2}"
+        
         self.logger.info(f"vis_sp: Superpointの対応可視化を開始 (batch_idx={batch_idx})")
-        self.logger.info(f"  時刻t: {len(points_t)} 点, {len(unique_sp_t)} SPs")
-        self.logger.info(f"  時刻t+n: {len(points_t1)} 点, {len(unique_sp_t1)} SPs")
+        self.logger.info(f"  時刻t: {scene_name_t} ({len(points_t)} 点, {len(unique_sp_t)} SPs)")
+        self.logger.info(f"  時刻t2: {scene_name_t2} ({len(points_t1)} 点, {len(unique_sp_t1)} SPs)")
         self.logger.info(f"  対応行列サイズ: {corr_matrix.shape}")
         
+        # ============================================
+        # 1. 独立したSPの可視化（対応を考慮しない）
+        # ============================================
+        # sp_labels内の全SPに色を割り当て（unique_sp_tはフィルタリング後なので使わない）
+        all_sp_t = np.unique(sp_labels_t[sp_labels_t >= 0])
+        all_sp_t1 = np.unique(sp_labels_t1[sp_labels_t1 >= 0])
+        
+        # 時刻tの各SPに異なる色を割り当て
+        sp_colors_t_independent = {}
+        for idx, sp in enumerate(all_sp_t):
+            hue = (idx * 360.0 / max(len(all_sp_t), 1)) % 360
+            sp_colors_t_independent[sp] = hsv_to_rgb(hue, 0.8, 0.9)
+        
+        # 時刻t2の各SPに異なる色を割り当て
+        sp_colors_t1_independent = {}
+        for idx, sp in enumerate(all_sp_t1):
+            hue = (idx * 360.0 / max(len(all_sp_t1), 1)) % 360
+            sp_colors_t1_independent[sp] = hsv_to_rgb(hue, 0.8, 0.9)
+        
+        # 独立したSPのPLYファイルを保存
+        filepath_t_ind = os.path.join(output_dir, f"{prefix_t}_independent.ply")
+        filepath_t1_ind = os.path.join(output_dir, f"{prefix_t2}_independent.ply")
+        
+        save_vis_sp_ply(points_t, sp_labels_t, sp_colors_t_independent, filepath_t_ind)
+        save_vis_sp_ply(points_t1, sp_labels_t1, sp_colors_t1_independent, filepath_t1_ind)
+        
+        self.logger.info(f"  独立SP保存完了: {filepath_t_ind}")
+        self.logger.info(f"  独立SP保存完了: {filepath_t1_ind}")
+        
+        # ============================================
+        # 2. 対応するSPの可視化
+        # ============================================
         # SP IDをインデックスにマッピング
         sp_t_to_idx = {sp: i for i, sp in enumerate(unique_sp_t)}
         sp_t1_to_idx = {sp: i for i, sp in enumerate(unique_sp_t1)}
         idx_to_sp_t = {i: sp for sp, i in sp_t_to_idx.items()}
         idx_to_sp_t1 = {i: sp for sp, i in sp_t1_to_idx.items()}
         
-        # 対応するSPペアを特定（各SP_tについて最も対応点数が多いSP_t1を見つける）
-        # 双方向で最も対応が強いペアを抽出
+        # 対応するSPペアを特定
         sp_pairs = []  # (sp_t, sp_t1, correspondence_count)
-        
         min_correspondence = self.config.stc.correspondence.min_points
         
         for i in range(corr_matrix.shape[0]):
-            # このSP_tと最も対応点数が多いSP_t1を見つける
             row = corr_matrix[i]
             if row.max() >= min_correspondence:
                 j = row.argmax()
@@ -873,54 +740,76 @@ class TCUSSTrainer:
         
         self.logger.info(f"  有効な対応ペア数: {len(sp_pairs)}")
         
-        # 各対応ペアにユニークな色を割り当て
-        # HSVを使ってカラフルな色を生成
-        def hsv_to_rgb(h, s, v):
-            """HSV -> RGB変換 (h: 0-360, s,v: 0-1)"""
-            import colorsys
-            r, g, b = colorsys.hsv_to_rgb(h/360.0, s, v)
-            return (int(r * 255), int(g * 255), int(b * 255))
+        # 対応付けられた点の割合を計算
+        matched_sp_t = set(sp_t for sp_t, _, _ in sp_pairs)
+        matched_sp_t1 = set(sp_t1 for _, sp_t1, _ in sp_pairs)
         
-        sp_colors_t = {}   # SP_t -> (R, G, B)
-        sp_colors_t1 = {}  # SP_t1 -> (R, G, B)
+        # 各点がマッチしたSPに属するかをカウント
+        points_in_matched_sp_t = np.sum(np.isin(sp_labels_t, list(matched_sp_t)))
+        points_in_matched_sp_t1 = np.sum(np.isin(sp_labels_t1, list(matched_sp_t1)))
+        
+        total_points_t = len(points_t)
+        total_points_t1 = len(points_t1)
+        
+        ratio_t = points_in_matched_sp_t / total_points_t * 100 if total_points_t > 0 else 0
+        ratio_t1 = points_in_matched_sp_t1 / total_points_t1 * 100 if total_points_t1 > 0 else 0
+        
+        self.logger.info(f"  === 対応付け統計 ===")
+        self.logger.info(f"    時刻t: {points_in_matched_sp_t}/{total_points_t} 点 ({ratio_t:.2f}%) が対応付けられたSPに属する")
+        self.logger.info(f"    時刻t2: {points_in_matched_sp_t1}/{total_points_t1} 点 ({ratio_t1:.2f}%) が対応付けられたSPに属する")
+        self.logger.info(f"    マッチしたSP数: 時刻t={len(matched_sp_t)}/{len(unique_sp_t)}, 時刻t2={len(matched_sp_t1)}/{len(unique_sp_t1)}")
+        
+        # 対応するSPに同じ色を割り当て
+        sp_colors_t_matched = {}
+        sp_colors_t1_matched = {}
         
         n_pairs = len(sp_pairs)
         for idx, (sp_t, sp_t1, count) in enumerate(sp_pairs):
-            # 色相を等間隔で割り当て
             hue = (idx * 360.0 / max(n_pairs, 1)) % 360
             color = hsv_to_rgb(hue, 0.8, 0.9)
-            sp_colors_t[sp_t] = color
-            sp_colors_t1[sp_t1] = color
+            sp_colors_t_matched[sp_t] = color
+            sp_colors_t1_matched[sp_t1] = color
+        
+        # 対応ありSPのPLYファイルを保存
+        filepath_t_matched = os.path.join(output_dir, f"{prefix_t}_matched.ply")
+        filepath_t1_matched = os.path.join(output_dir, f"{prefix_t2}_matched.ply")
+        
+        save_vis_sp_ply(points_t, sp_labels_t, sp_colors_t_matched, filepath_t_matched)
+        save_vis_sp_ply(points_t1, sp_labels_t1, sp_colors_t1_matched, filepath_t1_matched)
+        
+        self.logger.info(f"  対応SP保存完了: {filepath_t_matched}")
+        self.logger.info(f"  対応SP保存完了: {filepath_t1_matched}")
         
         # ログ出力: 対応ペアの詳細（最初の10ペア）
         self.logger.info("  対応ペアの詳細（最初の10ペア）:")
         for sp_t, sp_t1, count in sp_pairs[:10]:
-            color = sp_colors_t.get(sp_t, (128, 128, 128))
-            self.logger.info(f"    SP_t={sp_t} <-> SP_t1={sp_t1}, count={count}, color={color}")
-        
-        # PLYファイルとして保存
-        filepath_t = os.path.join(output_dir, f"batch{batch_idx}_t.ply")
-        filepath_t1 = os.path.join(output_dir, f"batch{batch_idx}_t1.ply")
-        
-        save_vis_sp_ply(points_t, sp_labels_t, sp_colors_t, filepath_t)
-        save_vis_sp_ply(points_t1, sp_labels_t1, sp_colors_t1, filepath_t1)
-        
-        self.logger.info(f"  保存完了: {filepath_t}")
-        self.logger.info(f"  保存完了: {filepath_t1}")
+            color = sp_colors_t_matched.get(sp_t, (128, 128, 128))
+            self.logger.info(f"    SP_t={sp_t} <-> SP_t2={sp_t1}, count={count}, color={color}")
         
         # 統計情報をテキストファイルで保存
-        stats_path = os.path.join(output_dir, f"batch{batch_idx}_stats.txt")
+        stats_path = os.path.join(output_dir, f"{prefix_t}_to_{prefix_t2}_stats.txt")
         with open(stats_path, 'w') as f:
-            f.write(f"=== Superpoint対応可視化統計 (batch_idx={batch_idx}) ===\n\n")
+            f.write(f"=== Superpoint対応可視化統計 ===\n")
+            f.write(f"時刻t: {scene_name_t} ({prefix_t})\n")
+            f.write(f"時刻t2: {scene_name_t2} ({prefix_t2})\n\n")
             f.write(f"時刻t: {len(points_t)} 点, {len(unique_sp_t)} SPs\n")
-            f.write(f"時刻t+n: {len(points_t1)} 点, {len(unique_sp_t1)} SPs\n")
+            f.write(f"時刻t2: {len(points_t1)} 点, {len(unique_sp_t1)} SPs\n")
             f.write(f"対応行列サイズ: {corr_matrix.shape}\n")
             f.write(f"有効な対応ペア数: {len(sp_pairs)}\n")
             f.write(f"min_correspondence設定: {min_correspondence}\n\n")
+            f.write("=== 点の対応付け統計 ===\n")
+            f.write(f"時刻t: {points_in_matched_sp_t}/{total_points_t} 点 ({ratio_t:.2f}%) が対応付けられたSPに属する\n")
+            f.write(f"時刻t2: {points_in_matched_sp_t1}/{total_points_t1} 点 ({ratio_t1:.2f}%) が対応付けられたSPに属する\n")
+            f.write(f"マッチしたSP数: 時刻t={len(matched_sp_t)}/{len(unique_sp_t)}, 時刻t2={len(matched_sp_t1)}/{len(unique_sp_t1)}\n\n")
+            f.write("=== 出力ファイル ===\n")
+            f.write(f"独立SP (時刻t): {filepath_t_ind}\n")
+            f.write(f"独立SP (時刻t2): {filepath_t1_ind}\n")
+            f.write(f"対応SP (時刻t): {filepath_t_matched}\n")
+            f.write(f"対応SP (時刻t2): {filepath_t1_matched}\n\n")
             f.write("=== 全対応ペア詳細 ===\n")
             for sp_t, sp_t1, count in sorted(sp_pairs, key=lambda x: -x[2]):
-                color = sp_colors_t.get(sp_t, (128, 128, 128))
-                f.write(f"SP_t={sp_t} <-> SP_t1={sp_t1}, count={int(count)}, color=RGB{color}\n")
+                color = sp_colors_t_matched.get(sp_t, (128, 128, 128))
+                f.write(f"SP_t={sp_t} <-> SP_t2={sp_t1}, count={int(count)}, color=RGB{color}\n")
         
         self.logger.info(f"  統計情報保存: {stats_path}")
     
@@ -987,19 +876,10 @@ class TCUSSTrainer:
         
         # メインプロセスのみで疑似ラベル計算・統計・ログ処理
         if self.is_main_process or not self.use_ddp:
-            # 疑似ラベルの計算と保存
+            # 疑似ラベルの計算と保存（get_kittisp_feature内でsp_id_pathにも保存済み）
             all_pseudo, all_gt, all_pseudo_gt = get_pseudo_kitti(
                 self.config, context, primitive_labels, sp_index
             )
-            
-            # STC用: init SP → 統合SP のマッピング（sp_idx）をキャッシュに保存
-            self.sp_index_cache.clear()
-            for i, ctx in enumerate(context):
-                scene_name = ctx[0]
-                sp_idx = ctx[3] if len(ctx) > 3 else None
-                if sp_idx is not None:
-                    self.sp_index_cache[scene_name] = sp_idx
-            self.logger.info(f'STC用SPマッピングキャッシュを更新: {len(self.sp_index_cache)} シーン')
             
             self.logger.info(
                 'ラベル付けされたポイントの割合 %.2f クラスタリング時間: %.2fs', 

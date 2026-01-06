@@ -6,17 +6,23 @@ STC (Superpoint Time Consistency) 対応可視化スクリプト
 VoteFlowの結果を使ってSuperpoint間の対応を計算し、PLYファイルとして保存する。
 
 使用例:
-    # t と t+1 の対応を可視化
+    # t と t+1 の対応を可視化（エゴモーション除去なし）
     python scripts/visualize_stc_correspondence.py \
         --seq 0 --frame 100 \
         --checkpoint data/users/minesawa/semantickitti/onlyGrowSP/model_30_checkpoint.pth \
         --num_sp 50
 
-    # t と t+12 の対応を可視化（累積flow使用）
+    # t と t+1 の対応を可視化（エゴモーション除去あり）
+    python scripts/visualize_stc_correspondence.py \
+        --seq 0 --frame 100 \
+        --checkpoint data/users/minesawa/semantickitti/onlyGrowSP/model_30_checkpoint.pth \
+        --num_sp 50 --remove_ego_motion
+
+    # t と t+12 の対応を可視化（累積flow使用、エゴモーション除去あり）
     python scripts/visualize_stc_correspondence.py \
         --seq 0 --frame 100 --frame_gap 12 \
         --checkpoint data/users/minesawa/semantickitti/onlyGrowSP/model_30_checkpoint.pth \
-        --num_sp 50
+        --num_sp 50 --remove_ego_motion
 """
 
 import argparse
@@ -28,10 +34,23 @@ import torch.nn.functional as F
 import h5py
 import MinkowskiEngine as ME
 from scipy.spatial import cKDTree
+import random
 
 # プロジェクトルートをパスに追加
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+
+# 再現性のためシードを固定
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
 
 from models.fpn import Res16FPN18
 from lib.utils import get_kmeans_labels
@@ -199,20 +218,25 @@ def compute_accumulated_flow(
         seq: シーケンス番号
         start_frame: 開始フレーム
         frame_gap: フレーム間隔（n）
-        start_coords: 開始フレームの座標 (voxelize後、crop後)
+        start_coords: 開始フレームの座標 (voxelize後, crop後)
         unique_map: voxelize時のユニークマップ
         mask: r_crop後のマスク
         remove_ego_motion: エゴモーションを除去するか
         
     Returns:
         accumulated_flow: 累積flow [N, 3]
+        warped_coords: warp後の座標 [N, 3]
     """
     # 初期位置（生座標）
     raw_data = load_frame_data_raw(h5_path, seq, start_frame)
-    current_coords = raw_data['coords'][unique_map][mask].copy()  # crop後の座標
-    accumulated_flow = np.zeros_like(current_coords)
+    start_coords = raw_data['coords'][unique_map][mask].copy()  # crop後の座標
+    accumulated_flow = np.zeros_like(start_coords)
     
-    print(f"  累積flow計算: t={start_frame} -> t+{frame_gap}={start_frame + frame_gap}")
+    # 最近傍探索用の座標（常にstep_flowで更新して、元の点群との対応を追跡）
+    current_coords_for_nn = start_coords.copy()
+    
+    ego_str = "without ego" if remove_ego_motion else "with ego"
+    print(f"  累積flow計算 ({ego_str}): t={start_frame} -> t+{frame_gap}={start_frame + frame_gap}")
     
     for step in range(frame_gap):
         current_frame = start_frame + step
@@ -232,27 +256,35 @@ def compute_accumulated_flow(
         if step == 0:
             # 最初のステップは直接取得可能
             step_flow = curr_flow[unique_map][mask]
+            # エゴモーション計算用の座標
+            coords_for_ego = start_coords
         else:
             # warpした位置から元の点群への最近傍探索
             tree = cKDTree(curr_raw['coords'])
-            distances, indices = tree.query(current_coords, k=1)
+            distances, indices = tree.query(current_coords_for_nn, k=1)
             step_flow = curr_flow[indices]
+            # エゴモーション計算用の座標
+            coords_for_ego = current_coords_for_nn
         
         # エゴモーション除去
         if remove_ego_motion:
-            ego_flow = compute_ego_motion_flow(current_coords, curr_pose, next_pose)
+            ego_flow = compute_ego_motion_flow(coords_for_ego, curr_pose, next_pose)
             object_flow = step_flow - ego_flow
         else:
             object_flow = step_flow
         
         # 累積
         accumulated_flow += object_flow
-        current_coords = current_coords + step_flow  # 次のステップ用に位置を更新
+        # 最近傍探索用の座標は常にstep_flowで更新（元の点群との対応を追跡）
+        current_coords_for_nn = current_coords_for_nn + step_flow
         
         if (step + 1) % 5 == 0 or step == frame_gap - 1:
             print(f"    Step {step+1}/{frame_gap}: 累積flow norm平均 = {np.linalg.norm(accumulated_flow, axis=1).mean():.3f}m")
     
-    return accumulated_flow
+    # 最終的なwarp後の座標は、開始座標 + 累積flow
+    warped_coords = start_coords + accumulated_flow
+    
+    return accumulated_flow, warped_coords
 
 
 def compute_superpoints_kmeans(coords_vox: np.ndarray, feats: torch.Tensor, init_sp: np.ndarray, k: int):
@@ -404,6 +436,8 @@ def main():
     parser.add_argument('--r_crop', type=float, default=50.0)
     parser.add_argument('--distance_threshold', type=float, default=0.3, help='対応点距離閾値')
     parser.add_argument('--min_points', type=int, default=5, help='SP対応に必要な最小点数')
+    parser.add_argument('--remove_ego_motion', action='store_true', default=False, 
+                        help='エゴモーションを除去するか（デフォルト: False）')
     parser.add_argument('--device', type=str, default='cuda:0')
     args = parser.parse_args()
     
@@ -441,26 +475,51 @@ def main():
     print(f"  時刻t: 統合後SP数 = {len(np.unique(sp_t[sp_t >= 0]))}")
     print(f"  時刻t+{args.frame_gap}: 統合後SP数 = {len(np.unique(sp_tn[sp_tn >= 0]))}")
     
+    # 点群統計情報
+    print()
+    print("=== 点群統計情報 ===")
+    print(f"[時刻t={args.frame}]")
+    coords_t = data_t['coords_original']
+    print(f"  点数: {len(coords_t)}")
+    print(f"  平均座標: x={coords_t[:, 0].mean():.3f}, y={coords_t[:, 1].mean():.3f}, z={coords_t[:, 2].mean():.3f}")
+    print(f"  標準偏差: x={coords_t[:, 0].std():.3f}, y={coords_t[:, 1].std():.3f}, z={coords_t[:, 2].std():.3f}")
+    print(f"  範囲: x=[{coords_t[:, 0].min():.2f}, {coords_t[:, 0].max():.2f}], "
+          f"y=[{coords_t[:, 1].min():.2f}, {coords_t[:, 1].max():.2f}], "
+          f"z=[{coords_t[:, 2].min():.2f}, {coords_t[:, 2].max():.2f}]")
+    
+    print(f"[時刻t+{args.frame_gap}={args.frame + args.frame_gap}]")
+    coords_tn = data_tn['coords_original']
+    print(f"  点数: {len(coords_tn)}")
+    print(f"  平均座標: x={coords_tn[:, 0].mean():.3f}, y={coords_tn[:, 1].mean():.3f}, z={coords_tn[:, 2].mean():.3f}")
+    print(f"  標準偏差: x={coords_tn[:, 0].std():.3f}, y={coords_tn[:, 1].std():.3f}, z={coords_tn[:, 2].std():.3f}")
+    print(f"  範囲: x=[{coords_tn[:, 0].min():.2f}, {coords_tn[:, 0].max():.2f}], "
+          f"y=[{coords_tn[:, 1].min():.2f}, {coords_tn[:, 1].max():.2f}], "
+          f"z=[{coords_tn[:, 2].min():.2f}, {coords_tn[:, 2].max():.2f}]")
+    print()
+    
     # 5. 対応点計算
     print("[5/6] VoteFlowを使ってSuperpoint対応を計算中...")
     
+    ego_str = "without ego" if args.remove_ego_motion else "with ego"
+    print(f"  エゴモーション除去: {args.remove_ego_motion} ({ego_str})")
+    
     # frame_gap > 1 の場合は累積flowを計算
     if args.frame_gap > 1:
-        accumulated_flow = compute_accumulated_flow(
+        accumulated_flow, warped_coords = compute_accumulated_flow(
             args.h5_path, args.seq, args.frame, args.frame_gap,
             data_t['coords_original'],
             data_t['unique_map'], data_t['mask'],
-            remove_ego_motion=True
+            remove_ego_motion=args.remove_ego_motion
         )
     else:
         # frame_gap == 1 の場合は通常のflow
         accumulated_flow = data_t['flow']
-        # エゴモーション除去は compute_point_correspondence_filtered 内で行われる
+        warped_coords = data_t['coords_original'] + data_t['flow']
     
     correspondence_t, _ = compute_point_correspondence_filtered(
         data_t['coords_original'],
         data_tn['coords_original'],
-        accumulated_flow if args.frame_gap > 1 else data_t['flow'],
+        accumulated_flow,
         sp_t,
         sp_tn,
         data_t['pose'],
@@ -468,7 +527,7 @@ def main():
         data_t['ground_mask'],
         data_tn['ground_mask'],
         distance_threshold=args.distance_threshold,
-        remove_ego_motion=(args.frame_gap == 1),  # gap>1の場合は既に除去済み
+        remove_ego_motion=(args.frame_gap == 1 and args.remove_ego_motion),  # gap>1の場合は既に処理済み
         exclude_ground=True
     )
     
@@ -526,20 +585,48 @@ def main():
         else:
             colors_tn[i] = [0, 0, 0]
     
-    # 出力ディレクトリ
+    # 出力ディレクトリ（frame_gapごとに分ける）
     seq_str = str(args.seq).zfill(2)
     frame_str = str(args.frame).zfill(6)
     frame_str_n = str(end_frame).zfill(6)
-    gap_suffix = f"_gap{args.frame_gap}" if args.frame_gap > 1 else ""
+    ego_suffix = "_without_ego" if args.remove_ego_motion else "_with_ego"
     
-    output_path_t = os.path.join(args.output_dir, f"seq{seq_str}_frame{frame_str}{gap_suffix}_t.ply")
-    output_path_tn = os.path.join(args.output_dir, f"seq{seq_str}_frame{frame_str_n}{gap_suffix}_tn.ply")
+    output_dir_gap = os.path.join(args.output_dir, f"gap{args.frame_gap}")
+    os.makedirs(output_dir_gap, exist_ok=True)
+    
+    output_path_t = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str}_t{ego_suffix}.ply")
+    output_path_tn = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str_n}_tn{ego_suffix}.ply")
     
     save_ply(data_t['coords_original'], colors_t, sp_t, output_path_t)
     save_ply(data_tn['coords_original'], colors_tn, sp_tn, output_path_tn)
     
+    # === 追加: 元の点群とwarp後の点群を保存（Superpoint無し） ===
+    print()
+    print("[追加] 元の点群とwarp後の点群を保存中...")
+    
+    # 元の点群（t時刻）（緑色）
+    colors_orig = np.tile([0, 255, 0], (len(data_t['coords_original']), 1)).astype(np.uint8)
+    labels_orig = np.zeros(len(data_t['coords_original']), dtype=np.int32)
+    output_path_orig = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str}_original.ply")
+    save_ply(data_t['coords_original'], colors_orig, labels_orig, output_path_orig)
+    
+    # warp後の点群（赤色）+ 正解の点群（青色）を1つのファイルに結合
+    colors_warped = np.tile([255, 0, 0], (len(warped_coords), 1)).astype(np.uint8)
+    labels_warped = np.ones(len(warped_coords), dtype=np.int32)
+    
+    colors_target = np.tile([0, 0, 255], (len(data_tn['coords_original']), 1)).astype(np.uint8)
+    labels_target = np.full(len(data_tn['coords_original']), 2, dtype=np.int32)
+    
+    # 結合
+    combined_coords = np.vstack([warped_coords, data_tn['coords_original']])
+    combined_colors = np.vstack([colors_warped, colors_target])
+    combined_labels = np.concatenate([labels_warped, labels_target])
+    
+    output_path_warped = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str}_warped{ego_suffix}.ply")
+    save_ply(combined_coords, combined_colors, combined_labels, output_path_warped)
+    
     # 統計情報も保存
-    stats_path = os.path.join(args.output_dir, f"seq{seq_str}_frame{frame_str}{gap_suffix}_stats.txt")
+    stats_path = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str}_stats{ego_suffix}.txt")
     with open(stats_path, 'w') as f:
         f.write(f"STC Correspondence Visualization Stats\n")
         f.write(f"="*50 + "\n")
@@ -547,13 +634,40 @@ def main():
         f.write(f"Frame t: {args.frame}\n")
         f.write(f"Frame t+n: {end_frame} (gap={args.frame_gap})\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"Remove ego motion: {args.remove_ego_motion}\n")
         f.write(f"\n")
-        f.write(f"Points (t): {len(data_t['coords_vox'])}\n")
-        f.write(f"Points (t+n): {len(data_tn['coords_vox'])}\n")
+        
+        f.write(f"=== Point Cloud Statistics ===\n")
+        f.write(f"[Time t={args.frame}]\n")
+        f.write(f"  Points: {len(coords_t)}\n")
+        f.write(f"  Mean: x={coords_t[:, 0].mean():.3f}, y={coords_t[:, 1].mean():.3f}, z={coords_t[:, 2].mean():.3f}\n")
+        f.write(f"  Std: x={coords_t[:, 0].std():.3f}, y={coords_t[:, 1].std():.3f}, z={coords_t[:, 2].std():.3f}\n")
+        f.write(f"[Time t+{args.frame_gap}={args.frame + args.frame_gap}]\n")
+        f.write(f"  Points: {len(coords_tn)}\n")
+        f.write(f"  Mean: x={coords_tn[:, 0].mean():.3f}, y={coords_tn[:, 1].mean():.3f}, z={coords_tn[:, 2].mean():.3f}\n")
+        f.write(f"  Std: x={coords_tn[:, 0].std():.3f}, y={coords_tn[:, 1].std():.3f}, z={coords_tn[:, 2].std():.3f}\n")
+        f.write(f"\n")
+        
+        f.write(f"Points (voxelized, t): {len(data_t['coords_vox'])}\n")
+        f.write(f"Points (voxelized, t+n): {len(data_tn['coords_vox'])}\n")
         f.write(f"Superpoints (k): {args.num_sp}\n")
         f.write(f"Matched pairs: {len(sp_t_to_sp_tn)}\n")
         f.write(f"Correspondence count: {np.sum(correspondence_t >= 0)}\n")
         f.write(f"\n")
+        
+        ego_label = "without ego motion" if args.remove_ego_motion else "with ego motion"
+        f.write(f"Accumulated Flow Stats ({ego_label}):\n")
+        f.write(f"  Mean flow magnitude: {np.linalg.norm(accumulated_flow, axis=1).mean():.3f} m\n")
+        f.write(f"  Max flow magnitude: {np.linalg.norm(accumulated_flow, axis=1).max():.3f} m\n")
+        f.write(f"  Min flow magnitude: {np.linalg.norm(accumulated_flow, axis=1).min():.3f} m\n")
+        f.write(f"\n")
+        
+        f.write(f"=== Warped PLY File Contents ===\n")
+        f.write(f"  Red points (label=1): Warped prediction ({len(warped_coords)} points)\n")
+        f.write(f"  Blue points (label=2): Ground truth at t+{args.frame_gap} ({len(data_tn['coords_original'])} points)\n")
+        f.write(f"  Total points in warped PLY: {len(combined_coords)}\n")
+        f.write(f"\n")
+        
         f.write(f"Matched SP pairs:\n")
         for sp_id_t, sp_id_tn in sp_t_to_sp_tn.items():
             corr_count = corr_matrix[np.where(unique_sp_t == sp_id_t)[0][0], np.where(unique_sp_tn == sp_id_tn)[0][0]]
@@ -567,23 +681,32 @@ def main():
     
     # 時刻t - 独立した色付け
     colors_t_indep = colorize_superpoints_independent(sp_t, args.num_sp, seed=42)
-    output_path_t_indep = os.path.join(args.output_dir, f"seq{seq_str}_frame{frame_str}{gap_suffix}_t_sp_only.ply")
+    output_path_t_indep = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str}_t_sp_only{ego_suffix}.ply")
     save_ply(data_t['coords_original'], colors_t_indep, sp_t, output_path_t_indep)
     
     # 時刻t+n - 独立した色付け（同じseedで色が対応するように）
     colors_tn_indep = colorize_superpoints_independent(sp_tn, args.num_sp, seed=42)
-    output_path_tn_indep = os.path.join(args.output_dir, f"seq{seq_str}_frame{frame_str_n}{gap_suffix}_tn_sp_only.ply")
+    output_path_tn_indep = os.path.join(output_dir_gap, f"seq{seq_str}_frame{frame_str_n}_tn_sp_only{ego_suffix}.ply")
     save_ply(data_tn['coords_original'], colors_tn_indep, sp_tn, output_path_tn_indep)
     
     print()
     print("完了しました！")
+    print(f"出力ディレクトリ: {output_dir_gap}")
+    print(f"エゴモーション除去: {args.remove_ego_motion}")
+    print(f"")
     print(f"出力ファイル:")
-    print(f"  [対応ベース色付け]")
+    print(f"  [対応ベース色付け（Superpoint対応可視化）]")
     print(f"  - {output_path_t}")
     print(f"  - {output_path_tn}")
     print(f"  [独立SP色付け（クラスタリング確認用）]")
     print(f"  - {output_path_t_indep}")
     print(f"  - {output_path_tn_indep}")
+    print(f"  [元の点群とwarp後の点群（Flow確認用）]")
+    print(f"  - {output_path_orig} (緑: t時刻の元の点群)")
+    ego_description = "物体の動きのみ" if args.remove_ego_motion else "VoteFlowの生の推定結果"
+    print(f"  - {output_path_warped}")
+    print(f"      赤: warp後の点群（予測: {ego_description}）")
+    print(f"      青: t+{args.frame_gap}時刻の実際の点群（正解）")
     print(f"  [統計情報]")
     print(f"  - {stats_path}")
 

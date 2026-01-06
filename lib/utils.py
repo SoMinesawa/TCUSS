@@ -22,6 +22,8 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     Note: KITTItrainではMixupでcoordsだけが連結されるため、
     coordsとfeats/labels/normals/regionのサイズが異なる。
     indsはfeatsの範囲でインデックスされる。
+    
+    STC用に、各シーンの「元のinit SP ID → 統合SP ID」マッピングをsp_id_pathに保存する。
     """
     print('computing point feats ....')
     point_feats_list = []
@@ -32,8 +34,8 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     
     with torch.no_grad():
         for batch_idx, data in tqdm(enumerate(loader), total=len(loader), desc="get_kittisp_feature"):
-            # collate_fnから10要素を受け取る（feats_sizesが追加された）
-            coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index, feats_sizes = data
+            # collate_fnから11要素を受け取る（unique_vals_listが追加された）
+            coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index, feats_sizes, unique_vals_list = data
             
             # バッチサイズを取得（coordsの最初の列がbatch_id）
             batch_ids = coords[:, 0].int()
@@ -132,6 +134,37 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
                 point_labels_list.append(labels_cpu)
                 all_sp_index.append(neural_region_cpu)
                 context.append((scene_name, gt, raw_region, sp_idx_cpu))
+                
+                # === STC用: sp_mappingを計算・保存 ===
+                # unique_vals: 連番ID → 元のinit SP ID のマッピング
+                # sp_idx: 連番ID → 統合SP ID のマッピング
+                # よって、元のinit SP ID → 統合SP ID のマッピングを計算
+                scene_unique_vals = unique_vals_list[local_batch_id]
+                
+                if len(scene_unique_vals) > 0:
+                    # sp_id_pathディレクトリを作成
+                    sp_id_folder = os.path.join(args.sp_id_path, scene_name.strip('/').split('/')[0])
+                    if not os.path.exists(sp_id_folder):
+                        os.makedirs(sp_id_folder)
+                    
+                    # 元のinit SPファイルから最大IDを取得
+                    init_sp_file = os.path.join(args.sp_path, scene_name.lstrip('/') + '_superpoint.npy')
+                    original_init_sp = np.load(init_sp_file)
+                    max_init_sp_id = original_init_sp.max()
+                    
+                    # sp_mapping: 元のinit SP ID → 統合SP ID
+                    # -1は未定義（サンプリングされなかったSP）
+                    sp_mapping = np.full(max_init_sp_id + 1, -1, dtype=np.int32)
+                    
+                    # scene_unique_vals[連番ID] = 元のinit SP ID
+                    # sp_idx_cpu[連番ID] = 統合SP ID
+                    for renumbered_id, original_id in enumerate(scene_unique_vals):
+                        if renumbered_id < len(sp_idx_cpu):
+                            sp_mapping[original_id] = sp_idx_cpu[renumbered_id]
+                    
+                    # 保存
+                    sp_mapping_file = os.path.join(args.sp_id_path, scene_name.lstrip('/') + '_sp_mapping.npy')
+                    np.save(sp_mapping_file, sp_mapping)
 
     return point_feats_list, point_labels_list, all_sp_index, context
 

@@ -125,21 +125,24 @@ class cfl_collate_fn:
     
     Returns:
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, 
-        pseudo_batch, inds_batch, region_batch, index, feats_sizes
+        pseudo_batch, inds_batch, region_batch, index, feats_sizes, unique_vals_list
         
         feats_sizes: 各シーンのfeatsサイズのリスト（バッチ分割用）
+        unique_vals_list: 各シーンのunique_vals（連番ID→元init SP IDマッピング）のリスト
     """
 
     def __call__(self, list_data):
-        coords, feats, normals, labels, inverse_map, pseudo, inds, region, index = list(zip(*list_data))
+        coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals = list(zip(*list_data))
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch = [], [], [], [], [], [], []
         region_batch = []
         feats_sizes = []  # 各シーンのfeatsサイズを記録
+        unique_vals_list = []  # 各シーンのunique_vals（連番ID→元init SP IDマッピング）
         accm_coords = 0   # inds用オフセット（coordsのサイズで計算）
         for batch_id, _ in enumerate(coords):
             num_coords = coords[batch_id].shape[0]
             num_feats = feats[batch_id].shape[0]
             feats_sizes.append(num_feats)
+            unique_vals_list.append(unique_vals[batch_id])
             coords_batch.append(torch.cat((torch.ones(num_coords, 1).int() * batch_id, torch.from_numpy(coords[batch_id]).int()), 1))
             feats_batch.append(torch.from_numpy(feats[batch_id]))
             normal_batch.append(torch.from_numpy(normals[batch_id]))
@@ -161,7 +164,7 @@ class cfl_collate_fn:
         inds_batch = torch.cat(inds_batch, 0)
         region_batch = torch.cat(region_batch, 0)
 
-        return coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch, region_batch, index, feats_sizes
+        return coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch, region_batch, index, feats_sizes, unique_vals_list
 
 
 class KITTItrain(Dataset):
@@ -317,14 +320,14 @@ class KITTItrain(Dataset):
                 if mask.sum() < self.args.drop_threshold and q != -1:
                     region[mask] = -1
 
-            # region = np.array([3, -1, 2, 3, 5, -1])が
+            # regionを連番化（GrowSP学習のscatter_操作用）
+            # unique_vals: 連番ID → 元のinit SP IDのマッピング
+            # STC用にget_kittisp_featureでsp_mappingを計算・保存する際に使用
             valid_region = region[region != -1]
             unique_vals = np.unique(valid_region)
             unique_vals.sort()
             valid_region = np.searchsorted(unique_vals, valid_region)
-
             region[region != -1] = valid_region
-            # region = np.array([1, -1, 0, 1, 2, -1])のようになる
 
             # np.long は非推奨なので int64 で置換
             pseudo = -np.ones_like(labels).astype(np.int64)
@@ -334,6 +337,9 @@ class KITTItrain(Dataset):
             scene_name = self.name[index]
             file_path = os.path.join(self.args.pseudo_label_path, scene_name.lstrip("/") + '.npy')            
             pseudo = np.array(np.load(file_path), dtype=np.int64)
+            
+            # trainモードでは連番化しないので、unique_valsは空
+            unique_vals = np.array([], dtype=np.int64)
             
             # サイズ不一致チェック
             expected_size = len(inds)
@@ -365,7 +371,7 @@ class KITTItrain(Dataset):
                     f"debug_reprocess_size={debug_size}, ply_file={debug_file}"
                 )
 
-        return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index
+        return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals
 
 
 class KITTIval(Dataset):
@@ -631,9 +637,12 @@ class cfl_collate_fn_test:
 class KITTIstc(Dataset):
     """STC (Superpoint Time Consistency) 学習用データセット
     
-    連続する2フレーム（時刻tとt+1）のデータを返す。
-    各フレームは独立してSPラベルを持つ。
+    連続する2フレーム（時刻tとt2）のデータを返す。
+    scan_windowに対応し、t2はt1からscan_window以内のフレーム。
     VoteFlowで事前計算されたScene Flowデータ（H5ファイル）を使用する。
+    
+    データセット側でSP対応計算まで行い、train_stcには対応行列を渡す。
+    統合SPラベルはsp_id_pathから読み込む（get_kittisp_featureで保存されたもの）。
     
     シーン選択は外部から set_scene_pairs() で設定する。
     """
@@ -659,6 +668,36 @@ class KITTIstc(Dataset):
         self.voteflow_h5_path = args.stc.voteflow_preprocess_path
         # H5ファイルハンドルのキャッシュ（シーケンス番号 -> ファイルハンドル）
         self._h5_handles: Dict[int, h5py.File] = {}
+        
+        # 対応点計算の設定
+        self.distance_threshold = args.stc.correspondence.distance_threshold
+        self.distance_threshold_per_frame = args.stc.correspondence.distance_threshold_per_frame
+        self.distance_threshold_moving = args.stc.correspondence.distance_threshold_moving
+        self.distance_threshold_moving_per_frame = args.stc.correspondence.distance_threshold_moving_per_frame
+        self.moving_flow_threshold = args.stc.correspondence.moving_flow_threshold
+        self.min_points = args.stc.correspondence.min_points
+        self.min_sp_points = args.stc.correspondence.min_sp_points
+        self.exclude_ground = args.stc.correspondence.exclude_ground
+        self.remove_ego_motion = args.stc.correspondence.remove_ego_motion
+        
+        # 対応点計算関数をインポート（遅延インポート）
+        from scene_flow.correspondence import (
+            compute_point_correspondence_filtered,
+            compute_superpoint_correspondence_matrix
+        )
+        self._compute_point_correspondence = compute_point_correspondence_filtered
+        self._compute_sp_correspondence = compute_superpoint_correspondence_matrix
+    
+    def augs(self, coords):
+        """データ拡張（KITTItrainと同様）
+        
+        voxel座標に対して回転、平行移動、スケーリングを適用する。
+        t1とt2で別々に呼び出すことで、異なるランダム拡張が適用される。
+        """
+        coords = self.rota_coords(coords)
+        coords = self.trans_coords(coords)
+        coords = self.scale_coords(coords)
+        return coords
     
     def set_scene_pairs(self, scene_idx_t1: List[int], scene_idx_t2: List[int]):
         """シーンペアを設定する
@@ -694,27 +733,84 @@ class KITTIstc(Dataset):
     
     def __getitem__(self, index):
         seq_t, idx_t = self.scene_locates[index]
-        seq_t1, idx_t1 = self.scene_diff_locates[index]
+        seq_t2, idx_t2 = self.scene_diff_locates[index]
         
-        # 時刻tのデータ（座標、SPラベル、pose、Scene Flow）
-        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t = self._get_item_one_scene(seq_t, idx_t)
-        # 時刻t+1のデータ
-        coords_t1, coords_t1_original, sp_labels_t1, pose_t1, _, ground_mask_t1 = self._get_item_one_scene(seq_t1, idx_t1)
-        
-        # scene_name（キャッシュ参照用）
+        # scene_name（特徴量取得用）
         scene_name_t = self._tuple_to_scene_name((seq_t, idx_t))
-        scene_name_t1 = self._tuple_to_scene_name((seq_t1, idx_t1))
+        scene_name_t2 = self._tuple_to_scene_name((seq_t2, idx_t2))
         
-        return (coords_t, coords_t1, coords_t_original, coords_t1_original, 
-                sp_labels_t, sp_labels_t1, pose_t, pose_t1, 
-                scene_name_t, scene_name_t1, flow_t, ground_mask_t, ground_mask_t1)
+        # 時刻tのデータ（座標、統合SPラベル、pose、Scene Flow）
+        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t, unique_map_t, mask_t = self._get_item_one_scene(seq_t, idx_t, return_maps=True)
+        # 時刻t2のデータ
+        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2, _, _ = self._get_item_one_scene(seq_t2, idx_t2, return_maps=True)
+        
+        # フローを累積（t → t+n）
+        # flow_est_fixedは「そのフレーム→次のフレーム」へのフローなので、
+        # t → t+n へのフローは flow[t] + flow[t+1] + ... + flow[t+n-1] を累積する
+        accumulated_flow = self._accumulate_flow(seq_t, idx_t, idx_t2, unique_map_t, mask_t)
+        
+        # SP対応行列を計算
+        num_frames = abs(idx_t2 - idx_t)  # フレーム差（絶対値）
+        correspondence_t, _ = self._compute_point_correspondence(
+            coords_t_original,
+            coords_t2_original,
+            accumulated_flow,
+            sp_labels_t,
+            sp_labels_t2,
+            pose_t,
+            pose_t2,
+            ground_mask_t,
+            ground_mask_t2,
+            distance_threshold=self.distance_threshold,
+            distance_threshold_per_frame=self.distance_threshold_per_frame,
+            distance_threshold_moving=self.distance_threshold_moving,
+            distance_threshold_moving_per_frame=self.distance_threshold_moving_per_frame,
+            moving_flow_threshold=self.moving_flow_threshold,
+            num_frames=num_frames,
+            remove_ego_motion=self.remove_ego_motion,
+            exclude_ground=self.exclude_ground
+        )
+        
+        corr_matrix, unique_sp_t, unique_sp_t2 = self._compute_sp_correspondence(
+            correspondence_t,
+            sp_labels_t,
+            sp_labels_t2,
+            min_points=self.min_points,
+            min_sp_points=self.min_sp_points
+        )
+        
+        # データ拡張を適用（t1とt2で別々のランダム拡張）
+        # 対応計算はオリジナル座標で完了済み、特徴抽出用にデータ拡張を適用
+        # voxel座標に対して適用（KITTItrainと同様）
+        coords_t_aug = self.augs(coords_t.copy())
+        coords_t2_aug = self.augs(coords_t2.copy())
+        
+        return {
+            'coords_t': coords_t_aug,  # データ拡張後（特徴抽出用）
+            'coords_t2': coords_t2_aug,  # データ拡張後（特徴抽出用）
+            'sp_labels_t': sp_labels_t,
+            'sp_labels_t2': sp_labels_t2,
+            'corr_matrix': corr_matrix,
+            'unique_sp_t': unique_sp_t,
+            'unique_sp_t2': unique_sp_t2,
+            'scene_name_t': scene_name_t,
+            'scene_name_t2': scene_name_t2
+        }
     
     def _tuple_to_scene_name(self, tup: Tuple[int, int]) -> str:
         """シーン名を生成（KITTItrainと同じフォーマット）"""
         return f'/{str(tup[0]).zfill(2)}/{str(tup[1]).zfill(6)}'
     
-    def _get_item_one_scene(self, seq: int, idx: int):
-        """1シーンのデータをH5ファイルから取得"""
+    def _get_item_one_scene(self, seq: int, idx: int, return_maps: bool = False):
+        """1シーンのデータをH5ファイルから取得
+        
+        統合SPラベルは、元のinit SPファイルにsp_mappingを適用して作成する。
+        
+        Args:
+            seq: シーケンス番号
+            idx: フレームインデックス
+            return_maps: True の場合、unique_map と mask も返す（フロー累積用）
+        """
         h5_file = self._get_h5_handle(seq)
         timestamp = str(idx).zfill(6)
         
@@ -738,10 +834,6 @@ class KITTIstc(Dataset):
         means = coords.mean(0)
         coords = coords - means
         
-        # SPラベルを取得
-        sp_file = self._tuple_to_sp_path((seq, idx))
-        sp_labels_full = np.load(sp_file)
-        
         # voxelize
         coords_vox, _, _, unique_map, _ = self._voxelize(coords)
         coords_vox = coords_vox.astype(np.float32)
@@ -749,6 +841,34 @@ class KITTIstc(Dataset):
         # r_cropでマスク
         mask = np.sqrt(((coords_vox * self.args.voxel_size) ** 2).sum(-1)) < self.args.r_crop
         coords_vox = coords_vox[mask]
+        
+        # 統合SPラベルを作成: 元のinit SPにsp_mappingを適用
+        # 1. 元のinit SPファイルを読み込む（元の点群サイズ）
+        seq_str = str(seq).zfill(2)
+        idx_str = str(idx).zfill(6)
+        init_sp_file = os.path.join(self.args.sp_path, seq_str, f'{idx_str}_superpoint.npy')
+        init_sp_labels = np.load(init_sp_file)  # (N,) 元の点群サイズ
+        
+        # 2. sp_mappingを読み込む（init SP → 統合SPのマッピング）
+        sp_mapping_file = os.path.join(self.args.sp_id_path, seq_str, f'{idx_str}_sp_mapping.npy')
+        if os.path.exists(sp_mapping_file):
+            sp_mapping = np.load(sp_mapping_file)  # (max_init_sp_id+1,)
+            
+            # 3. init SPラベルに対してマッピングを適用
+            # init_sp_labels == -1 の点（ノイズ）は -1 のまま
+            # init_sp_labels >= len(sp_mapping) の場合は -1 にする
+            # sp_mapping[init_sp_id] == -1 の場合も -1 にする（サンプリングされなかったSP）
+            sp_labels_full = np.full_like(init_sp_labels, -1, dtype=np.int32)
+            valid_init_mask = (init_sp_labels >= 0) & (init_sp_labels < len(sp_mapping))
+            mapped_values = sp_mapping[init_sp_labels[valid_init_mask]]
+            # sp_mapping内の-1は未定義なので、それ以外のみ適用
+            sp_labels_full[valid_init_mask] = np.where(mapped_values >= 0, mapped_values, -1)
+        else:
+            # sp_mappingが存在しない場合（最初のクラスタリング前）はエラー
+            raise FileNotFoundError(
+                f"sp_mappingファイルが見つかりません: {sp_mapping_file}\n"
+                f"STCを使用するには、まずクラスタリングを実行してsp_mappingを生成してください。"
+            )
         
         # SPラベル、ground_mask、flowもマッピング
         sp_labels = sp_labels_full[unique_map][mask]
@@ -758,7 +878,126 @@ class KITTIstc(Dataset):
         # オリジナル座標（mask後）
         coords_original_masked = coords_original[unique_map][mask]
         
+        if return_maps:
+            return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox, unique_map, mask
         return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox
+    
+    def _accumulate_flow(self, seq: int, idx_t: int, idx_t2: int, unique_map: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """フローを累積して、時刻t → 時刻t2 へのフローを計算
+        
+        flow_est_fixed は「そのフレーム → 次のフレーム」へのフロー。
+        t → t2 へのフローは、各中間フレームで点の対応を取りながら累積する。
+        
+        具体的には、点 p_t の位置から:
+        1. p_t + flow[t] で t+1 の位置を予測
+        2. 予測位置に最も近い t+1 の点を見つける（KD-Tree）
+        3. その点のflow[t+1]を累積フローに加算
+        4. その点の位置 + flow[t+1] で t+2 の位置を予測
+        5. ... を繰り返す
+        
+        Args:
+            seq: シーケンス番号
+            idx_t: 開始フレームインデックス
+            idx_t2: 終了フレームインデックス
+            unique_map: voxel化のマッピング
+            mask: r_cropマスク
+        
+        Returns:
+            accumulated_flow: 累積フロー [N_masked, 3]
+        """
+        from scipy.spatial import cKDTree
+        
+        h5_file = self._get_h5_handle(seq)
+        
+        # 最初のフレームの座標とフローを取得
+        timestamp_t = str(idx_t).zfill(6)
+        if timestamp_t not in h5_file:
+            raise KeyError(f'タイムスタンプ {timestamp_t} がH5ファイル（seq={seq}）に存在しません')
+        
+        coords_t = h5_file[timestamp_t]['lidar'][:]  # (N, 3)
+        n_points_t = coords_t.shape[0]
+        
+        # voxel化とマスクを適用した点のインデックス（追跡対象）
+        masked_indices = unique_map[mask]
+        n_tracked = len(masked_indices)
+        
+        # 累積フロー（追跡対象点のみ）
+        accumulated_flow = np.zeros((n_tracked, 3), dtype=np.float32)
+        
+        # 現在の予測位置（追跡対象点のみ）
+        current_positions = coords_t[masked_indices].copy()
+        
+        # t から t2 への方向を決定
+        if idx_t2 > idx_t:
+            frame_range = range(idx_t, idx_t2)
+            direction = 1
+        elif idx_t2 < idx_t:
+            frame_range = range(idx_t, idx_t2, -1)
+            direction = -1
+        else:
+            # t == t2 の場合、フローはゼロ
+            return accumulated_flow
+        
+        for frame_idx in frame_range:
+            timestamp_curr = str(frame_idx).zfill(6)
+            
+            if timestamp_curr not in h5_file:
+                continue
+            
+            frame_data_curr = h5_file[timestamp_curr]
+            coords_curr = frame_data_curr['lidar'][:]  # (N_curr, 3)
+            
+            if direction > 0:
+                # 順方向: frame_idx → frame_idx+1
+                # flow_est_fixed[frame_idx] = frame_idx → frame_idx+1 へのフロー
+                if 'flow_est_fixed' in frame_data_curr:
+                    flow_to_use = frame_data_curr['flow_est_fixed'][:]
+                else:
+                    flow_to_use = np.zeros_like(coords_curr)
+                
+                # 現在の予測位置に最も近い点を見つける
+                tree = cKDTree(coords_curr)
+                distances, nearest_indices = tree.query(current_positions, k=1)
+                
+                matched_flow = flow_to_use[nearest_indices]
+                accumulated_flow += matched_flow
+                
+                # 次の位置: 対応点の位置 + フロー
+                current_positions = coords_curr[nearest_indices] + matched_flow
+            else:
+                # 逆方向: frame_idx → frame_idx-1
+                # 必要なのは frame_idx-1 → frame_idx へのフロー（反転して使う）
+                timestamp_prev = str(frame_idx - 1).zfill(6)
+                
+                if timestamp_prev not in h5_file:
+                    continue
+                
+                frame_data_prev = h5_file[timestamp_prev]
+                coords_prev = frame_data_prev['lidar'][:]  # (N_prev, 3)
+                
+                if 'flow_est_fixed' in frame_data_prev:
+                    flow_prev_to_curr = frame_data_prev['flow_est_fixed'][:]  # prev → curr へのフロー
+                else:
+                    flow_prev_to_curr = np.zeros_like(coords_prev)
+                
+                # 現在の予測位置に最も近い点をcoordsで見つける
+                tree = cKDTree(coords_curr)
+                distances, nearest_indices_curr = tree.query(current_positions, k=1)
+                
+                # その点に対応するprevフレームの点を見つける
+                # curr点の位置からprev→currフローを引いた位置がprevの点の位置に近いはず
+                # まず、curr点に最も近いprev点を見つける
+                tree_prev = cKDTree(coords_prev)
+                _, nearest_indices_prev = tree_prev.query(coords_curr[nearest_indices_curr], k=1)
+                
+                # prev→currのフローを反転してcurr→prevのフローとして使用
+                matched_flow = flow_prev_to_curr[nearest_indices_prev]
+                accumulated_flow -= matched_flow  # 反転
+                
+                # 次の位置: 対応点の位置 - フロー（prevの方向へ）
+                current_positions = coords_curr[nearest_indices_curr] - matched_flow
+        
+        return accumulated_flow
     
     def _voxelize(self, coords):
         """点群をvoxel化"""
@@ -785,62 +1024,71 @@ class KITTIstc(Dataset):
         return quantized_coords, None, None, unique_map, inverse_map
     
     def _tuple_to_sp_path(self, tup):
-        # 他クラスと同様に"_superpoint.npy"の命名規則に統一
+        """init SPラベルファイルのパス"""
         return os.path.join(self.args.sp_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_superpoint.npy')
+    
+    def _tuple_to_sp_id_path(self, tup):
+        """統合SPラベルファイルのパス（get_kittisp_featureで保存されたもの）"""
+        return os.path.join(self.args.sp_id_path, str(tup[0]).zfill(2), str(tup[1]).zfill(6) + '_sp_id.npy')
 
 
 class cfl_collate_fn_stc:
-    """STC用collate関数"""
+    """STC用collate関数
+    
+    KITTIstcが返すdictをバッチ化する。
+    coords_t/coords_t2はMinkowskiEngine用にバッチIDを付与。
+    SP対応行列などはリストのまま返す。
+    """
     
     def __call__(self, list_data):
-        (coords_t, coords_t1, coords_t_original, coords_t1_original, 
-         sp_labels_t, sp_labels_t1, pose_t, pose_t1, 
-         scene_name_t, scene_name_t1, flow_t, ground_mask_t, ground_mask_t1) = list(zip(*list_data))
-        
+        # list_dataは[{...}, {...}, ...]の形式
         coords_t_batch = []
-        coords_t1_batch = []
+        coords_t2_batch = []
+        sp_labels_t_list = []
+        sp_labels_t2_list = []
+        corr_matrix_list = []
+        unique_sp_t_list = []
+        unique_sp_t2_list = []
+        scene_name_t_list = []
+        scene_name_t2_list = []
         
-        for batch_id in range(len(coords_t)):
-            num_points_t = coords_t[batch_id].shape[0]
-            num_points_t1 = coords_t1[batch_id].shape[0]
+        for batch_id, data in enumerate(list_data):
+            coords_t = data['coords_t']
+            coords_t2 = data['coords_t2']
+            
+            num_points_t = coords_t.shape[0]
+            num_points_t2 = coords_t2.shape[0]
             
             coords_t_batch.append(
                 torch.cat((torch.ones(num_points_t, 1).int() * batch_id, 
-                          torch.from_numpy(coords_t[batch_id]).int()), 1)
+                          torch.from_numpy(coords_t).int()), 1)
             )
-            coords_t1_batch.append(
-                torch.cat((torch.ones(num_points_t1, 1).int() * batch_id, 
-                          torch.from_numpy(coords_t1[batch_id]).int()), 1)
+            coords_t2_batch.append(
+                torch.cat((torch.ones(num_points_t2, 1).int() * batch_id, 
+                          torch.from_numpy(coords_t2).int()), 1)
             )
+            
+            sp_labels_t_list.append(torch.from_numpy(data['sp_labels_t']).long())
+            sp_labels_t2_list.append(torch.from_numpy(data['sp_labels_t2']).long())
+            corr_matrix_list.append(torch.from_numpy(data['corr_matrix']).float())
+            unique_sp_t_list.append(data['unique_sp_t'])
+            unique_sp_t2_list.append(data['unique_sp_t2'])
+            scene_name_t_list.append(data['scene_name_t'])
+            scene_name_t2_list.append(data['scene_name_t2'])
         
         coords_t_batch = torch.cat(coords_t_batch, 0).float()
-        coords_t1_batch = torch.cat(coords_t1_batch, 0).float()
-        
-        # オリジナル座標、SPラベル、flowなどはリストのまま返す
-        coords_t_original = [torch.from_numpy(c).float() for c in coords_t_original]
-        coords_t1_original = [torch.from_numpy(c).float() for c in coords_t1_original]
-        sp_labels_t = [torch.from_numpy(s).long() for s in sp_labels_t]
-        sp_labels_t1 = [torch.from_numpy(s).long() for s in sp_labels_t1]
-        pose_t = [torch.from_numpy(p).float() for p in pose_t]
-        pose_t1 = [torch.from_numpy(p).float() for p in pose_t1]
-        flow_t = [torch.from_numpy(f).float() for f in flow_t]
-        ground_mask_t = [torch.from_numpy(g) for g in ground_mask_t]
-        ground_mask_t1 = [torch.from_numpy(g) for g in ground_mask_t1]
+        coords_t2_batch = torch.cat(coords_t2_batch, 0).float()
         
         return {
             'coords_t': coords_t_batch,
-            'coords_t1': coords_t1_batch,
-            'coords_t_original': coords_t_original,
-            'coords_t1_original': coords_t1_original,
-            'sp_labels_t': sp_labels_t,
-            'sp_labels_t1': sp_labels_t1,
-            'pose_t': pose_t,
-            'pose_t1': pose_t1,
-            'scene_name_t': list(scene_name_t),
-            'scene_name_t1': list(scene_name_t1),
-            'flow_t': flow_t,
-            'ground_mask_t': ground_mask_t,
-            'ground_mask_t1': ground_mask_t1
+            'coords_t2': coords_t2_batch,
+            'sp_labels_t': sp_labels_t_list,
+            'sp_labels_t2': sp_labels_t2_list,
+            'corr_matrix': corr_matrix_list,
+            'unique_sp_t': unique_sp_t_list,
+            'unique_sp_t2': unique_sp_t2_list,
+            'scene_name_t': scene_name_t_list,
+            'scene_name_t2': scene_name_t2_list
         }
 
 
