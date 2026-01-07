@@ -6,17 +6,17 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "stc_first_debug"
+name: "stc_window1"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/stc_first_debug"
+save_path: "data/users/minesawa/semantickitti/stc_window1"
 pseudo_label_path: "pseudo_label_kitti/"
 sp_id_path: "sp_id_kitti/" 
 
 # エポック設定
-max_epoch: [20, 350]  # [非成長フェーズ, 成長フェーズ]
+max_epoch: [100, 350]  # [非成長フェーズ, 成長フェーズ]
 max_iter: [10000, 30000]
 
 # モデル設定
@@ -24,7 +24,7 @@ bn_momentum: 0.02
 conv1_kernel_size: 5
 
 # 最適化設定
-lr: 0.05  # バックボーンの学習率
+lr: 0.02  # バックボーンの学習率
 weight_decay: 0.01
 accum_step: 1
 
@@ -66,13 +66,13 @@ growsp:
   c_shape: 5.0
 
 # データセット設定
-select_num: 1500
+select_num: 6000
 eval_select_num: 4071
 r_crop: 50.0
 scan_window: 1  # t1からt2を選ぶ際の最大フレーム差
 
 # 評価設定
-cluster_interval: 3
+cluster_interval: 10
 eval_interval: 10
 silhouette: false
 
@@ -97,8 +97,8 @@ debug: false
 vis: false
 vis_sp: false
 # 学習再開設定
-resume: false
-wandb_run_id: null
+resume: true
+wandb_run_id: 0sjra8qz
 
 # ===========================================
 # STC (Superpoint Time Consistency) 設定
@@ -110,25 +110,24 @@ stc:
   # VoteFlow前処理済みデータのパス（H5ファイル）
   voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
 
-  # 対応点計算
-  correspondence:
-    # 静止物体用の閾値
-    distance_threshold: 0.2  # 静止物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_per_frame: 0.05  # フレーム数に応じて追加する閾値 (meters)
+  # SPマッチング設定（Superpointレベルでの対応計算）
+  sp_matching:
+    # 各要素の重み（0にすれば無効化）
+    weight_centroid_distance: 1.0  # 重心距離（近いほど高スコア）
+    weight_spread_similarity: 1.0  # 広がり（σx, σy, σz）の類似度
+    weight_point_count_similarity: 1.0  # 点数の類似度
     
-    # 動いている物体用の閾値
-    distance_threshold_moving: 0.6  # 動いている物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_moving_per_frame: 0.2  # フレーム数に応じて追加する閾値 (meters)
-    
-    # moving判定（SPごとの平均object_flowで判定）
-    moving_flow_threshold: 0.5  # m/frame（この値以上ならmoving SPと判定）
-    
-    min_points: 5  # SPペアを有効とする最小対応点数
+    # 閾値
+    max_centroid_distance: 5.0  # これ以上離れたSPは対応候補から除外 (m)
+    min_score_threshold: 0.7  # この値以下のスコアは対応として採用しない
     min_sp_points: 10  # この点数以下のSPは対応計算から除外
-    exclude_ground: false  # 地面点を対応計算から除外
+    
+    # エゴモーション除去
     remove_ego_motion: false  # flow_est_fixedは既に時刻t+1座標系への変換を含む
+    
+    # 地面点除外
+    exclude_ground: false  # 地面点を対応計算から除外
 
   # 損失関数設定
   loss:
     temperature: 0.1  # 将来的に使う可能性
-    correspondence_ratio_weight: true  # SPの対応点割合で重み付けするかどうか

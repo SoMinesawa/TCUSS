@@ -110,25 +110,24 @@ stc:
   # VoteFlow前処理済みデータのパス（H5ファイル）
   voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
 
-  # 対応点計算
-  correspondence:
-    # 静止物体用の閾値
-    distance_threshold: 0.3  # 静止物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_per_frame: 0.1  # フレーム数に応じて追加する閾値 (meters)
+  # SPマッチング設定（Superpointレベルでの対応計算）
+  sp_matching:
+    # 各要素の重み（0にすれば無効化）
+    weight_centroid_distance: 1.0  # 重心距離（近いほど高スコア）
+    weight_spread_similarity: 0.3  # 広がり（σx, σy, σz）の類似度
+    weight_point_count_similarity: 0.2  # 点数の類似度
     
-    # 動いている物体用の閾値
-    distance_threshold_moving: 0.6  # 動いている物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_moving_per_frame: 0.2  # フレーム数に応じて追加する閾値 (meters)
-    
-    # moving判定（SPごとの平均object_flowで判定）
-    moving_flow_threshold: 0.5  # m/frame（この値以上ならmoving SPと判定）
-    
-    min_points: 5  # SPペアを有効とする最小対応点数
+    # 閾値
+    max_centroid_distance: 3.0  # これ以上離れたSPは対応候補から除外 (m)
+    min_score_threshold: 0.3  # この値以下のスコアは対応として採用しない
     min_sp_points: 10  # この点数以下のSPは対応計算から除外
-    exclude_ground: false  # 地面点を対応計算から除外
+    
+    # エゴモーション除去
     remove_ego_motion: false  # flow_est_fixedは既に時刻t+1座標系への変換を含む
+    
+    # 地面点除外
+    exclude_ground: false  # 地面点を対応計算から除外
 
   # 損失関数設定
   loss:
     temperature: 0.1  # 将来的に使う可能性
-    correspondence_ratio_weight: true  # SPの対応点割合で重み付けするかどうか

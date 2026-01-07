@@ -6,29 +6,28 @@ import yaml
 
 
 @dataclass
-class STCCorrespondenceConfig:
-    """対応点計算設定"""
-    # 静止物体用の閾値
-    distance_threshold: float = 0.3  # 静止物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_per_frame: float = 0.1  # フレーム数に応じて追加する閾値 (meters)
+class STCSPMatchingConfig:
+    """SPマッチング設定（Superpointレベルでの対応計算）"""
+    # 各要素の重み（0にすれば無効化）
+    weight_centroid_distance: float = 1.0  # 重心距離（近いほど高スコア）
+    weight_spread_similarity: float = 0.3  # 広がり（σx, σy, σz）の類似度
+    weight_point_count_similarity: float = 0.2  # 点数の類似度
     
-    # 動いている物体用の閾値
-    distance_threshold_moving: float = 0.6  # 動いている物体のベース閾値 (meters, 1フレーム時)
-    distance_threshold_moving_per_frame: float = 0.2  # フレーム数に応じて追加する閾値 (meters)
+    # 閾値
+    max_centroid_distance: float = 3.0  # これ以上離れたSPは対応候補から除外 (m)
+    min_score_threshold: float = 0.3  # この値以下のスコアは対応として採用しない
+    min_sp_points: int = 10  # この点数以下のSPは対応計算から除外
     
-    # moving判定（SPごとの平均object_flowで判定）
-    moving_flow_threshold: float = 0.1  # m/frame（この値以上ならmoving SPと判定）
+    # エゴモーション除去
+    remove_ego_motion: bool = False  # flow_est_fixedは既に時刻t+1座標系への変換を含む
     
-    min_points: int = 5
-    min_sp_points: int = 0  # この点数以下のSPは対応計算から除外（0なら除外しない）
-    exclude_ground: bool = True  # 地面点を対応計算から除外するかどうか
-    remove_ego_motion: bool = True  # エゴモーションを除去してobject_flowを使用するかどうか
+    # 地面点除外
+    exclude_ground: bool = False  # 地面点を対応計算から除外
 
 
 @dataclass
 class STCLossConfig:
     """STC損失設定"""
-    correspondence_ratio_weight: bool = True  # SPの対応点割合で重み付けするかどうか
     temperature: float = 0.1
 
 
@@ -46,7 +45,7 @@ class STCConfig:
     enabled: bool = False  # デフォルトは無効
     weight: float = 1.0
     voteflow_preprocess_path: str = "data/dataset/semantickitti/voteflow_preprocess_fixed"  # VoteFlow前処理済みH5データパス
-    correspondence: STCCorrespondenceConfig = field(default_factory=STCCorrespondenceConfig)
+    sp_matching: STCSPMatchingConfig = field(default_factory=STCSPMatchingConfig)
     loss: STCLossConfig = field(default_factory=STCLossConfig)
 
 
@@ -181,7 +180,7 @@ class TCUSSConfig:
             enabled=stc_dict.get('enabled', False),
             weight=stc_dict.get('weight', 1.0),
             voteflow_preprocess_path=stc_dict.get('voteflow_preprocess_path', 'data/dataset/semantickitti/voteflow_preprocess_fixed'),
-            correspondence=STCCorrespondenceConfig(**stc_dict.get('correspondence', {})),
+            sp_matching=STCSPMatchingConfig(**stc_dict.get('sp_matching', {})),
             loss=STCLossConfig(**stc_dict.get('loss', {}))
         )
         

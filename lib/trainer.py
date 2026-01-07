@@ -9,6 +9,8 @@ import numpy as np
 import random
 import time
 import os
+import glob
+import re
 import wandb
 import logging
 from tqdm import tqdm
@@ -24,7 +26,7 @@ from lib.utils import (
     get_pseudo_kitti, get_kittisp_feature, get_fixclassifier, get_kmeans_labels
 )
 from datasets.SemanticKITTI import generate_scene_pairs, get_unique_scene_indices
-from lib.stc_loss import compute_sp_features, loss_stc_similarity
+from lib.stc_loss import compute_sp_features, loss_stc_similarity_weighted
 from eval_SemanticKITTI import eval, eval_ddp
 import sys
 
@@ -183,73 +185,113 @@ class TCUSSTrainer:
             settings=wandb.Settings(code_dir=".")
         )
         return run
+
+    def _find_latest_checkpoint_epoch(self) -> int:
+        """save_path 内の最新 checkpoint_epoch_*.pth の epoch を返す（見つからなければ例外）"""
+        pattern = join(self.config.save_path, "checkpoint_epoch_*.pth")
+        paths = glob.glob(pattern)
+        if not paths:
+            raise FileNotFoundError(
+                f"resume=true ですがチェックポイントが見つかりません: pattern={pattern}. "
+                f"save_path={self.config.save_path}"
+            )
+        epochs: List[int] = []
+        for p in paths:
+            m = re.search(r"checkpoint_epoch_(\d+)\.pth$", os.path.basename(p))
+            if m is None:
+                continue
+            epochs.append(int(m.group(1)))
+        if not epochs:
+            raise FileNotFoundError(
+                f"checkpoint_epoch_*.pth は存在しますが epoch がパースできません: pattern={pattern}"
+            )
+        return max(epochs)
     
     def resume_from_checkpoint(self, phase: int):
         """チェックポイントから再開（DDP対応版）
         
-        全プロセスで同じresume_epochを返すように、broadcastで同期する。
+        重要:
+        - wandbのsummaryは同期遅延/未同期の可能性があるため、save_path 内の最新 checkpoint を正とする
+        - DDP時は *全プロセス* で同じチェックポイントをロードし、モデル/optimizer/scheduler状態を揃える
         """
         if not self.config.resume:
             return None
-        
-        # resume_epochを格納するテンソル（全プロセスで同期するため）
-        resume_epoch_tensor = torch.zeros(1, dtype=torch.int64, device=self.device)
-        
+
+        # まず rank0 が最新チェックポイント epoch を決め、DDP時は全rankへブロードキャスト
+        ckpt_epoch_tensor = torch.zeros(1, dtype=torch.int64, device=self.device)
         if self.is_main_process:
-            # メインプロセスのみでwandbから情報を取得
-            last_epoch = wandb.run.summary.get("epoch", 0)
-            self.resume_epoch = ((last_epoch-1) // self.config.cluster_interval) * self.config.cluster_interval + 1
-            self.logger.info(f'エポック {self.resume_epoch} から再開します')
-            resume_epoch_tensor[0] = self.resume_epoch
-            
-            # 指定されたエポックのチェックポイントを読み込む
-            checkpoint_path = join(self.config.save_path, f'checkpoint_epoch_{self.resume_epoch-1}.pth')
-            if os.path.exists(checkpoint_path):
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
-                
-                # DDPラップを解除してロード
-                model_q = self.model_q.module if self.use_ddp else self.model_q
-                
-                model_q.load_state_dict(checkpoint['model_q_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                
-                # 現在のフェーズのスケジューラー状態を読み込む
-                if f'scheduler_{phase}_state_dict' in checkpoint:
-                    self.schedulers[phase].load_state_dict(checkpoint[f'scheduler_{phase}_state_dict'])
-                
-                # 乱数状態を復元（CPUのByteTensorである必要がある）
-                if 'np_random_state' in checkpoint:
-                    np.random.set_state(checkpoint['np_random_state'])
-                if 'torch_random_state' in checkpoint:
-                    rng_state = checkpoint['torch_random_state']
-                    if isinstance(rng_state, torch.Tensor):
-                        rng_state = rng_state.cpu().to(torch.uint8)
-                    torch.set_rng_state(rng_state)
-                if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
-                    cuda_rng_state = checkpoint['torch_cuda_random_state']
-                    if isinstance(cuda_rng_state, torch.Tensor):
-                        cuda_rng_state = cuda_rng_state.cpu().to(torch.uint8)
-                    torch.cuda.set_rng_state(cuda_rng_state, device=self.local_rank)
-                
-                # early stopping状態の復元
-                if 'best_metric_score' in checkpoint:
-                    self.best_metric_score = checkpoint['best_metric_score']
-                    self.patience_counter = checkpoint['patience_counter']
-                    self.early_stopped = checkpoint['early_stopped']
-                    self.best_epoch = checkpoint['best_epoch']
-                    self.loss_history = checkpoint['loss_history']
-                    self.logger.info(f'early stopping状態を復元: best_score={self.best_metric_score:.4f}, '
-                                    f'patience={self.patience_counter}, best_epoch={self.best_epoch}')
-            else:
-                self.logger.warning(f'チェックポイントファイル {checkpoint_path} が見つかりません')
-                resume_epoch_tensor[0] = 0  # チェックポイントが見つからない場合は0
-        
-        # DDP時は全プロセスでresume_epochを同期
+            latest_epoch = self._find_latest_checkpoint_epoch()
+            ckpt_epoch_tensor[0] = latest_epoch
+            self.logger.info(
+                f"最新チェックポイント: checkpoint_epoch_{latest_epoch}.pth を使用して再開します"
+            )
         if self.use_ddp:
-            dist.broadcast(resume_epoch_tensor, src=0)
-        
-        resume_epoch = int(resume_epoch_tensor[0].item())
-        return resume_epoch if resume_epoch > 0 else None
+            dist.broadcast(ckpt_epoch_tensor, src=0)
+        latest_epoch = int(ckpt_epoch_tensor[0].item())
+
+        checkpoint_path = join(self.config.save_path, f'checkpoint_epoch_{latest_epoch}.pth')
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"resume=true ですがチェックポイントが見つかりません: {checkpoint_path}"
+            )
+
+        # DDP時も全rankでロードして状態を一致させる（rank0のみロードはNG）
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # DDPラップを解除してロード
+        model_q = self.model_q.module if self.use_ddp else self.model_q
+        model_q.load_state_dict(checkpoint['model_q_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # 現在のフェーズのスケジューラー状態を読み込む（存在しなければエラーにしないが警告）
+        sched_key = f'scheduler_{phase}_state_dict'
+        if sched_key in checkpoint:
+            self.schedulers[phase].load_state_dict(checkpoint[sched_key])
+        else:
+            if self.is_main_process:
+                self.logger.warning(
+                    f"チェックポイントに {sched_key} がありません。"
+                    "スケジューラは初期状態のまま開始されます（意図した挙動か確認してください）。"
+                )
+
+        # 乱数状態は rank0 のみ復元（チェックポイントがrank0で保存されるため）
+        if self.is_main_process:
+            if 'np_random_state' in checkpoint:
+                np.random.set_state(checkpoint['np_random_state'])
+            if 'torch_random_state' in checkpoint:
+                rng_state = checkpoint['torch_random_state']
+                if isinstance(rng_state, torch.Tensor):
+                    rng_state = rng_state.cpu().to(torch.uint8)
+                torch.set_rng_state(rng_state)
+            if torch.cuda.is_available() and 'torch_cuda_random_state' in checkpoint and checkpoint['torch_cuda_random_state'] is not None:
+                cuda_rng_state = checkpoint['torch_cuda_random_state']
+                if isinstance(cuda_rng_state, torch.Tensor):
+                    cuda_rng_state = cuda_rng_state.cpu().to(torch.uint8)
+                torch.cuda.set_rng_state(cuda_rng_state, device=self.local_rank)
+
+        # early stopping状態の復元（全rankで同じ値にしておく）
+        if 'best_metric_score' in checkpoint:
+            self.best_metric_score = checkpoint['best_metric_score']
+            self.patience_counter = checkpoint['patience_counter']
+            self.early_stopped = checkpoint['early_stopped']
+            self.best_epoch = checkpoint['best_epoch']
+            self.loss_history = checkpoint['loss_history']
+            if self.is_main_process:
+                self.logger.info(
+                    f'early stopping状態を復元: best_score={self.best_metric_score:.4f}, '
+                    f'patience={self.patience_counter}, best_epoch={self.best_epoch}'
+                )
+
+        # 再開epochは「最新チェックポイントの次」
+        self.resume_epoch = latest_epoch + 1
+        if self.is_main_process:
+            self.logger.info(f'エポック {self.resume_epoch} から再開します')
+
+        # 念のため同期
+        if self.use_ddp:
+            dist.barrier()
+
+        return self.resume_epoch
     
     def save_checkpoint(self, epoch: int, phase: int):
         """チェックポイントの保存（メインプロセスのみ）"""
@@ -396,7 +438,10 @@ class TCUSSTrainer:
             iterator = tqdm(iterator, desc=f'トレーニングエポック: {epoch}')
         
         for i in iterator:
+            import time as _time
+            _t0 = _time.time()
             data = next(dataloader_iter)
+            _t1 = _time.time()
             growsp_t1_data, growsp_t2_data, stc_data = data
             
             # 注意: BatchNormのinplace更新問題を回避するため、各損失は個別にbackwardする
@@ -407,13 +452,16 @@ class TCUSSTrainer:
             growsp_t2_loss = self.train_growsp(growsp_t2_data) / self.config.accum_step
             if growsp_t2_loss.grad_fn is not None:
                 growsp_t2_loss.backward()
+            _t2 = _time.time()
             
             if self.config.stc.enabled:
                 # STCモード（Phase 0からSTC lossを計算）
                 if stc_data is not None:
                     temporal_loss = self.train_stc(stc_data) / self.config.accum_step
+                    _t3 = _time.time()
                 else:
                     temporal_loss = torch.tensor(0.0, device=self.device)
+                    _t3 = _t2
                 temporal_weight = self.config.stc.weight
                 
                 # STC損失の個別backward
@@ -423,6 +471,7 @@ class TCUSSTrainer:
                 # GrowSPのみモード（STC無効）
                 temporal_loss = torch.tensor(0.0, device=self.device)
                 temporal_weight = 0.0
+                _t3 = _t2
             
             # 損失の表示用に加算（backwardは既に各損失で個別に実行済み）
             growsp_loss = growsp_t1_loss.item() + growsp_t2_loss.item()
@@ -461,7 +510,24 @@ class TCUSSTrainer:
         
         if self.is_main_process:
             loss_name = 'loss_stc' if self.config.stc.enabled else 'loss_temporal'
-            wandb.log({'epoch': epoch, 'loss_growsp': loss_growsp_display, loss_name: loss_temporal_display, 'train_loss': train_loss})
+            num_iters = len(train_loader)
+            if num_iters <= 0:
+                raise ValueError(f"Unexpected train_loader length: {num_iters}")
+            loss_growsp_avg = loss_growsp_display / num_iters
+            loss_temporal_avg = loss_temporal_display / num_iters
+            train_loss_avg = loss_growsp_avg + temporal_weight * loss_temporal_avg
+            wandb.log({
+                'epoch': epoch,
+                'train/iters': num_iters,
+                # 既存のメトリクス（epoch内の合計）
+                'loss_growsp': loss_growsp_display,
+                loss_name: loss_temporal_display,
+                'train_loss': train_loss,
+                # 追加メトリクス（epoch内の平均：解釈しやすい）
+                'loss_growsp_avg': loss_growsp_avg,
+                f'{loss_name}_avg': loss_temporal_avg,
+                'train_loss_avg': train_loss_avg,
+            })
         
         # vis_spモードでは1 epoch終了後に終了
         if self.config.vis_sp:
@@ -519,6 +585,13 @@ class TCUSSTrainer:
         Args:
             stc_data: STC用データ（corr_matrix, sp_labels等を含む）
         """
+        import time as _time
+        _stc_profile = getattr(self, '_stc_profile_count', 0)
+        self._stc_profile_count = _stc_profile + 1
+        _do_profile = _stc_profile < 3 and self.is_main_process
+        
+        if _do_profile: _t0 = _time.time()
+        
         coords_t = stc_data['coords_t']
         coords_t2 = stc_data['coords_t2']
         sp_labels_t_list = stc_data['sp_labels_t']  # 統合SPラベル（リスト）
@@ -538,11 +611,13 @@ class TCUSSTrainer:
         
         # 結合して1回のforward
         coords_combined = torch.cat([coords_t, coords_t2_shifted], dim=0)
+        
         in_field_combined = ME.TensorField(
             coords_combined[:, 1:] * self.config.voxel_size, 
             coords_combined, 
             device=self.local_rank
         )
+        
         feats_combined = self.model_q(in_field_combined)
         
         # 出力を分割
@@ -555,7 +630,9 @@ class TCUSSTrainer:
         total_loss = torch.tensor(0.0, device=self.device)
         valid_batch_count = 0
         
+        _loop_times = []
         for batch_idx, batch_id in enumerate(batch_ids):
+            if _do_profile: _loop_start = _time.time()
             batch_id_int = int(batch_id.item())
             
             # このバッチの特徴量を取得
@@ -603,20 +680,21 @@ class TCUSSTrainer:
                 target_sp_ids=unique_sp_t2
             )
             
-            loss = loss_stc_similarity(
+            # 新方式: corr_matrixはマッチングスコア（0〜1）を格納（未マッチは0）
+            # スコアを重みとして、重み付きコサイン類似度を最大化（=負の値を最小化）
+            loss = loss_stc_similarity_weighted(
                 sp_feats_t,
                 sp_feats_t2,
                 corr_matrix,
                 valid_mask_t,
-                valid_mask_t2,
-                min_correspondence=self.config.stc.correspondence.min_points,
-                sp_counts_t=sp_counts_t,
-                correspondence_ratio_weight=self.config.stc.loss.correspondence_ratio_weight
+                valid_mask_t2
             )
             
             if loss.grad_fn is not None:
                 total_loss = total_loss + loss
                 valid_batch_count += 1
+            
+            if _do_profile: _loop_times.append(_time.time() - _loop_start)
         
         if valid_batch_count > 0:
             total_loss = total_loss / valid_batch_count
@@ -726,17 +804,17 @@ class TCUSSTrainer:
         idx_to_sp_t1 = {i: sp for sp, i in sp_t1_to_idx.items()}
         
         # 対応するSPペアを特定
-        sp_pairs = []  # (sp_t, sp_t1, correspondence_count)
-        min_correspondence = self.config.stc.correspondence.min_points
+        # 新方式: corr_matrixはマッチングスコア（0〜1）を格納、非ゼロは有効なマッチ
+        sp_pairs = []  # (sp_t, sp_t1, score)
         
         for i in range(corr_matrix.shape[0]):
             row = corr_matrix[i]
-            if row.max() >= min_correspondence:
+            if row.max() > 0:  # スコアが0より大きければ有効なマッチ
                 j = row.argmax()
-                count = row[j]
+                score = row[j]
                 sp_t = idx_to_sp_t[i]
                 sp_t1 = idx_to_sp_t1[j]
-                sp_pairs.append((sp_t, sp_t1, count))
+                sp_pairs.append((sp_t, sp_t1, score))
         
         self.logger.info(f"  有効な対応ペア数: {len(sp_pairs)}")
         
@@ -796,7 +874,7 @@ class TCUSSTrainer:
             f.write(f"時刻t2: {len(points_t1)} 点, {len(unique_sp_t1)} SPs\n")
             f.write(f"対応行列サイズ: {corr_matrix.shape}\n")
             f.write(f"有効な対応ペア数: {len(sp_pairs)}\n")
-            f.write(f"min_correspondence設定: {min_correspondence}\n\n")
+            f.write(f"マッチング方式: SPレベル直接マッチング（1対1, Greedy）\n\n")
             f.write("=== 点の対応付け統計 ===\n")
             f.write(f"時刻t: {points_in_matched_sp_t}/{total_points_t} 点 ({ratio_t:.2f}%) が対応付けられたSPに属する\n")
             f.write(f"時刻t2: {points_in_matched_sp_t1}/{total_points_t1} 点 ({ratio_t1:.2f}%) が対応付けられたSPに属する\n")
@@ -807,9 +885,9 @@ class TCUSSTrainer:
             f.write(f"対応SP (時刻t): {filepath_t_matched}\n")
             f.write(f"対応SP (時刻t2): {filepath_t1_matched}\n\n")
             f.write("=== 全対応ペア詳細 ===\n")
-            for sp_t, sp_t1, count in sorted(sp_pairs, key=lambda x: -x[2]):
+            for sp_t, sp_t1, score in sorted(sp_pairs, key=lambda x: -x[2]):
                 color = sp_colors_t_matched.get(sp_t, (128, 128, 128))
-                f.write(f"SP_t={sp_t} <-> SP_t2={sp_t1}, count={int(count)}, color=RGB{color}\n")
+                f.write(f"SP_t={sp_t} <-> SP_t2={sp_t1}, score={score:.3f}, color=RGB{color}\n")
         
         self.logger.info(f"  統計情報保存: {stats_path}")
     

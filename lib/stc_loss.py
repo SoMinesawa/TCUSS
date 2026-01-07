@@ -21,6 +21,8 @@ def compute_sp_features(
     対応行列と整合性を取るため、target_sp_ids（フィルタリング後のSPリスト）に
     対応した特徴量のみを計算する。
     
+    ベクトル化された実装でGPU上で高速に計算。
+    
     Args:
         point_features: 点の特徴量 [N, D]
         sp_labels: 各点のSuperpointラベル [N]、-1は無効
@@ -32,7 +34,7 @@ def compute_sp_features(
         sp_counts: 各SPの点数 [M]（対応点割合の計算用）
     """
     device = point_features.device
-    D = point_features.shape[1]
+    N, D = point_features.shape
     num_sp = len(target_sp_ids)
     
     if num_sp == 0:
@@ -46,25 +48,33 @@ def compute_sp_features(
     else:
         target_sp_ids = target_sp_ids.to(device)
     
-    # SP IDからインデックスへのマッピングを作成
-    # target_sp_ids[i] -> i
-    sp_id_to_idx = {int(sp_id): i for i, sp_id in enumerate(target_sp_ids.cpu().numpy())}
+    # === ベクトル化された実装 ===
+    # SP ID -> インデックスのマッピングテーブルを作成
+    # max_sp_id + 1 サイズのテーブルを作成（メモリ効率は悪いが高速）
+    max_sp_id = max(int(target_sp_ids.max().item()), int(sp_labels.max().item())) + 1
+    sp_id_to_idx = torch.full((max_sp_id,), -1, dtype=torch.long, device=device)
+    sp_id_to_idx[target_sp_ids] = torch.arange(num_sp, device=device)
     
-    # 各SPの特徴量の合計と点数を計算
+    # 有効な点のマスク（sp_labels >= 0 かつ target_sp_idsに含まれる）
+    valid_mask = sp_labels >= 0
+    sp_labels_clamped = sp_labels.clamp(min=0)  # -1を0にクランプ（テーブル参照用）
+    point_sp_idx = sp_id_to_idx[sp_labels_clamped]  # 各点のSPインデックス（-1は無効）
+    
+    # target_sp_idsに含まれる点のみを有効とする
+    valid_mask = valid_mask & (point_sp_idx >= 0)
+    
+    # 有効な点のインデックスと対応するSPインデックス
+    valid_point_indices = torch.where(valid_mask)[0]
+    valid_sp_indices = point_sp_idx[valid_mask]
+    
+    # scatter_addで特徴量の合計を計算
     sp_features_sum = torch.zeros(num_sp, D, device=device)
+    valid_features = point_features[valid_mask]  # [K, D]
+    sp_features_sum.scatter_add_(0, valid_sp_indices.unsqueeze(-1).expand(-1, D), valid_features)
+    
+    # scatter_addでカウントを計算
     sp_counts = torch.zeros(num_sp, device=device)
-    
-    # 有効な点のみを処理
-    valid_point_mask = sp_labels >= 0
-    valid_features = point_features[valid_point_mask]
-    valid_labels = sp_labels[valid_point_mask].cpu().numpy()
-    
-    # 各点について、target_sp_idsに含まれるSPのみ集計
-    for pt_idx, sp_id in enumerate(valid_labels):
-        if sp_id in sp_id_to_idx:
-            sp_idx = sp_id_to_idx[sp_id]
-            sp_features_sum[sp_idx] += valid_features[pt_idx]
-            sp_counts[sp_idx] += 1
+    sp_counts.scatter_add_(0, valid_sp_indices, torch.ones_like(valid_sp_indices, dtype=torch.float))
     
     # 平均を計算（点がないSPはゼロベクトル）
     sp_valid_mask = sp_counts > 0
@@ -164,6 +174,53 @@ def loss_stc_similarity(
         # 負の平均類似度を損失とする（類似度を最大化したいので）
         loss = -weighted_similarity.mean()
     
+    return loss
+
+
+def loss_stc_similarity_weighted(
+    sp_features_t: torch.Tensor,
+    sp_features_t1: torch.Tensor,
+    weight_matrix: torch.Tensor,
+    valid_mask_t: Optional[torch.Tensor] = None,
+    valid_mask_t1: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    対応するSuperpointの特徴量を近づける損失（スコア行列/重み行列版）
+
+    `weight_matrix` を「対応の強さ」を表す重みとして扱い、全ペアの重み付きコサイン類似度を最大化する。
+    corr_matrix が 1対1マッチングのスコア（0〜1、未マッチは0）である場合にそのまま使える。
+
+    - 未マッチ(0)は分子/分母ともに寄与しない（=損失にも勾配にも寄与しない）
+    - valid_mask_t / valid_mask_t1 が False のSPは重みを0にして無効化
+    """
+    M, D = sp_features_t.shape
+    N = sp_features_t1.shape[0]
+    device = sp_features_t.device
+
+    if M == 0 or N == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    if valid_mask_t is None:
+        valid_mask_t = torch.ones(M, dtype=torch.bool, device=device)
+    if valid_mask_t1 is None:
+        valid_mask_t1 = torch.ones(N, dtype=torch.bool, device=device)
+
+    w = weight_matrix.to(device)
+    if w.shape != (M, N):
+        raise ValueError(f"weight_matrix shape mismatch: expected {(M, N)}, got {tuple(w.shape)}")
+
+    # 無効SPは重みを0にして除外
+    w = w * valid_mask_t.float().unsqueeze(1) * valid_mask_t1.float().unsqueeze(0)
+    total_weight = w.sum()
+    if total_weight <= 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    sp_features_t_norm = F.normalize(sp_features_t, dim=-1)
+    sp_features_t1_norm = F.normalize(sp_features_t1, dim=-1)
+    similarity = torch.mm(sp_features_t_norm, sp_features_t1_norm.t())  # [M, N]
+
+    loss = -(w * similarity).sum() / (total_weight + eps)
     return loss
 
 

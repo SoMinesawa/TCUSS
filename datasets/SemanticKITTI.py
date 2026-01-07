@@ -650,6 +650,13 @@ class KITTIstc(Dataset):
     def __init__(self, args):
         self.args = args
         
+        # scan_window = 1 の強制チェック
+        if args.scan_window != 1:
+            raise ValueError(
+                f"STC（SPレベル直接マッチング）ではscan_window=1のみサポートしています。"
+                f"現在の設定: scan_window={args.scan_window}"
+            )
+        
         self.file = []
         seq_list = np.sort(os.listdir(self.args.data_path))
         for seq_id in seq_list:
@@ -669,24 +676,20 @@ class KITTIstc(Dataset):
         # H5ファイルハンドルのキャッシュ（シーケンス番号 -> ファイルハンドル）
         self._h5_handles: Dict[int, h5py.File] = {}
         
-        # 対応点計算の設定
-        self.distance_threshold = args.stc.correspondence.distance_threshold
-        self.distance_threshold_per_frame = args.stc.correspondence.distance_threshold_per_frame
-        self.distance_threshold_moving = args.stc.correspondence.distance_threshold_moving
-        self.distance_threshold_moving_per_frame = args.stc.correspondence.distance_threshold_moving_per_frame
-        self.moving_flow_threshold = args.stc.correspondence.moving_flow_threshold
-        self.min_points = args.stc.correspondence.min_points
-        self.min_sp_points = args.stc.correspondence.min_sp_points
-        self.exclude_ground = args.stc.correspondence.exclude_ground
-        self.remove_ego_motion = args.stc.correspondence.remove_ego_motion
+        # SPマッチング設定（新方式）
+        sp_matching = args.stc.sp_matching
+        self.weight_centroid_distance = sp_matching.weight_centroid_distance
+        self.weight_spread_similarity = sp_matching.weight_spread_similarity
+        self.weight_point_count_similarity = sp_matching.weight_point_count_similarity
+        self.max_centroid_distance = sp_matching.max_centroid_distance
+        self.min_score_threshold = sp_matching.min_score_threshold
+        self.min_sp_points = sp_matching.min_sp_points
+        self.remove_ego_motion = sp_matching.remove_ego_motion
+        self.exclude_ground = sp_matching.exclude_ground
         
-        # 対応点計算関数をインポート（遅延インポート）
-        from scene_flow.correspondence import (
-            compute_point_correspondence_filtered,
-            compute_superpoint_correspondence_matrix
-        )
-        self._compute_point_correspondence = compute_point_correspondence_filtered
-        self._compute_sp_correspondence = compute_superpoint_correspondence_matrix
+        # 対応計算関数をインポート（SPレベル直接マッチング）
+        from scene_flow.correspondence import compute_superpoint_correspondence_direct
+        self._compute_sp_correspondence_direct = compute_superpoint_correspondence_direct
     
     def augs(self, coords):
         """データ拡張（KITTItrainと同様）
@@ -740,43 +743,31 @@ class KITTIstc(Dataset):
         scene_name_t2 = self._tuple_to_scene_name((seq_t2, idx_t2))
         
         # 時刻tのデータ（座標、統合SPラベル、pose、Scene Flow）
-        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t, unique_map_t, mask_t = self._get_item_one_scene(seq_t, idx_t, return_maps=True)
+        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t = self._get_item_one_scene(seq_t, idx_t)
+        
         # 時刻t2のデータ
-        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2, _, _ = self._get_item_one_scene(seq_t2, idx_t2, return_maps=True)
+        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2 = self._get_item_one_scene(seq_t2, idx_t2)
         
-        # フローを累積（t → t+n）
-        # flow_est_fixedは「そのフレーム→次のフレーム」へのフローなので、
-        # t → t+n へのフローは flow[t] + flow[t+1] + ... + flow[t+n-1] を累積する
-        accumulated_flow = self._accumulate_flow(seq_t, idx_t, idx_t2, unique_map_t, mask_t)
-        
-        # SP対応行列を計算
-        num_frames = abs(idx_t2 - idx_t)  # フレーム差（絶対値）
-        correspondence_t, _ = self._compute_point_correspondence(
+        # SP対応行列を計算（SPレベル直接マッチング）
+        # scan_window=1なので、flow_tをそのまま使用
+        corr_matrix, unique_sp_t, unique_sp_t2 = self._compute_sp_correspondence_direct(
             coords_t_original,
             coords_t2_original,
-            accumulated_flow,
+            flow_t,
             sp_labels_t,
             sp_labels_t2,
             pose_t,
             pose_t2,
             ground_mask_t,
             ground_mask_t2,
-            distance_threshold=self.distance_threshold,
-            distance_threshold_per_frame=self.distance_threshold_per_frame,
-            distance_threshold_moving=self.distance_threshold_moving,
-            distance_threshold_moving_per_frame=self.distance_threshold_moving_per_frame,
-            moving_flow_threshold=self.moving_flow_threshold,
-            num_frames=num_frames,
+            weight_centroid_distance=self.weight_centroid_distance,
+            weight_spread_similarity=self.weight_spread_similarity,
+            weight_point_count_similarity=self.weight_point_count_similarity,
+            max_centroid_distance=self.max_centroid_distance,
+            min_score_threshold=self.min_score_threshold,
+            min_sp_points=self.min_sp_points,
             remove_ego_motion=self.remove_ego_motion,
             exclude_ground=self.exclude_ground
-        )
-        
-        corr_matrix, unique_sp_t, unique_sp_t2 = self._compute_sp_correspondence(
-            correspondence_t,
-            sp_labels_t,
-            sp_labels_t2,
-            min_points=self.min_points,
-            min_sp_points=self.min_sp_points
         )
         
         # データ拡張を適用（t1とt2で別々のランダム拡張）
@@ -801,7 +792,7 @@ class KITTIstc(Dataset):
         """シーン名を生成（KITTItrainと同じフォーマット）"""
         return f'/{str(tup[0]).zfill(2)}/{str(tup[1]).zfill(6)}'
     
-    def _get_item_one_scene(self, seq: int, idx: int, return_maps: bool = False):
+    def _get_item_one_scene(self, seq: int, idx: int):
         """1シーンのデータをH5ファイルから取得
         
         統合SPラベルは、元のinit SPファイルにsp_mappingを適用して作成する。
@@ -809,7 +800,14 @@ class KITTIstc(Dataset):
         Args:
             seq: シーケンス番号
             idx: フレームインデックス
-            return_maps: True の場合、unique_map と mask も返す（フロー累積用）
+            
+        Returns:
+            coords_vox: voxel化された座標 [N, 3]
+            coords_original_masked: オリジナル座標（mask後）[N, 3]
+            sp_labels: SPラベル [N]
+            pose: ワールド姿勢行列 [4, 4]
+            flow_vox: Scene flow [N, 3]
+            ground_mask_vox: 地面マスク [N]
         """
         h5_file = self._get_h5_handle(seq)
         timestamp = str(idx).zfill(6)
@@ -878,126 +876,7 @@ class KITTIstc(Dataset):
         # オリジナル座標（mask後）
         coords_original_masked = coords_original[unique_map][mask]
         
-        if return_maps:
-            return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox, unique_map, mask
         return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox
-    
-    def _accumulate_flow(self, seq: int, idx_t: int, idx_t2: int, unique_map: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """フローを累積して、時刻t → 時刻t2 へのフローを計算
-        
-        flow_est_fixed は「そのフレーム → 次のフレーム」へのフロー。
-        t → t2 へのフローは、各中間フレームで点の対応を取りながら累積する。
-        
-        具体的には、点 p_t の位置から:
-        1. p_t + flow[t] で t+1 の位置を予測
-        2. 予測位置に最も近い t+1 の点を見つける（KD-Tree）
-        3. その点のflow[t+1]を累積フローに加算
-        4. その点の位置 + flow[t+1] で t+2 の位置を予測
-        5. ... を繰り返す
-        
-        Args:
-            seq: シーケンス番号
-            idx_t: 開始フレームインデックス
-            idx_t2: 終了フレームインデックス
-            unique_map: voxel化のマッピング
-            mask: r_cropマスク
-        
-        Returns:
-            accumulated_flow: 累積フロー [N_masked, 3]
-        """
-        from scipy.spatial import cKDTree
-        
-        h5_file = self._get_h5_handle(seq)
-        
-        # 最初のフレームの座標とフローを取得
-        timestamp_t = str(idx_t).zfill(6)
-        if timestamp_t not in h5_file:
-            raise KeyError(f'タイムスタンプ {timestamp_t} がH5ファイル（seq={seq}）に存在しません')
-        
-        coords_t = h5_file[timestamp_t]['lidar'][:]  # (N, 3)
-        n_points_t = coords_t.shape[0]
-        
-        # voxel化とマスクを適用した点のインデックス（追跡対象）
-        masked_indices = unique_map[mask]
-        n_tracked = len(masked_indices)
-        
-        # 累積フロー（追跡対象点のみ）
-        accumulated_flow = np.zeros((n_tracked, 3), dtype=np.float32)
-        
-        # 現在の予測位置（追跡対象点のみ）
-        current_positions = coords_t[masked_indices].copy()
-        
-        # t から t2 への方向を決定
-        if idx_t2 > idx_t:
-            frame_range = range(idx_t, idx_t2)
-            direction = 1
-        elif idx_t2 < idx_t:
-            frame_range = range(idx_t, idx_t2, -1)
-            direction = -1
-        else:
-            # t == t2 の場合、フローはゼロ
-            return accumulated_flow
-        
-        for frame_idx in frame_range:
-            timestamp_curr = str(frame_idx).zfill(6)
-            
-            if timestamp_curr not in h5_file:
-                continue
-            
-            frame_data_curr = h5_file[timestamp_curr]
-            coords_curr = frame_data_curr['lidar'][:]  # (N_curr, 3)
-            
-            if direction > 0:
-                # 順方向: frame_idx → frame_idx+1
-                # flow_est_fixed[frame_idx] = frame_idx → frame_idx+1 へのフロー
-                if 'flow_est_fixed' in frame_data_curr:
-                    flow_to_use = frame_data_curr['flow_est_fixed'][:]
-                else:
-                    flow_to_use = np.zeros_like(coords_curr)
-                
-                # 現在の予測位置に最も近い点を見つける
-                tree = cKDTree(coords_curr)
-                distances, nearest_indices = tree.query(current_positions, k=1)
-                
-                matched_flow = flow_to_use[nearest_indices]
-                accumulated_flow += matched_flow
-                
-                # 次の位置: 対応点の位置 + フロー
-                current_positions = coords_curr[nearest_indices] + matched_flow
-            else:
-                # 逆方向: frame_idx → frame_idx-1
-                # 必要なのは frame_idx-1 → frame_idx へのフロー（反転して使う）
-                timestamp_prev = str(frame_idx - 1).zfill(6)
-                
-                if timestamp_prev not in h5_file:
-                    continue
-                
-                frame_data_prev = h5_file[timestamp_prev]
-                coords_prev = frame_data_prev['lidar'][:]  # (N_prev, 3)
-                
-                if 'flow_est_fixed' in frame_data_prev:
-                    flow_prev_to_curr = frame_data_prev['flow_est_fixed'][:]  # prev → curr へのフロー
-                else:
-                    flow_prev_to_curr = np.zeros_like(coords_prev)
-                
-                # 現在の予測位置に最も近い点をcoordsで見つける
-                tree = cKDTree(coords_curr)
-                distances, nearest_indices_curr = tree.query(current_positions, k=1)
-                
-                # その点に対応するprevフレームの点を見つける
-                # curr点の位置からprev→currフローを引いた位置がprevの点の位置に近いはず
-                # まず、curr点に最も近いprev点を見つける
-                tree_prev = cKDTree(coords_prev)
-                _, nearest_indices_prev = tree_prev.query(coords_curr[nearest_indices_curr], k=1)
-                
-                # prev→currのフローを反転してcurr→prevのフローとして使用
-                matched_flow = flow_prev_to_curr[nearest_indices_prev]
-                accumulated_flow -= matched_flow  # 反転
-                
-                # 次の位置: 対応点の位置 - フロー（prevの方向へ）
-                current_positions = coords_curr[nearest_indices_curr] - matched_flow
-        
-        return accumulated_flow
     
     def _voxelize(self, coords):
         """点群をvoxel化"""

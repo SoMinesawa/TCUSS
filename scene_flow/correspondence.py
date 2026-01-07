@@ -1,18 +1,18 @@
 """
 対応点計算モジュール
 
-Scene flowを使って点の対応を計算するためのユーティリティ関数。
+Scene flowを使ってSuperpointの対応を計算するためのユーティリティ関数。
 VoteFlowに依存しない純粋なNumPy実装。
 
 主要な機能:
 - エゴモーション除去（object_flow計算）
-- SPに属する点のみでのマッチング
+- SPレベルでの直接マッチング（重心、広がり、点数、移動ベクトル）
 - 地面点の除外（オプション）
 """
 
 import numpy as np
 from scipy.spatial import cKDTree
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 
 
 def compute_ego_motion_flow(
@@ -344,17 +344,416 @@ def compute_superpoint_correspondence_matrix(
     return corr_matrix, unique_sp_t, unique_sp_t1
 
 
+# =============================================================================
+# SPレベルでの直接マッチング（新方式）
+# =============================================================================
+
+def compute_sp_features(
+    points: np.ndarray,
+    sp_labels: np.ndarray,
+    flow: np.ndarray,
+    ground_mask: Optional[np.ndarray] = None,
+    pose_t: Optional[np.ndarray] = None,
+    pose_t1: Optional[np.ndarray] = None,
+    min_sp_points: int = 10,
+    exclude_ground: bool = False,
+    remove_ego_motion: bool = False
+) -> Dict[int, Dict]:
+    """
+    各Superpointの特徴量を計算
+    
+    Args:
+        points: 点群座標 [N, 3]
+        sp_labels: 各点のSPラベル [N]
+        flow: Scene flow [N, 3]
+        ground_mask: 地面マスク [N]（Trueが地面）
+        pose_t: 時刻tのワールド姿勢行列 [4, 4]（エゴモーション除去用）
+        pose_t1: 時刻t+1のワールド姿勢行列 [4, 4]（エゴモーション除去用）
+        min_sp_points: この点数以下のSPは除外
+        exclude_ground: 地面点を除外するかどうか
+        remove_ego_motion: エゴモーションを除去するかどうか
+        
+    Returns:
+        sp_features: {sp_id: {'centroid': [3], 'spread': [3], 'point_count': int, 'motion': [3]}}
+    """
+    # エゴモーション除去
+    if remove_ego_motion and pose_t is not None and pose_t1 is not None:
+        object_flow = compute_object_flow(flow, points, pose_t, pose_t1)
+    else:
+        object_flow = flow
+    
+    # 有効な点のマスク（SP所属 & 地面でない）
+    valid_mask = sp_labels >= 0
+    if exclude_ground and ground_mask is not None:
+        valid_mask = valid_mask & ~ground_mask
+    
+    # 有効なユニークSPを取得
+    unique_sps = np.unique(sp_labels[valid_mask])
+    
+    sp_features = {}
+    
+    for sp_id in unique_sps:
+        # このSPに属する点のマスク
+        sp_mask = (sp_labels == sp_id) & valid_mask
+        sp_points = points[sp_mask]
+        sp_flow = object_flow[sp_mask]
+        
+        point_count = len(sp_points)
+        
+        # 点数が閾値以下のSPは除外
+        if point_count <= min_sp_points:
+            continue
+        
+        # 重心
+        centroid = sp_points.mean(axis=0)
+        
+        # 広がり（各軸の標準偏差）
+        spread = sp_points.std(axis=0)
+        
+        # 移動ベクトル（flowの平均）
+        motion = sp_flow.mean(axis=0)
+        
+        sp_features[sp_id] = {
+            'centroid': centroid,
+            'spread': spread,
+            'point_count': point_count,
+            'motion': motion
+        }
+    
+    return sp_features
+
+
+def compute_sp_matching_score_matrix(
+    sp_features_t: Dict[int, Dict],
+    sp_features_t1: Dict[int, Dict],
+    weight_centroid_distance: float = 1.0,
+    weight_spread_similarity: float = 0.3,
+    weight_point_count_similarity: float = 0.2,
+    max_centroid_distance: float = 3.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    SPの特徴量からスコア行列を計算
+    
+    Args:
+        sp_features_t: 時刻tのSP特徴量
+        sp_features_t1: 時刻t+1のSP特徴量
+        weight_centroid_distance: 重心距離の重み
+        weight_spread_similarity: 広がり類似度の重み
+        weight_point_count_similarity: 点数類似度の重み
+        max_centroid_distance: 重心距離の最大値（これ以上は対応候補から除外）
+        
+    Returns:
+        score_matrix: スコア行列 [num_sp_t, num_sp_t1]（0〜1、高いほど良いマッチ）
+        sp_ids_t: 時刻tのSP IDリスト
+        sp_ids_t1: 時刻t+1のSP IDリスト
+    """
+    sp_ids_t = np.array(list(sp_features_t.keys()))
+    sp_ids_t1 = np.array(list(sp_features_t1.keys()))
+    
+    num_sp_t = len(sp_ids_t)
+    num_sp_t1 = len(sp_ids_t1)
+    
+    if num_sp_t == 0 or num_sp_t1 == 0:
+        return np.zeros((0, 0), dtype=np.float32), sp_ids_t, sp_ids_t1
+    
+    # 特徴量を配列に展開
+    centroids_t = np.array([sp_features_t[sp_id]['centroid'] for sp_id in sp_ids_t])
+    centroids_t1 = np.array([sp_features_t1[sp_id]['centroid'] for sp_id in sp_ids_t1])
+    spreads_t = np.array([sp_features_t[sp_id]['spread'] for sp_id in sp_ids_t])
+    spreads_t1 = np.array([sp_features_t1[sp_id]['spread'] for sp_id in sp_ids_t1])
+    counts_t = np.array([sp_features_t[sp_id]['point_count'] for sp_id in sp_ids_t])
+    counts_t1 = np.array([sp_features_t1[sp_id]['point_count'] for sp_id in sp_ids_t1])
+    motions_t = np.array([sp_features_t[sp_id]['motion'] for sp_id in sp_ids_t])
+    
+    # 予測重心（重心 + 移動ベクトル）
+    predicted_centroids_t = centroids_t + motions_t  # [num_sp_t, 3]
+    
+    # スコア行列を初期化
+    score_matrix = np.zeros((num_sp_t, num_sp_t1), dtype=np.float32)
+    
+    # === 1. 重心距離スコア ===
+    # [num_sp_t, num_sp_t1]
+    centroid_distances = np.linalg.norm(
+        predicted_centroids_t[:, np.newaxis, :] - centroids_t1[np.newaxis, :, :],
+        axis=-1
+    )
+    # 距離を0〜1のスコアに変換（近いほど高い）
+    # max_centroid_distance以上は0
+    centroid_score = np.clip(1.0 - centroid_distances / max_centroid_distance, 0.0, 1.0)
+    
+    # === 2. 広がり類似度スコア ===
+    # コサイン類似度を使用
+    # spreads_t: [num_sp_t, 3], spreads_t1: [num_sp_t1, 3]
+    spread_norms_t = np.linalg.norm(spreads_t, axis=-1, keepdims=True) + 1e-8
+    spread_norms_t1 = np.linalg.norm(spreads_t1, axis=-1, keepdims=True) + 1e-8
+    spreads_t_normalized = spreads_t / spread_norms_t
+    spreads_t1_normalized = spreads_t1 / spread_norms_t1
+    
+    # コサイン類似度 [num_sp_t, num_sp_t1]
+    spread_similarity = np.dot(spreads_t_normalized, spreads_t1_normalized.T)
+    # -1〜1を0〜1に変換
+    spread_score = (spread_similarity + 1.0) / 2.0
+    
+    # === 3. 点数類似度スコア ===
+    # min/max で類似度を計算
+    counts_t_expanded = counts_t[:, np.newaxis]
+    counts_t1_expanded = counts_t1[np.newaxis, :]
+    count_min = np.minimum(counts_t_expanded, counts_t1_expanded)
+    count_max = np.maximum(counts_t_expanded, counts_t1_expanded)
+    count_score = count_min / (count_max + 1e-8)
+    
+    # === 総合スコア ===
+    total_weight = weight_centroid_distance + weight_spread_similarity + weight_point_count_similarity
+    if total_weight > 0:
+        score_matrix = (
+            weight_centroid_distance * centroid_score +
+            weight_spread_similarity * spread_score +
+            weight_point_count_similarity * count_score
+        ) / total_weight
+    
+    # max_centroid_distance以上のペアは強制的に0
+    score_matrix[centroid_distances > max_centroid_distance] = 0.0
+    
+    return score_matrix, sp_ids_t, sp_ids_t1
+
+
+def greedy_sp_matching(
+    score_matrix: np.ndarray,
+    min_score_threshold: float = 0.3
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    スコア行列からGreedyで1対1マッチングを行う
+    
+    Args:
+        score_matrix: スコア行列 [num_sp_t, num_sp_t1]
+        min_score_threshold: この値以下のスコアは対応として採用しない
+        
+    Returns:
+        matched_indices_t: マッチしたSP_tのインデックス（score_matrixの行インデックス）
+        matched_indices_t1: マッチしたSP_t1のインデックス（score_matrixの列インデックス）
+        matched_scores: 対応スコア
+    """
+    num_sp_t, num_sp_t1 = score_matrix.shape
+    
+    if num_sp_t == 0 or num_sp_t1 == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+    
+    # コピーして作業（マスク用）
+    scores = score_matrix.copy()
+    
+    matched_t = []
+    matched_t1 = []
+    matched_scores = []
+    
+    # 使用済みフラグ
+    used_t = np.zeros(num_sp_t, dtype=bool)
+    used_t1 = np.zeros(num_sp_t1, dtype=bool)
+    
+    # Greedyマッチング
+    while True:
+        # 最大スコアを見つける
+        max_score = scores.max()
+        
+        if max_score <= min_score_threshold:
+            break
+        
+        # 最大スコアの位置
+        idx = int(np.argmax(scores))
+        i, j = divmod(idx, num_sp_t1)
+        
+        # マッチを記録
+        matched_t.append(i)
+        matched_t1.append(j)
+        matched_scores.append(max_score)
+        
+        # 使用済みにする
+        used_t[i] = True
+        used_t1[j] = True
+        
+        # この行と列をマスク（-infにする）
+        scores[i, :] = -np.inf
+        scores[:, j] = -np.inf
+    
+    return (
+        np.array(matched_t, dtype=np.int64),
+        np.array(matched_t1, dtype=np.int64),
+        np.array(matched_scores, dtype=np.float32)
+    )
+
+
+def compute_superpoint_correspondence_direct(
+    points_t: np.ndarray,
+    points_t1: np.ndarray,
+    flow_t: np.ndarray,
+    sp_labels_t: np.ndarray,
+    sp_labels_t1: np.ndarray,
+    pose_t: Optional[np.ndarray] = None,
+    pose_t1: Optional[np.ndarray] = None,
+    ground_mask_t: Optional[np.ndarray] = None,
+    ground_mask_t1: Optional[np.ndarray] = None,
+    weight_centroid_distance: float = 1.0,
+    weight_spread_similarity: float = 0.3,
+    weight_point_count_similarity: float = 0.2,
+    max_centroid_distance: float = 3.0,
+    min_score_threshold: float = 0.3,
+    min_sp_points: int = 10,
+    remove_ego_motion: bool = False,
+    exclude_ground: bool = False
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    SPレベルで直接対応を計算する（新方式）
+    
+    点レベルのマッチングを行わず、SPの特徴量（重心、広がり、点数、移動ベクトル）を使って
+    Greedy 1対1マッチングを行う。
+    
+    Args:
+        points_t: 時刻tの点群 [N, 3]
+        points_t1: 時刻t+1の点群 [M, 3]
+        flow_t: 時刻tのScene flow [N, 3]
+        sp_labels_t: 時刻tの各点のSPラベル [N]
+        sp_labels_t1: 時刻t+1の各点のSPラベル [M]
+        pose_t: 時刻tのワールド姿勢行列 [4, 4]（エゴモーション除去用）
+        pose_t1: 時刻t+1のワールド姿勢行列 [4, 4]（エゴモーション除去用）
+        ground_mask_t: 時刻tの地面マスク [N]
+        ground_mask_t1: 時刻t+1の地面マスク [M]
+        weight_centroid_distance: 重心距離の重み
+        weight_spread_similarity: 広がり類似度の重み
+        weight_point_count_similarity: 点数類似度の重み
+        max_centroid_distance: 重心距離の最大値 (m)
+        min_score_threshold: 最小スコア閾値
+        min_sp_points: 最小SP点数
+        remove_ego_motion: エゴモーション除去
+        exclude_ground: 地面除外
+        
+    Returns:
+        corr_matrix: 対応行列 [num_valid_sp_t, num_valid_sp_t1]（1対1マッチ箇所が1、他は0）
+        unique_sp_t: 有効なSP IDリスト（時刻t）
+        unique_sp_t1: 有効なSP IDリスト（時刻t+1）
+    """
+    # 1. SP特徴量を計算
+    sp_features_t = compute_sp_features(
+        points_t, sp_labels_t, flow_t,
+        ground_mask_t, pose_t, pose_t1,
+        min_sp_points, exclude_ground, remove_ego_motion
+    )
+    
+    # t+1側はflowは使わない（ゼロで代用）
+    sp_features_t1 = compute_sp_features(
+        points_t1, sp_labels_t1, np.zeros_like(points_t1),
+        ground_mask_t1, None, None,
+        min_sp_points, exclude_ground, False
+    )
+    
+    if len(sp_features_t) == 0 or len(sp_features_t1) == 0:
+        return np.zeros((0, 0), dtype=np.float32), np.array([]), np.array([])
+    
+    # 2. スコア行列を計算
+    score_matrix, sp_ids_t, sp_ids_t1 = compute_sp_matching_score_matrix(
+        sp_features_t, sp_features_t1,
+        weight_centroid_distance,
+        weight_spread_similarity,
+        weight_point_count_similarity,
+        max_centroid_distance
+    )
+    
+    # 3. Greedyマッチング
+    matched_indices_t, matched_indices_t1, matched_scores = greedy_sp_matching(
+        score_matrix, min_score_threshold
+    )
+    
+    # 4. 対応行列を構築（従来のcorr_matrixと同じ形式）
+    # 1対1マッチした箇所が1（または対応スコア）、他は0
+    num_sp_t = len(sp_ids_t)
+    num_sp_t1 = len(sp_ids_t1)
+    corr_matrix = np.zeros((num_sp_t, num_sp_t1), dtype=np.float32)
+    
+    for idx_t, idx_t1, score in zip(matched_indices_t, matched_indices_t1, matched_scores):
+        # スコアを格納（後で重み付けに使える）
+        corr_matrix[idx_t, idx_t1] = score
+    
+    return corr_matrix, sp_ids_t, sp_ids_t1
+
+
 if __name__ == "__main__":
     # テスト
     import numpy as np
     
-    print("=== 基本テスト ===")
+    print("=== SPレベル直接マッチングテスト ===")
+    
+    # テストデータ: 各SPに20点ずつ割り当て（5 SP × 20点 = 100点）
+    np.random.seed(42)
+    num_sps = 5
+    points_per_sp = 20
+    
+    # 時刻tの点群を作成（SPごとにクラスタ）
+    points_t = []
+    sp_labels_t = []
+    for sp_id in range(num_sps):
+        # 各SPの重心をランダムに設定
+        centroid = np.array([sp_id * 3.0, 0.0, 0.0])  # SPごとに3m離れた位置
+        sp_points = centroid + np.random.randn(points_per_sp, 3).astype(np.float32) * 0.5
+        points_t.append(sp_points)
+        sp_labels_t.extend([sp_id] * points_per_sp)
+    
+    points_t = np.vstack(points_t).astype(np.float32)
+    sp_labels_t = np.array(sp_labels_t)
+    
+    # Scene flow: 全体を少し移動させる（例: x方向に0.5m）
+    flow_t = np.zeros_like(points_t)
+    flow_t[:, 0] = 0.5  # x方向に0.5m移動
+    
+    # 時刻t+1の点群: tの点群をflowで移動 + ノイズ
+    points_t1 = points_t + flow_t + np.random.randn(*points_t.shape).astype(np.float32) * 0.1
+    sp_labels_t1 = sp_labels_t.copy()  # 同じSPラベル（理想的なケース）
+    
+    print(f"Points t: {points_t.shape}, Points t1: {points_t1.shape}")
+    print(f"SP labels t: unique={np.unique(sp_labels_t)}")
+    
+    # SPレベル直接マッチングをテスト
+    corr_matrix, unique_sp_t, unique_sp_t1 = compute_superpoint_correspondence_direct(
+        points_t, points_t1, flow_t,
+        sp_labels_t, sp_labels_t1,
+        weight_centroid_distance=1.0,
+        weight_spread_similarity=0.3,
+        weight_point_count_similarity=0.2,
+        max_centroid_distance=3.0,
+        min_score_threshold=0.3,
+        min_sp_points=5  # テスト用に小さめ
+    )
+    
+    print(f"\n=== 結果 ===")
+    print(f"対応行列サイズ: {corr_matrix.shape}")
+    print(f"有効SP数: t={len(unique_sp_t)}, t1={len(unique_sp_t1)}")
+    print(f"マッチ数: {np.sum(corr_matrix > 0)}")
+    print(f"\n対応行列（スコア）:")
+    print(corr_matrix)
+    
+    # 対角要素が高いスコアになっているか確認（理想的には1対1で自分自身にマッチ）
+    for i in range(len(unique_sp_t)):
+        matched_j = np.argmax(corr_matrix[i])
+        if corr_matrix[i, matched_j] > 0:
+            print(f"SP_t[{unique_sp_t[i]}] -> SP_t1[{unique_sp_t1[matched_j]}] (score={corr_matrix[i, matched_j]:.3f})")
+    
+    print("\n=== SP特徴量テスト ===")
+    sp_features = compute_sp_features(
+        points_t, sp_labels_t, flow_t,
+        min_sp_points=5
+    )
+    for sp_id, features in sp_features.items():
+        print(f"SP {sp_id}:")
+        print(f"  centroid: {features['centroid']}")
+        print(f"  spread (σx, σy, σz): {features['spread']}")
+        print(f"  point_count: {features['point_count']}")
+        print(f"  motion: {features['motion']}")
+    
+    # 後方互換性テスト（旧関数）
+    print("\n=== 後方互換性テスト（旧関数） ===")
     # テストデータ
-    points_t = np.random.randn(100, 3).astype(np.float32)
-    points_t1 = points_t + np.random.randn(100, 3).astype(np.float32) * 0.1
+    points_t_old = np.random.randn(100, 3).astype(np.float32)
+    points_t1_old = points_t_old + np.random.randn(100, 3).astype(np.float32) * 0.1
     
     # ダミーフロー
-    flow = points_t1[:50] - points_t[:50]
+    flow = points_t1_old[:50] - points_t_old[:50]
     valid_indices = np.arange(50)
     
     # 対応点計算（基本版）
