@@ -1,0 +1,182 @@
+% ============================================================
+% Method section for TCUSS (English + Japanese translation).
+% ============================================================
+% ============================================================
+% TCUSS の Method 章（英語 + 日本語訳コメント）です。
+% ============================================================
+
+\section{Method}
+% 方法
+
+\subsection{Overview}
+% 概要
+We study unsupervised semantic segmentation on temporally ordered LiDAR point clouds.
+% 本研究では、時系列に並んだLiDAR点群に対する教師なしセマンティックセグメンテーションを扱う。
+Our goal is to assign a semantic class to every point without using human annotations during training.
+% 学習時に人手アノテーションを用いずに、各点へセマンティッククラスを割り当てることが目的である。
+We build on GrowSP, an unsupervised segmentation pipeline that learns point features from scratch using superpoints and clustering-based pseudo labels.
+% 私たちは、Superpointとクラスタリング由来の擬似ラベルでスクラッチから点特徴を学習する教師なし手法GrowSPをベースにする。
+TCUSS extends GrowSP to LiDAR sequences by adding a temporal regularizer that encourages feature consistency across frames.
+% TCUSSは、フレーム間の特徴の整合性を促す時間正則化項を追加することでGrowSPをLiDAR系列へ拡張する。
+Concretely, we estimate correspondences between superpoints at time \(t\) and \(t{+}\Delta\) using scene flow predicted by an existing self-supervised LiDAR scene flow model trained on driving scenes, and we pull matched superpoint features closer.
+% 具体的には、運転シーンで学習された自己教師あり（=教師なし）LiDAR scene flow推定器の予測flowを用いて時刻\(t\)と\(t{+}\Delta\)のSuperpoint対応を推定し、対応するSuperpoint特徴を近づける。
+
+\subsection{Problem Setup and Notation}
+% 問題設定と記号
+Let \(P_t = \{\mathbf{x}_i^t\}_{i=1}^{N_t}\) be a LiDAR scan at time \(t\), where \(\mathbf{x}_i^t\) is the 3D coordinate of point \(i\).
+% 時刻\(t\)のLiDARスキャンを \(P_t=\{\mathbf{x}_i^t\}_{i=1}^{N_t}\) とし、\(\mathbf{x}_i^t\) は点\(i\)の3次元座標とする。
+We use a feature extractor \(f_\theta\) to map each point to an embedding \(\mathbf{z}_i^t = f_\theta(\mathbf{x}_i^t)\) of dimension \(D\).
+% 特徴抽出器 \(f_\theta\) により各点を次元\(D\)の埋め込み \(\mathbf{z}_i^t = f_\theta(\mathbf{x}_i^t)\) に写像する。
+Each scan is partitioned into a set of superpoints \(S_t = \{s_m^t\}_{m=1}^{M_t}\), where superpoint \(s_m^t\) corresponds to an index set \(\mathcal{P}_m^t \subseteq \{1,\dots,N_t\}\).
+% 各スキャンはSuperpoint集合 \(S_t=\{s_m^t\}_{m=1}^{M_t}\) に分割され、Superpoint \(s_m^t\) は点インデックス集合 \(\mathcal{P}_m^t \subseteq \{1,\dots,N_t\}\) に対応する。
+We denote the superpoint embedding by the average of point embeddings inside it.
+% Superpoint埋め込みは、その中の点埋め込みの平均で定義する。
+
+\begin{equation}
+\mathbf{s}_m^t \;=\; \frac{1}{|\mathcal{P}_m^t|}\sum_{i \in \mathcal{P}_m^t}\mathbf{z}_i^t .
+\end{equation}
+% \(\mathbf{s}_m^t\) はSuperpoint \(m\) 内の点特徴の平均である。
+
+\subsection{Base Unsupervised Segmentation (GrowSP Summary)}
+% ベース手法（GrowSPの要約）
+GrowSP trains \(f_\theta\) from scratch by iterating between superpoint construction, clustering, and feature learning.
+% GrowSPは、Superpoint構築・クラスタリング・特徴学習を反復することで \(f_\theta\) をスクラッチから学習する。
+At each epoch, superpoints are treated as basic elements for pseudo labeling, and all superpoints across the training set are clustered into a large number of semantic primitives.
+% 各エポックでSuperpointを擬似ラベル付けの基本要素とみなし、学習データ全体のSuperpointを多数のSemantic Primitiveへクラスタリングする。
+The resulting primitive assignments provide pseudo labels for points, and \(f_\theta\) is optimized by a cross-entropy objective with a prototype-based linear classifier.
+% 得られたPrimitive割当を点の擬似ラベルとして用い、プロトタイプ線形分類器によるクロスエントロピーで \(f_\theta\) を最適化する。
+GrowSP also employs a progressive growing strategy that merges initial small superpoints into larger ones over training, which stabilizes early learning and gradually captures object-level structures.
+% GrowSPは、初期の小さなSuperpointを学習とともに徐々にマージして大きくする段階的成長戦略を用い、序盤の安定化と物体レベル構造の獲得を狙う。
+In TCUSS, we keep the GrowSP loss unchanged and only add a temporal consistency term described below.
+% TCUSSではGrowSPの損失は変更せず、以下で述べる時間整合性項のみを追加する。
+
+\subsection{Superpoint Correspondence from Scene Flow}
+% Scene flowによるSuperpoint対応推定
+Temporal consistency requires a notion of correspondence between regions across frames.
+% 時間整合性には、フレーム間で領域同士を対応付ける仕組みが必要である。
+Instead of relying on image features or tracking labels, we use scene flow vectors estimated by an existing self-supervised LiDAR scene flow method trained on driving scenes (e.g., VoteFlow).
+% 画像特徴や追跡ラベルに頼る代わりに、運転シーンで学習された既存の自己教師あり（=教師なし）LiDAR scene flow手法（例：VoteFlow）で推定したflowベクトルを用いる。
+Importantly, the scene flow estimator is trained and applied without semantic labels, so it does not inject semantic supervision into TCUSS.
+% 重要なのは、scene flow推定器はセマンティックラベル無しで学習・適用されるため、TCUSSへセマンティック教師信号を注入しない点である。
+We consider a pair of frames \((t, t{+}\Delta)\), where \(\Delta\) is a positive integer indicating the scan interval.
+% フレームペア \((t, t{+}\Delta)\) を考え、\(\Delta\) はスキャン間隔（何フレーム離れているか）を表す正の整数とする。
+We denote the per-point 3D flow vector at time \(t\) by \(\mathbf{u}_i^t\).
+% 時刻\(t\)の点ごとの3次元flowベクトルを \(\mathbf{u}_i^t\) と表す。
+The flow is assumed to map points from frame \(t\) to the coordinate system of frame \(t{+}\Delta\).
+% flowは、フレーム\(t\)の点をフレーム\(t{+}\Delta\)の座標系へ写像するものと仮定する。
+
+\noindent\textbf{Superpoint-level descriptors.}\par
+% Superpointレベルの記述子
+For each superpoint \(s_m^t\), we compute a lightweight geometric-motion descriptor from its points and flows.
+% 各Superpoint \(s_m^t\) について、その点群とflowから軽量な幾何・運動記述子を計算する。
+We use the centroid \(\mathbf{c}_m^t\), the axis-wise spread \(\boldsymbol{\sigma}_m^t\) (standard deviation), the point count \(n_m^t\), and the mean motion \(\mathbf{v}_m^t\).
+% 重心 \(\mathbf{c}_m^t\)、各軸の広がり \(\boldsymbol{\sigma}_m^t\)（標準偏差）、点数 \(n_m^t\)、平均運動 \(\mathbf{v}_m^t\) を用いる。
+
+\begin{align}
+\mathbf{c}_m^t &= \frac{1}{|\mathcal{P}_m^t|}\sum_{i\in \mathcal{P}_m^t}\mathbf{x}_i^t, \\
+\boldsymbol{\sigma}_m^t &= \mathrm{Std}\left(\{\mathbf{x}_i^t\}_{i\in \mathcal{P}_m^t}\right), \\
+n_m^t &= |\mathcal{P}_m^t|, \\
+\mathbf{v}_m^t &= \frac{1}{|\mathcal{P}_m^t|}\sum_{i\in \mathcal{P}_m^t}\mathbf{u}_i^t.
+\end{align}
+% ここで\(\mathrm{Std}(\cdot)\)は座標の各軸方向の標準偏差を返す。
+
+To predict where a superpoint moves, we use the flow-transported centroid \(\hat{\mathbf{c}}_m^{t\rightarrow t{+}\Delta} = \mathbf{c}_m^t + \mathbf{v}_m^t\).
+% Superpointの移動先予測として、flowで平行移動した重心 \(\hat{\mathbf{c}}_m^{t\rightarrow t{+}\Delta} = \mathbf{c}_m^t + \mathbf{v}_m^t\) を用いる。
+For each superpoint \(s_n^{t{+}\Delta}\), we compute the corresponding geometric descriptor \((\mathbf{c}_n^{t{+}\Delta}, \boldsymbol{\sigma}_n^{t{+}\Delta}, n_n^{t{+}\Delta})\) without using flow.
+% 各Superpoint \(s_n^{t{+}\Delta}\) については、flowを使わずに幾何記述子 \((\mathbf{c}_n^{t{+}\Delta}, \boldsymbol{\sigma}_n^{t{+}\Delta}, n_n^{t{+}\Delta})\) を計算する。
+
+\noindent\textbf{Pairwise matching score.}\par
+% ペアごとのマッチングスコア
+We define a score \(A_{m,n}\in[0,1]\) for matching \(s_m^t\) to \(s_n^{t{+}\Delta}\) using three cues: transported centroid distance, spread similarity, and point-count similarity.
+% \(s_m^t\) と \(s_n^{t{+}\Delta}\) の対応スコア \(A_{m,n}\in[0,1]\) を、(1) 予測重心距離、(2) 広がり類似度、(3) 点数類似度の3要素で定義する。
+First, we compute the transported centroid distance \(d_{m,n} = \|\hat{\mathbf{c}}_m^{t\rightarrow t{+}\Delta} - \mathbf{c}_n^{t{+}\Delta}\|_2\).
+% まず、予測重心距離 \(d_{m,n} = \|\hat{\mathbf{c}}_m^{t\rightarrow t{+}\Delta} - \mathbf{c}_n^{t{+}\Delta}\|_2\) を計算する。
+Pairs with \(d_{m,n}\) larger than a threshold \(\tau_d\) are discarded by setting their score to zero.
+% \(d_{m,n}\) が閾値\(\tau_d\)より大きいペアはスコアを0として候補から除外する。
+For the remaining pairs, we convert distance to a normalized centroid score \(a^{(c)}_{m,n} = \max(0, 1 - d_{m,n}/\tau_d)\).
+% 残ったペアについて、距離を正規化した重心スコア \(a^{(c)}_{m,n} = \max(0, 1 - d_{m,n}/\tau_d)\) に変換する。
+
+Second, we compute spread similarity by cosine similarity of axis-wise spreads and map it to \([0,1]\).
+% 次に、各軸広がりベクトルのコサイン類似度で広がり類似度を計算し、\([0,1]\)に写像する。
+We denote \(a^{(s)}_{m,n} = (\cos(\boldsymbol{\sigma}_m^t, \boldsymbol{\sigma}_n^{t{+}\Delta}) + 1)/2\).
+% \(a^{(s)}_{m,n} = (\cos(\boldsymbol{\sigma}_m^t, \boldsymbol{\sigma}_n^{t{+}\Delta}) + 1)/2\) とする。
+
+Third, we compute point-count similarity as \(a^{(n)}_{m,n} = \min(n_m^t, n_n^{t{+}\Delta}) / \max(n_m^t, n_n^{t{+}\Delta})\).
+% さらに、点数類似度を \(a^{(n)}_{m,n} = \min(n_m^t, n_n^{t{+}\Delta}) / \max(n_m^t, n_n^{t{+}\Delta})\) として計算する。
+We combine these cues with weights \((w_c, w_s, w_n)\) to form the final score.
+% これら3要素を重み \((w_c, w_s, w_n)\) で結合して最終スコアを得る。
+
+\begin{equation}
+A_{m,n} \;=\;
+\frac{w_c\,a^{(c)}_{m,n} + w_s\,a^{(s)}_{m,n} + w_n\,a^{(n)}_{m,n}}{w_c+w_s+w_n} .
+\end{equation}
+% 実装では、\(\tau_d\)超過のペアは強制的に \(A_{m,n}=0\) とする。
+
+\noindent\textbf{Greedy one-to-one matching.}\par
+% Greedyな1対1マッチング
+Given the score matrix \(A\), we compute a one-to-one superpoint correspondence by greedy assignment.
+% スコア行列 \(A\) から、Greedy割当によって1対1のSuperpoint対応を計算する。
+We repeatedly select the highest remaining score, match that pair, and remove the corresponding row and column from further consideration.
+% 残っているスコアの最大値を繰り返し選び、そのペアをマッチさせ、対応する行と列を以降の候補から除外する。
+We stop when the maximum score is below a threshold \(\tau_s\).
+% 最大スコアが閾値\(\tau_s\)を下回ったら終了する。
+The result is a sparse weight matrix \(W\in[0,1]^{M_t\times M_{t{+}\Delta}}\) where matched entries store their matching scores and unmatched entries are zero.
+% 結果として、マッチした要素にスコアを格納し未マッチを0とする疎な重み行列 \(W\in[0,1]^{M_t\times M_{t{+}\Delta}}\) を得る。
+To improve robustness, we ignore superpoints with too few points when building \(A\).
+% 頑健性のため、スコア行列 \(A\) 構築時に点数が少なすぎるSuperpointは除外する。
+
+\subsection{Superpoint Time Consistency Loss}
+% Superpoint時間整合性損失
+Using the correspondence weights \(W\), we encourage matched superpoints to have similar learned features.
+% 対応重み \(W\) を用いて、対応するSuperpointの学習特徴が似るように学習を促す。
+We compute superpoint embeddings \(\mathbf{s}_m^t\) and \(\mathbf{s}_n^{t{+}\Delta}\) by averaging point embeddings as in Eq.(1).
+% 式(1)のように点埋め込みの平均でSuperpoint埋め込み \(\mathbf{s}_m^t\)、\(\mathbf{s}_n^{t{+}\Delta}\) を計算する。
+We then maximize the weighted cosine similarity across all matched pairs.
+% その上で、マッチしたペア全体の重み付きコサイン類似度を最大化する。
+
+\begin{equation}
+\mathcal{L}_{\mathrm{stc}}
+\;=\;
+-\frac{\sum_{m=1}^{M_t}\sum_{n=1}^{M_{t{+}\Delta}} W_{m,n}\;\cos\!\left(\mathbf{s}_m^t,\mathbf{s}_n^{t{+}\Delta}\right)}
+{\sum_{m=1}^{M_t}\sum_{n=1}^{M_{t{+}\Delta}} W_{m,n} + \epsilon } .
+\end{equation}
+% \(\mathcal{L}_{\mathrm{stc}}\) は対応スコアで重み付けしたコサイン類似度の負号であり、\(\epsilon\) は0除算回避の微小値である。
+
+Pairs with \(W_{m,n}=0\) do not contribute to the loss, meaning that we only pull matched superpoints together and we do not explicitly push unmatched ones apart.
+% \(W_{m,n}=0\) のペアは損失に寄与しないため、マッチしたSuperpointだけを近づけ、未マッチを明示的に遠ざけない。
+If no correspondence is found for a training pair, we set \(\mathcal{L}_{\mathrm{stc}}=0\) for that pair.
+% ある学習ペアで対応が一つも得られない場合、そのペアの \(\mathcal{L}_{\mathrm{stc}}\) は0とする。
+This design avoids injecting noisy gradients from unreliable correspondences.
+% この設計により、信頼できない対応からノイズの勾配が入ることを避けられる。
+
+\subsection{Overall Objective and Training}
+% 全体目的関数と学習
+TCUSS optimizes GrowSP on a pair of scans \((P_t, P_{t{+}\Delta})\) and adds the temporal loss between them.
+% TCUSSはスキャンペア \((P_t, P_{t{+}\Delta})\) に対してGrowSPを最適化し、それらの間に時間損失を追加する。
+Let \(\mathcal{L}_{\mathrm{grow}}(P_t)\) denote the original GrowSP loss computed on scan \(P_t\).
+% スキャン \(P_t\) 上で計算される元のGrowSP損失を \(\mathcal{L}_{\mathrm{grow}}(P_t)\) と表す。
+Our training objective for a pair \((P_t, P_{t{+}\Delta})\) is:
+% フレームペア \((P_t, P_{t{+}\Delta})\) に対する学習目的は次の通りである。
+
+\begin{equation}
+\mathcal{L}
+\;=\;
+\mathcal{L}_{\mathrm{grow}}(P_t)
+\;+\;
+\mathcal{L}_{\mathrm{grow}}(P_{t{+}\Delta})
+\;+\;
+\lambda\,\mathcal{L}_{\mathrm{stc}}(P_t, P_{t{+}\Delta}) .
+\end{equation}
+% \(\lambda\) は時間損失の重みであり、GrowSP損失2項にSTC損失を加えた総和を最小化する。
+
+We compute \(W\) from scene flow and superpoint labels, extract point embeddings for both frames with the shared encoder \(f_\theta\), and backpropagate the combined loss to update \(\theta\).
+% scene flowとSuperpointラベルから \(W\) を計算し、共有エンコーダ \(f_\theta\) で両フレームの点埋め込みを抽出し、結合損失を逆伝播して\(\theta\)を更新する。
+All components are trained without any ground-truth semantic labels.
+% すべての構成要素は、真のセマンティックラベルを一切用いずに学習される。
+
+\noindent\textbf{Remarks.}\par
+% 補足
+The temporal module is intentionally lightweight and does not introduce additional neural networks beyond the GrowSP backbone.
+% 時間モジュールは意図的に軽量であり、GrowSPのバックボーン以外に追加のニューラルネットワークを導入しない。
+In practice, the correspondence computation can be performed outside the network forward pass and supplied as a sparse weight matrix \(W\) for efficient training.
+% 実運用上は、対応計算をネットワークのforward外で行い、疎な重み行列 \(W\) として渡すことで効率的に学習できる。
