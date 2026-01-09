@@ -53,12 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=2022, help='乱数シード')
     parser.add_argument('--voxel_size', type=float, default=0.15, help='SparseConvのボクセルサイズ')
     parser.add_argument('--input_dim', type=int, default=3, help='ネットワーク入力次元')
-    parser.add_argument('--primitive_num', type=int, default=500, help='学習に使用するプリミティブ数')
+    parser.add_argument('--primitive_num', type=int, default=128, help='学習に使用するプリミティブ数')
     parser.add_argument('--semantic_class', type=int, default=19, help='意味クラス数')
     parser.add_argument('--feats_dim', type=int, default=128, help='出力特徴次元')
     parser.add_argument('--ignore_label', type=int, default=-1, help='無効ラベル')
     parser.add_argument('--debug', action='store_true', help='デバッグモード')
     parser.add_argument('--use_best', action='store_true', help='bestモデル（best_model.pth, best_classifier.pth）を使用')
+    parser.add_argument('--epoch', type=int, help='指定したepochのみ評価 (model_<epoch>_checkpoint.pth, cls_<epoch>_checkpoint.pth)')
     return parser.parse_args()
 
 
@@ -160,14 +161,22 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
         s: IoU情報の文字列
         IoU_dict: クラスごとのIoU辞書
     """
+    # モデル/分類器のチェックポイント存在確認（フォールバックせずエラーで終了）
+    model_ckpt_path = os.path.join(args.save_path, f'model_{epoch}_checkpoint.pth')
+    cls_ckpt_path = os.path.join(args.save_path, f'cls_{epoch}_checkpoint.pth')
+    if not os.path.exists(model_ckpt_path):
+        raise FileNotFoundError(f"モデルチェックポイントが見つかりません: {model_ckpt_path}")
+    if not os.path.exists(cls_ckpt_path):
+        raise FileNotFoundError(f"分類器チェックポイントが見つかりません: {cls_ckpt_path}")
+
     # モデルを読み込み
     model = Res16FPN18(in_channels=args.input_dim, out_channels=args.feats_dim, conv1_kernel_size=args.conv1_kernel_size, config=args).cuda()
-    model.load_state_dict(torch.load(os.path.join(args.save_path, 'model_' + str(epoch) + '_checkpoint.pth')))
+    model.load_state_dict(torch.load(model_ckpt_path))
     model.eval()
 
     # 分類器を読み込み
     cls = torch.nn.Linear(args.feats_dim, args.primitive_num, bias=False).cuda()
-    cls.load_state_dict(torch.load(os.path.join(args.save_path, 'cls_' + str(epoch) + '_checkpoint.pth')))
+    cls.load_state_dict(torch.load(cls_ckpt_path))
     cls.eval()
 
     # プリミティブ中心をクラスタリング
@@ -363,9 +372,20 @@ if __name__ == '__main__':
     
     # シードを設定
     set_seed(args.seed)
-    
+
+    # オプションの整合性チェック（フォールバックせずエラーで終了）
+    if args.epoch is not None and args.epoch < 0:
+        raise ValueError(f"--epoch には0以上の整数を指定してください: {args.epoch}")
+    if args.epoch is not None and (args.use_best or args.debug):
+        raise ValueError("--epoch と --use_best/--debug は同時に指定できません")
+
+    # epoch指定がある場合はそのepochのみ評価
+    if args.epoch is not None:
+        o_Acc, m_Acc, m_IoU, s, IoU_dict = eval(args.epoch, args)
+        print('Epoch: {:02d}, oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(args.epoch, o_Acc, m_Acc, m_IoU))
+        print(s)
     # bestモデルを使用する場合
-    if args.use_best:
+    elif args.use_best:
         o_Acc, m_Acc, m_IoU, s, IoU_dict = eval_best(args)
         print('Best Model: oAcc {:.2f}  mAcc {:.2f} mIoU {:.2f}'.format(o_Acc, m_Acc, m_IoU))
         print(s)

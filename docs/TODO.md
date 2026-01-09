@@ -25,6 +25,9 @@ growsp自体の精度向上 - epoch 30とかでk = 19でSuperpoint作って良�
 
 train_SemanticKITTI.pyでは、マルチプロセスの設定をしているけど、これは確かpytorchのDataLoader内でcudaやgpuを使用したからだった気がする。今って、DataLoader内でgpuとか使うコードのまま？この設定は削除まだできない？確認して。default.yamlで実行している。
 
+## メモ
+- growsp_0107の280epochがいい感じに論文の結果っぽい
+
 ## やる実験 → unsupervised SSでSOTA。移動物体も静止物体の精度も上がっている。時系列一貫性上がっているよ。
 - 何とか高速化したい。→ superpointの位置と点の数と分散とかでマッチングとればいけそう。これってそもそもscene flow必要？まあ欲しいか。
 - Unsupersised Semantic Segmentation
@@ -48,6 +51,8 @@ train_SemanticKITTI.pyでは、マルチプロセスの設定をしているけ�
 - lossも下がっていない場合
     - cluster_intervalごとに上昇する場合
         - 学習率と各epochごとのstep数を見直す。
+
+
 
 
 AttnPnP

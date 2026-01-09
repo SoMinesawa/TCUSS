@@ -1,0 +1,33 @@
+name: tcuss_vf
+channels:
+  # CUDAツールキットは 11.8 で揃えたい（PyTorch 2.0.0 + cu118 前提）
+  - nvidia/label/cuda-11.8.0
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.8
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - tqdm
+  - h5py
+  - pyyaml
+  - scikit-learn=1.3.2
+  - hdbscan
+  - matplotlib
+  - plotly
+  - dash
+  - wandb
+  - cmake
+  - ninja
+  # PyTorch 2.0.0 で iJIT_NotifyEvent が解決できず import 失敗することがあるため固定
+  - mkl==2024.0.0
+  - pytorch::pytorch=2.0.0
+  - pytorch::torchvision
+  - pytorch::pytorch-cuda=11.8
+  # CUDA拡張(MinkowskiEngine等)をconda内のnvccでビルドしたいので、toolkitも入れる
+  - nvidia/label/cuda-11.8.0::cuda
+  - pip:
+      - open3d==0.18.0
+

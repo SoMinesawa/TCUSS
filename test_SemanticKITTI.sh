@@ -10,6 +10,7 @@ SP_PATH="data/users/minesawa/semantickitti/growsp_sp"
 DATASET_PATH="data/dataset/semantickitti/dataset/"
 DEBUG=""
 USE_BEST=""
+EPOCH=""
 
 # 使い方の表示関数
 function show_usage {
@@ -25,10 +26,12 @@ function show_usage {
     echo "  --dataset PATH    - SemanticKITTIデータセットパス (デフォルト: $DATASET_PATH)"
     echo "  --debug           - デバッグモード (最新のチェックポイントのみ評価)"
     echo "  --use_best        - bestモデル（best_model.pth, best_classifier.pth）を使用"
+    echo "  --epoch N         - 指定したepochのみ評価 (model_N_checkpoint.pth, cls_N_checkpoint.pth)"
     echo ""
     echo "例:"
     echo "  $0 data/users/minesawa/semantickitti/growsp_model_original growsp.zip --debug"
     echo "  $0 data/users/minesawa/semantickitti/growsp_model_original growsp_best.zip --use_best"
+    echo "  $0 data/users/minesawa/semantickitti/growsp_model_original growsp_epoch80.zip --epoch 80"
     exit 1
 }
 
@@ -65,6 +68,10 @@ while [ "$#" -gt 0 ]; do
             USE_BEST="--use_best"
             shift
             ;;
+        --epoch)
+            EPOCH="$2"
+            shift 2
+            ;;
         *)
             echo "エラー: 不明なオプション $1"
             show_usage
@@ -78,13 +85,33 @@ if [ ! -d "$MODEL_DIR" ]; then
     exit 1
 fi
 
+# オプションの整合性チェック（フォールバックせずエラーで終了）
+if [ -n "$DEBUG" ] && [ -n "$USE_BEST" ]; then
+    echo "エラー: --debug と --use_best は同時に指定できません"
+    exit 1
+fi
+if [ -n "$EPOCH" ] && [ -n "$DEBUG" ]; then
+    echo "エラー: --epoch と --debug は同時に指定できません"
+    exit 1
+fi
+if [ -n "$EPOCH" ] && [ -n "$USE_BEST" ]; then
+    echo "エラー: --epoch と --use_best は同時に指定できません"
+    exit 1
+fi
+if [ -n "$EPOCH" ] && ! [[ "$EPOCH" =~ ^[0-9]+$ ]]; then
+    echo "エラー: --epoch には0以上の整数を指定してください: $EPOCH"
+    exit 1
+fi
+
 echo "=========== TCUSS テスト処理開始 ==========="
 echo "モデルディレクトリ: $MODEL_DIR"
 echo "提出ファイル名: $SUBMISSION_NAME"
 echo "データパス: $DATA_PATH"
 echo "SPパス: $SP_PATH"
 echo "データセットパス: $DATASET_PATH"
-if [ -n "$DEBUG" ]; then
+if [ -n "$EPOCH" ]; then
+    echo "モード: epoch指定 (epoch=$EPOCH)"
+elif [ -n "$DEBUG" ]; then
     echo "モード: デバッグ (最新のチェックポイントのみ)"
 elif [ -n "$USE_BEST" ]; then
     echo "モード: bestモデル使用 (best_model.pth, best_classifier.pth)"
@@ -93,12 +120,19 @@ else
 fi
 echo "==========================================="
 
+# epoch指定用のオプション配列
+EPOCH_OPT=()
+if [ -n "$EPOCH" ]; then
+    EPOCH_OPT=(--epoch "$EPOCH")
+fi
+
 # 各コマンドを順番に実行
 echo "1. テスト実行: テストデータでの予測実行"
 python test_SemanticKITTI.py \
     --data_path "$DATA_PATH" \
     --sp_path "$SP_PATH" \
     --save_path "$MODEL_DIR" \
+    "${EPOCH_OPT[@]}" \
     $DEBUG \
     $USE_BEST || { echo "テスト実行に失敗しました"; exit 1; }
 

@@ -1,0 +1,133 @@
+# TCUSS Default Configuration
+# このファイルをコピーして実験ごとの設定を作成してください
+#
+# 実行前に以下の環境変数を設定してください（tcuss_vf環境使用時）:
+# export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
+
+# 基本設定
+name: "growsp_0107"
+data_path: "data/users/minesawa/semantickitti/growsp"
+sp_path: "data/users/minesawa/semantickitti/growsp_sp"
+original_data_path: "data/dataset/semantickitti/dataset/sequences"
+patchwork_path: "data/users/minesawa/semantickitti/patchwork"
+save_path: "data/users/minesawa/semantickitti/growsp_0107"
+pseudo_label_path: "pseudo_label_kitti/"
+sp_id_path: "sp_id_kitti/" 
+
+# エポック設定
+max_epoch: [100, 350]  # [非成長フェーズ, 成長フェーズ]
+max_iter: [10000, 30000]
+
+# モデル設定
+bn_momentum: 0.02
+conv1_kernel_size: 5
+
+# 最適化設定
+lr: 0.04  # バックボーンの学習率
+weight_decay: 0.01
+accum_step: 1
+
+# データロード設定
+workers: 6
+cluster_workers: 24
+eval_workers: 44  # 評価時のワーカー数（GPU boundなので多めに設定）
+batch_size: [16, 16]
+eval_batch_size: 16  # 評価時のバッチサイズ
+cluster_batch_size: 1  # クラスタリング時のバッチサイズ
+
+# DataLoader最適化
+persistent_workers: false  # false推奨
+prefetch_factor: 4  # プリフェッチ数
+
+# マルチGPU設定
+use_ddp: true  # DistributedDataParallelを使用
+ddp_backend: "nccl"  # DDPバックエンド
+
+# 実験設定
+seed: 2022
+log_interval: 1000000
+
+# モデル構成設定
+voxel_size: 0.15
+input_dim: 3
+primitive_num: 500
+semantic_class: 19
+feats_dim: 128
+ignore_label: -1
+
+# GrowSP設定
+growsp:
+  start: 80
+  end: 30
+  drop_threshold: 10
+  w_rgb: 1.0
+  c_rgb: 5.0
+  c_shape: 5.0
+
+# データセット設定
+select_num: 1500
+eval_select_num: 4071
+r_crop: 50.0
+scan_window: 12  # t1からt2を選ぶ際の最大フレーム差
+
+# 評価設定
+cluster_interval: 10
+eval_interval: 10
+silhouette: false
+
+# 詳細評価設定
+evaluation:
+  distance_evaluation: true  # 距離別評価を有効にするかどうか
+  distance_bins: [10, 20, 30, 40, 50, 60, 70, 80]  # 距離区切り（m）、10m刻み
+  moving_static_evaluation: true  # 移動物体/静止物体の分離評価を有効にするかどうか
+
+# 早期停止設定
+early_stopping:
+  enabled: false
+  patience: 3
+  min_delta: 0.15
+  metric: "val_mIoU"
+  mode: "max"
+  rel_drop_window: 15
+  overfit_drop: 0.30
+
+# デバッグ設定
+debug: false
+vis: false
+vis_sp: false
+# 学習再開設定
+resume: false
+wandb_run_id: null
+
+# ===========================================
+# STC (Superpoint Time Consistency) 設定
+# ===========================================
+stc:
+  enabled: false  # 元のTARLモードでテスト用に一時的に無効化
+  weight: 0.2  # loss_stc の重み
+
+  # VoteFlow前処理済みデータのパス（H5ファイル）
+  voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
+
+  # SPマッチング設定（Superpointレベルでの対応計算）
+  sp_matching:
+    # 各要素の重み（0にすれば無効化）
+    weight_centroid_distance: 1.0  # 重心距離（近いほど高スコア）
+    weight_spread_similarity: 0.3  # 広がり（σx, σy, σz）の類似度
+    weight_point_count_similarity: 0.2  # 点数の類似度
+    
+    # 閾値
+    max_centroid_distance: 3.0  # これ以上離れたSPは対応候補から除外 (m)
+    min_score_threshold: 0.3  # この値以下のスコアは対応として採用しない
+    min_sp_points: 10  # この点数以下のSPは対応計算から除外
+    
+    # エゴモーション除去
+    remove_ego_motion: false  # flow_est_fixedは既に時刻t+1座標系への変換を含む
+    
+    # 地面点除外
+    exclude_ground: false  # 地面点を対応計算から除外
+
+  # 損失関数設定
+  loss:
+    temperature: 0.1  # 将来的に使う可能性

@@ -18,6 +18,25 @@ TCUSSは、点群のみを入力としたUnsupervised Semantic Segmentationの�
   - 対照学習によって、時刻が近い2つの点群からそれぞれ抽出される特徴量 F^{t_1} と F^{t_2} を、同じ物体の場合のみ近づけるように特徴量抽出器を学習する
 - → GrowSPにTARLの学習機構を導入
 
+## 環境構築 (conda)
+
+`sudo`不要でセットアップできます。
+
+```bash
+cd /path/to/TCUSS
+conda env create -f environment.yml -y
+conda activate tcuss_vf
+
+# CUDA拡張(MinkowskiEngine)ビルド用（必要に応じて）
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+export LIBRARY_PATH="$CONDA_PREFIX/lib:$LIBRARY_PATH"
+export CUDA_HOME="$CONDA_PREFIX"
+export TORCH_CUDA_ARCH_LIST="8.0"  # A100の場合。環境に合わせて調整してください
+
+# MinkowskiEngine（PyPI版はtorch 2.0と非互換のためGitHub版を使用）
+pip install -U --no-cache-dir --no-deps "git+https://github.com/NVIDIA/MinkowskiEngine.git"
+```
+
 ## 使用方法
 ### train
 
