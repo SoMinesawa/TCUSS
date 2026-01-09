@@ -36,6 +36,7 @@ max_epoch:
 - 100
 - 350
 name: test_stc
+dataset: semantickitti
 original_data_path: data/dataset/semantickitti/dataset/sequences
 patchwork_path: data/users/minesawa/semantickitti/patchwork
 primitive_num: 500

@@ -176,3 +176,5 @@ cython_debug/
 tcuss.tar.gz
 /tcuss_310/
 /data
+/pseudo_label_nuscenes/
+/sp_id_nuscenes/

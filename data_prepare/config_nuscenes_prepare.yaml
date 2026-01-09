@@ -1,0 +1,76 @@
+# nuScenes -> GrowSP (PLY) preprocessing configuration
+#
+# This script converts nuScenes LIDAR_TOP point clouds to the same binary .ply schema
+# used by the current GrowSP pipeline:
+#   x y z (float32), red green blue (uint8), class (int32), remission (float32)
+#
+# NOTE:
+# - Train uses both keyframes and sweeps (20Hz sequence aligned with VoteFlow preprocess).
+# - Val/eval should use keyframes only (frames that have lidarseg labels).
+
+# nuScenes root directory (must contain samples/, sweeps/, lidarseg/, v1.0-*/ JSONs)
+dataroot: "data/dataset/nuscenes"
+
+# nuScenes metadata version directory under dataroot (contains *.json)
+version: "v1.0-trainval"
+
+# VoteFlow preprocess directory (contains index_total.pkl and scene-*.h5)
+preprocess_path: "data/dataset/nuscenes/preprocess"
+
+# Output directory for converted .ply files (20Hz). Training can downsample via config.frame_stride.
+output_path: "data/users/minesawa/nuscenes/growsp"
+
+# CPU parallelism (ProcessPoolExecutor)
+max_workers: 24
+chunksize: 32
+
+# Use only tokens included in preprocess/index_total.pkl (20Hz sequence; includes sweeps)
+use_preprocess_index: true
+
+# LIDAR sensor name (nuScenes standard)
+lidar_sensor: "LIDAR_TOP"
+
+# Intensity scaling: nuScenes intensity is uint8-like in [0, 255] in pcd.bin.
+# remission will be saved as float32 in [0, 1] via (intensity / intensity_divisor).
+intensity_divisor: 255.0
+
+# lidarseg (0..31) -> training label (0..16)
+# 0 is void/ignore. 1..16 correspond to:
+# 1 barrier, 2 bicycle, 3 bus, 4 car, 5 construction_vehicle, 6 motorcycle,
+# 7 pedestrian, 8 traffic_cone, 9 trailer, 10 truck,
+# 11 driveable_surface, 12 other_flat, 13 sidewalk, 14 terrain, 15 manmade, 16 vegetation
+label_remap:
+  0: 0   # noise
+  1: 0   # animal
+  2: 7   # human.pedestrian.adult
+  3: 7   # human.pedestrian.child
+  4: 7   # human.pedestrian.construction_worker
+  5: 0   # human.pedestrian.personal_mobility
+  6: 7   # human.pedestrian.police_officer
+  7: 0   # human.pedestrian.stroller
+  8: 0   # human.pedestrian.wheelchair
+  9: 1   # movable_object.barrier
+  10: 0  # movable_object.debris
+  11: 0  # movable_object.pushable_pullable
+  12: 8  # movable_object.trafficcone
+  13: 0  # static_object.bicycle_rack
+  14: 2  # vehicle.bicycle
+  15: 3  # vehicle.bus.bendy
+  16: 3  # vehicle.bus.rigid
+  17: 4  # vehicle.car
+  18: 5  # vehicle.construction
+  19: 0  # vehicle.emergency.ambulance
+  20: 0  # vehicle.emergency.police
+  21: 6  # vehicle.motorcycle
+  22: 9  # vehicle.trailer
+  23: 10 # vehicle.truck
+  24: 11 # flat.driveable_surface
+  25: 12 # flat.other
+  26: 13 # flat.sidewalk
+  27: 14 # flat.terrain
+  28: 15 # static.manmade
+  29: 0  # static.other
+  30: 16 # static.vegetation
+  31: 0  # vehicle.ego
+
+

@@ -1,0 +1,64 @@
+# nuScenes initial superpoint construction configuration
+#
+# This config is used by `data_prepare/initialSP_prepare_nuScenes.py`.
+# It builds init superpoints per-frame by:
+#   ground -> 1 cluster (RANSAC)
+#   non-ground -> DBSCAN or HDBSCAN clustering
+
+# Input PLY directory (produced by data_prepare_nuScenes.py)
+input_path: "data/users/minesawa/nuscenes/growsp"
+
+# Output directory for init superpoint labels (*_superpoint.npy)
+sp_path: "data/users/minesawa/nuscenes/growsp_sp"
+
+# nuScenes meta (required when ground_detection_method == 'patchwork++')
+nuscenes:
+  dataroot: "data/dataset/nuscenes"
+  version: "v1.0-trainval"
+
+# Patchwork++ ground labels (required when ground_detection_method == 'patchwork++')
+patchwork:
+  path: "data/users/minesawa/nuscenes/patchwork-plusplus"
+  ground_label: 1  # patchwork++ label value for ground (0/1 binary)
+
+# Target scenes to process:
+# - "all": process all scene-* directories under input_path
+# - "first": process only the first scene directory (sorted) for quick testing
+# - list: process only specified scenes, e.g. ["scene-0001"]
+target_scenes: "all"
+
+# Ground detection: 'ransac' or 'patchwork++'
+ground_detection_method: "ransac"
+
+# Non-ground clustering: 'dbscan' or 'hdbscan'
+clustering_method: "hdbscan"
+
+# Visualization (writes colored PLYs under sp_path/vis/)
+vis: true
+
+# Parallel workers
+max_workers: 24
+chunksize: 32
+
+# Semantic class count (for optional metrics; not used in this script)
+semantic_class: 16
+
+# RANSAC settings (required when ground_detection_method == 'ransac')
+ransac:
+  distance_threshold: 0.1
+  ransac_n: 3
+  num_iterations: 1000
+
+# DBSCAN settings (required when clustering_method == 'dbscan')
+dbscan:
+  eps: 0.2
+  min_points: 1
+
+# HDBSCAN settings (required when clustering_method == 'hdbscan')
+hdbscan:
+  min_cluster_size: 20
+  min_samples: 10
+  metric: "euclidean"
+  cluster_selection_method: "eom"
+
+

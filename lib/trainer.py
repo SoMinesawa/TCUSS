@@ -25,9 +25,7 @@ from lib.config import TCUSSConfig
 from lib.utils import (
     get_pseudo_kitti, get_kittisp_feature, get_fixclassifier, get_kmeans_labels
 )
-from datasets.SemanticKITTI import generate_scene_pairs, get_unique_scene_indices
 from lib.stc_loss import compute_sp_features, loss_stc_similarity_weighted
-from eval_SemanticKITTI import eval, eval_ddp
 import sys
 
 
@@ -107,6 +105,34 @@ class TCUSSTrainer:
         self.world_size = world_size
         self.is_main_process = is_main_process
         self.use_ddp = getattr(config, 'use_ddp', False) and world_size > 1
+        self.dataset = getattr(config, 'dataset', None)
+
+        # Dataset-specific hooks (no fallback: unsupported dataset should error)
+        if self.dataset == "semantickitti":
+            from datasets.SemanticKITTI import generate_scene_pairs as _generate_scene_pairs_kitti
+            from datasets.SemanticKITTI import get_unique_scene_indices as _get_unique_scene_indices
+            from eval_SemanticKITTI import eval_ddp as _eval_ddp
+
+            self._generate_scene_pairs = lambda select_num, scan_window, seed: _generate_scene_pairs_kitti(
+                select_num=select_num, scan_window=scan_window, seed=seed
+            )
+            self._get_unique_scene_indices = _get_unique_scene_indices
+            self._eval_ddp = _eval_ddp
+        elif self.dataset == "nuscenes":
+            from datasets.NuScenes import generate_scene_pairs as _generate_scene_pairs_nuscenes
+            from datasets.NuScenes import get_unique_scene_indices as _get_unique_scene_indices
+            from eval_nuScenes import eval_ddp as _eval_ddp
+
+            self._generate_scene_pairs = lambda select_num, scan_window, seed: _generate_scene_pairs_nuscenes(
+                self.config, select_num=select_num, scan_window=scan_window, seed=seed
+            )
+            self._get_unique_scene_indices = _get_unique_scene_indices
+            self._eval_ddp = _eval_ddp
+        else:
+            raise ValueError(
+                f"Unsupported dataset: {self.dataset}. "
+                "config.dataset must be one of: ['semantickitti', 'nuscenes']"
+            )
         
         # デバイス設定
         self.device = f"cuda:{local_rank}"
@@ -370,12 +396,12 @@ class TCUSSTrainer:
                 # シーンペアを再生成（固定シード + エポック番号で全GPUで同じ結果）
                 # これによりtrainsetとclustersetで同じシーンを使用できる
                 sync_seed = self.config.seed + epoch
-                scene_pairs, scene_idx_t1, scene_idx_t2 = generate_scene_pairs(
+                scene_pairs, scene_idx_t1, scene_idx_t2 = self._generate_scene_pairs(
                     select_num=self.config.select_num,
                     scan_window=self.config.scan_window,
-                    seed=sync_seed
+                    seed=sync_seed,
                 )
-                scene_idx_all = get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
+                scene_idx_all = self._get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
                 
                 # trainsetとclustersetに同じシーンを設定
                 train_loader.dataset.set_scene_pairs(scene_idx_t1, scene_idx_t2)
@@ -965,36 +991,53 @@ class TCUSSTrainer:
                 time.time() - time_start
             )
             
-            # トレーニング中のスーパーポイント/プリミティブ精度のチェック
-            sem_num = self.config.semantic_class
-            mask = (all_pseudo_gt != -1)
-            histogram = np.bincount(
-                sem_num * all_gt.astype(np.int32)[mask] + all_pseudo_gt.astype(np.int32)[mask], 
-                minlength=sem_num ** 2
-            ).reshape(sem_num, sem_num)
-            
-            # 全体精度の計算
-            o_Acc = histogram[range(sem_num), range(sem_num)].sum() / histogram.sum() * 100
-            
-            # IoUの計算
-            tp = np.diag(histogram)
-            fp = np.sum(histogram, 0) - tp
-            fn = np.sum(histogram, 1) - tp
-            IoUs = tp / (tp + fp + fn + 1e-8)
-            m_IoU = np.nanmean(IoUs)
-            
-            # IoUの文字列表現
-            s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
-            for IoU in IoUs:
-                s += '{:5.2f} '.format(100 * IoU)
-            
-            # 結果のログ記録
-            self.logger.info('クラスタリング結果 - エポック: {:02d}, オール精度 {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, 100 * m_IoU))
-            wandb.log({
-                'epoch': epoch, 
-                'cluster/oAcc': o_Acc, 
-                'cluster/mIoU': m_IoU
-            })
+            # nuScenesでは sweep にGTが無い（教師なし学習でGT評価が不要）ため、
+            # クラスタリング段階でのGTベース精度計算はスキップする。
+            if self.dataset != "nuscenes":
+                # トレーニング中のスーパーポイント/プリミティブ精度のチェック
+                sem_num = self.config.semantic_class
+                mask = (all_pseudo_gt != -1)
+                histogram = np.bincount(
+                    sem_num * all_gt.astype(np.int32)[mask] + all_pseudo_gt.astype(np.int32)[mask], 
+                    minlength=sem_num ** 2
+                ).reshape(sem_num, sem_num)
+                
+                if histogram.sum() == 0:
+                    raise ValueError(
+                        "クラスタリング精度計算用のGTが空です。"
+                        f"dataset={self.dataset}, epoch={epoch}。"
+                        "GTが存在するデータのみで評価するか、評価計算をスキップしてください。"
+                    )
+                
+                # 全体精度の計算
+                o_Acc = histogram[range(sem_num), range(sem_num)].sum() / histogram.sum() * 100
+                
+                # IoUの計算
+                tp = np.diag(histogram)
+                fp = np.sum(histogram, 0) - tp
+                fn = np.sum(histogram, 1) - tp
+                IoUs = tp / (tp + fp + fn + 1e-8)
+                m_IoU = np.nanmean(IoUs)
+                
+                # IoUの文字列表現
+                s = '| mIoU {:5.2f} | '.format(100 * m_IoU)
+                for IoU in IoUs:
+                    s += '{:5.2f} '.format(100 * IoU)
+                
+                # 結果のログ記録
+                self.logger.info('クラスタリング結果 - エポック: {:02d}, オール精度 {:.2f} mIoU {:.2f}'.format(epoch, o_Acc, 100 * m_IoU))
+                wandb.log({
+                    'epoch': epoch, 
+                    'cluster/oAcc': o_Acc, 
+                    'cluster/mIoU': m_IoU
+                })
+            else:
+                # nuScenes: pseudoラベル付与率のみログ
+                pseudo_ratio = float((all_pseudo != -1).sum() / all_pseudo.shape[0])
+                wandb.log({
+                    'epoch': epoch,
+                    'cluster/pseudo_ratio': pseudo_ratio
+                })
         
         # DDP時は全プロセスでバリア同期
         if self.use_ddp:
@@ -1070,7 +1113,7 @@ class TCUSSTrainer:
         
         # 評価の実行（全GPUで分散処理）
         with torch.no_grad():
-            o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics = eval_ddp(
+            o_Acc, m_Acc, m_IoU, s, IoU_dict, distance_metrics, moving_static_metrics = self._eval_ddp(
                 epoch, 
                 self.config,
                 model_q,

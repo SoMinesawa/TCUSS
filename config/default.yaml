@@ -7,6 +7,7 @@
 
 # 基本設定
 name: "growsp_sp1_6000"
+dataset: "semantickitti"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
@@ -69,6 +70,7 @@ growsp:
 select_num: 6000
 eval_select_num: 4071
 r_crop: 50.0
+frame_stride: 1
 scan_window: 12  # t1からt2を選ぶ際の最大フレーム差
 
 # 評価設定

@@ -9,11 +9,6 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from datasets.SemanticKITTI import (
-    KITTItrain, cfl_collate_fn,
-    KITTItcuss_stc, cfl_collate_fn_tcuss_stc,
-    generate_scene_pairs, get_unique_scene_indices
-)
 import logging
 
 from lib.config import TCUSSConfig
@@ -127,19 +122,60 @@ def setup_datasets(config, local_rank=0, world_size=1):
     
     use_ddp = getattr(config, 'use_ddp', False) and world_size > 1
 
-    # シーンペアを生成（全GPUで同じ結果を得るため、固定シードを使用）
-    # これによりtrainsetとclustersetで同じシーンを使用できる
-    scene_pairs, scene_idx_t1, scene_idx_t2 = generate_scene_pairs(
-        select_num=config.select_num,
-        scan_window=config.scan_window,
-        seed=config.seed
-    )
-    scene_idx_all = get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
+    dataset = getattr(config, "dataset", None)
+    if dataset == "semantickitti":
+        from datasets.SemanticKITTI import (
+            KITTItrain,
+            cfl_collate_fn,
+            KITTItcuss_stc,
+            cfl_collate_fn_tcuss_stc,
+            generate_scene_pairs,
+            get_unique_scene_indices,
+        )
 
-    # トレーニングデータセット
-    trainset = KITTItcuss_stc(config)
-    trainset.set_scene_pairs(scene_idx_t1, scene_idx_t2)
-    collate_fn = cfl_collate_fn_tcuss_stc()
+        scene_pairs, scene_idx_t1, scene_idx_t2 = generate_scene_pairs(
+            select_num=config.select_num,
+            scan_window=config.scan_window,
+            seed=config.seed,
+        )
+        scene_idx_all = get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
+
+        trainset = KITTItcuss_stc(config)
+        trainset.set_scene_pairs(scene_idx_t1, scene_idx_t2)
+        collate_fn = cfl_collate_fn_tcuss_stc()
+
+        clusterset = KITTItrain(config, scene_idx_all, "train")
+        cluster_collate_fn = cfl_collate_fn()
+
+    elif dataset == "nuscenes":
+        from datasets.NuScenes import (
+            NuScenesTrain,
+            cfl_collate_fn,
+            NuScenestcuss,
+            cfl_collate_fn_tcuss,
+            generate_scene_pairs,
+            get_unique_scene_indices,
+        )
+
+        scene_pairs, scene_idx_t1, scene_idx_t2 = generate_scene_pairs(
+            config,
+            select_num=config.select_num,
+            scan_window=config.scan_window,
+            seed=config.seed,
+        )
+        scene_idx_all = get_unique_scene_indices(scene_idx_t1, scene_idx_t2)
+
+        trainset = NuScenestcuss(config)
+        trainset.set_scene_pairs(scene_idx_t1, scene_idx_t2)
+        collate_fn = cfl_collate_fn_tcuss()
+
+        clusterset = NuScenesTrain(config, scene_idx_all, "train")
+        cluster_collate_fn = cfl_collate_fn()
+
+    else:
+        raise ValueError(
+            f"Unsupported dataset: {dataset}. config.dataset must be one of: ['semantickitti', 'nuscenes']"
+        )
     
     # DDP用のDistributedSampler
     train_sampler = None
@@ -166,12 +202,11 @@ def setup_datasets(config, local_rank=0, world_size=1):
     # 重要: persistent_workers=False にする必要がある
     cluster_prefetch = prefetch_factor if cluster_workers > 0 else None
     
-    clusterset = KITTItrain(config, scene_idx_all, 'train')
     cluster_batch_size = getattr(config, 'cluster_batch_size', 16)
     cluster_loader = DataLoader(
         clusterset, 
         batch_size=cluster_batch_size, 
-        collate_fn=cfl_collate_fn(), 
+        collate_fn=cluster_collate_fn, 
         num_workers=cluster_workers, 
         pin_memory=True,
         persistent_workers=False,  # データセット更新のためFalse必須

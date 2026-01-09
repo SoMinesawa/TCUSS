@@ -247,11 +247,13 @@ def get_pseudo_kitti(args, context, cluster_pred, all_sub_cluster=None):
         new_region = np.unique(sub_cluster_pred)
         region_num += len(new_region[new_region != -1])
 
-        pseudo_label_folder = args.pseudo_label_path + '/' + scene_name[0:3]
+        # scene_name: '/00/000000' (SemanticKITTI) or '/scene-0001/000123' (nuScenes)
+        scene_dir = scene_name.strip('/').split('/')[0]
+        pseudo_label_folder = os.path.join(args.pseudo_label_path, scene_dir)
         if not os.path.exists(pseudo_label_folder):
             os.makedirs(pseudo_label_folder)
 
-        pseudo_label_file = args.pseudo_label_path + '/' + scene_name + '.npy'
+        pseudo_label_file = os.path.join(args.pseudo_label_path, scene_name.lstrip('/') + '.npy')
         np.save(pseudo_label_file, pseudo)
 
         all_gt.append(labels)
