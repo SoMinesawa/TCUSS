@@ -1,0 +1,124 @@
+% ============================================================
+% Experiments section for TCUSS (English + Japanese translation).
+% Each English sentence is followed by a Japanese translation as a LaTeX comment.
+% ============================================================
+
+\section{Experiments}
+% 実験
+
+\subsection{Datasets}
+% データセット
+
+We primarily evaluate TCUSS on SemanticKITTI, a LiDAR semantic segmentation benchmark for driving scenes.
+% 本研究では主に、運転シーンのLiDARセマンティックセグメンテーションベンチマークであるSemanticKITTI上でTCUSSを評価する。
+Following the standard split used in GrowSP, we train on sequences 00--07, 09, and 10, and evaluate on sequence 08.
+% GrowSPで用いられる標準的な分割に従い、学習にはsequences 00--07, 09, 10を用い、評価にはsequence 08を用いる。
+We use the 19-class setting and use ground-truth semantic labels only for evaluation.
+% 19クラス設定を用い、GTセマンティックラベルは評価のみに使用する。
+
+\noindent\textbf{nuScenes LiDARSeg (planned).}
+% nuScenes LiDARSeg（追加予定）
+
+We also plan to include nuScenes LiDAR semantic segmentation in our benchmark suite.
+% ベンチマークの対象として、nuScenesのLiDARセマンティックセグメンテーションも追加する予定である。
+At the time of writing, the nuScenes implementation and experiments are ongoing, and quantitative results will be reported in a future revision.
+% 本稿執筆時点では、nuScenes対応の実装および実験は進行中であり、定量結果は今後の改訂で報告する。
+
+\subsection{Pre-processing and Initial Superpoints}
+% 前処理と初期Superpoint
+
+We voxelize point clouds with voxel size \(0.15\)~m and crop points within a \(50\)~m radius around the sensor.
+% 点群はボクセルサイズ\(0.15\)mでボクセル化し、センサー周り半径\(50\)m以内の点を使用する。
+Initial superpoints are precomputed per scan and are used to bootstrap the GrowSP-style progressive superpoint growing.
+% 初期Superpointは各スキャンごとに事前計算し、GrowSP型の段階的Superpoint成長の初期化に用いる。
+For ground separation, we fit a ground plane by RANSAC and assign all ground points to a single superpoint.
+% 地面分離ではRANSACにより地面平面を推定し、地面点を単一のSuperpointに割り当てる。
+Non-ground points are clustered by HDBSCAN to form the remaining initial superpoints.
+% 非地面点はHDBSCANでクラスタリングし、残りの初期Superpointを構成する。
+
+\subsection{Implementation Details}
+% 実装詳細
+
+Unless otherwise stated, we use the same training and evaluation pipeline as GrowSP, with an additional temporal consistency loss for TCUSS.
+% 特に断りがない限り、GrowSPと同一の学習・評価パイプラインを用い、TCUSSでは追加で時間整合性損失を導入する。
+We use a MinkowskiEngine-based sparse 3D convolutional network (Res16FPN18) as the feature extractor and use only 3D coordinates as input features.
+% 特徴抽出器としてMinkowskiEngineによる疎3D畳み込みネットワーク（Res16FPN18）を用い、入力特徴は3次元座標のみを使用する。
+We set the embedding dimension to \(128\) and the number of semantic primitives to \(128\).
+% 埋め込み次元は\(128\)、Semantic Primitive数は\(128\)に設定する。
+We use AdamW with learning rate \(0.02\) and weight decay \(0.01\), and use a OneCycle learning-rate schedule.
+% 最適化にはAdamW（学習率\(0.02\)、weight decay \(0.01\)）を用い、学習率スケジュールはOneCycleを使用する。
+
+\noindent\textbf{Temporal consistency (TCUSS).}
+% 時間整合性（TCUSS）
+
+We enable the superpoint time-consistency loss and set its weight to \(\lambda=0.5\).
+% Superpoint時間整合性損失を有効化し、その重みを\(\lambda=0.5\)に設定する。
+We compute superpoint correspondences from preprocessed scene flow predictions using a lightweight superpoint-level matching scheme.
+% 事前計算済みのscene flow予測から、軽量なSuperpointレベルのマッチングによりSuperpoint対応を計算する。
+This temporal regularizer is used only during training.
+% この時間正則化項は学習時にのみ使用する。
+At inference time, TCUSS uses the same pipeline as GrowSP (feature extraction and prototype assignment), so the inference-time cost is unchanged.
+% 推論時にはTCUSSはGrowSPと同一の手順（特徴抽出とプロトタイプ割当）を用いるため、推論計算量はGrowSPから増加しない。
+
+\subsection{Training Resources}
+% 学習リソース
+
+All SemanticKITTI experiments are run on 8\(\times\) NVIDIA RTX 3090 GPUs and take approximately 50 hours per full training run.
+% SemanticKITTI実験はNVIDIA RTX 3090を8枚用いて実行し、完全な学習1回あたりおよそ50時間を要する。
+
+\subsection{Evaluation Protocol}
+% 評価手順
+
+We follow the evaluation protocol of GrowSP.
+% 評価手順はGrowSPに準拠する。
+Specifically, we cluster semantic primitives into the target number of semantic classes by k-means to obtain class prototypes, and assign each point to its nearest prototype in the learned feature space.
+% 具体的には、Semantic Primitiveをk-meansで目標のセマンティッククラス数へクラスタリングしてクラスプロトタイプを得て、学習特徴空間で最も近いプロトタイプへ各点を割り当てる。
+Since training is unsupervised, we use Hungarian matching between predicted clusters and ground-truth classes for reporting OA, mAcc, and mIoU.
+% 教師なし学習であるため、OA・mAcc・mIoUの算出時には、予測クラスタとGTクラスの対応付けにハンガリアンマッチングを用いる。
+To reduce noise from individual checkpoints, we aggregate results over multiple evaluation epochs and report mean \(\pm\) standard deviation.
+% 単一チェックポイント由来のばらつきを抑えるため、複数エポックでの評価結果を集計し、平均\(\pm\)標準偏差として報告する。
+
+\subsection{Quantitative Results}
+% 定量結果
+
+We summarize the quantitative results on SemanticKITTI in Tables~\ref{tab:semkitti-main} and~\ref{tab:semkitti-perclass}.
+% SemanticKITTIにおける定量結果を表\ref{tab:semkitti-main}および表\ref{tab:semkitti-perclass}にまとめる。
+
+\begin{table}[tb]
+  \centering
+  \caption{Overall results on SemanticKITTI validation sequence 08.}
+  % SemanticKITTI（検証シーケンス08）における全体結果。
+  \label{tab:semkitti-main}
+  \begin{tabular}{cccc}
+    \hline
+    Method & OA(\%)↑ & mAcc(\%)↑ & mIoU(\%)↑\\
+    \hline
+    KMeans~\cite{Zhang2023GrowSP} & 8.1$\pm$0.0 & 8.2$\pm$0.1 & 2.4$\pm$0.0\\
+    DBSCAN~\cite{Liu_2024_WACV} & 17.8 & 7.5 & 6.8\\
+    GrowSP$^{*}$ & 38.3$\pm$1.0 & 19.7$\pm$0.6 & 13.2$\pm$0.1\\
+    GrowSP$^{\dagger}$ & 40.9$\pm$0.9 & 19.1$\pm$0.4 & 12.5$\pm$0.2\\
+    GrowSP$^{\ddagger}$ & 44.0$\pm$1.8 & 18.6$\pm$0.5 & 13.5$\pm$0.4\\
+    U3DS$^3$~\cite{Liu_2024_WACV} & 34.8 & \textbf{23.1} & 14.2\\
+    He et al.~\cite{He2025SSRN} & 53.9 & 22.9 & 14.8\\
+    \textbf{TCUSS (ours)} & \textbf{52.8}$\pm$1.3 & 22.2$\pm$1.5 & \textbf{15.1}$\pm$0.9\\
+    \hline
+  \end{tabular}
+\end{table}
+
+\begin{table*}[t]
+  \centering
+  \caption{Per-class IoU (\%) on SemanticKITTI validation sequence 08.}
+  % SemanticKITTI（検証シーケンス08）におけるクラス別IoU（\%）。
+  \label{tab:semkitti-perclass}
+  \resizebox{\textwidth}{!}{%
+    \begin{tabular}{c|ccccccccccccccccccc|cc}
+      \hline
+      Method & \rotatebox{90}{car} & \rotatebox{90}{bicycle} & \rotatebox{90}{motorcycle} & \rotatebox{90}{truck} & \rotatebox{90}{o.-veh.} & \rotatebox{90}{person} & \rotatebox{90}{bicyclist} & \rotatebox{90}{motorcyclist} & \rotatebox{90}{road} & \rotatebox{90}{parking} & \rotatebox{90}{sidewalk} & \rotatebox{90}{o.-ground} & \rotatebox{90}{building} & \rotatebox{90}{fence} & \rotatebox{90}{vegetation} & \rotatebox{90}{trunk} & \rotatebox{90}{terrain} & \rotatebox{90}{pole} & \rotatebox{90}{t.-sign} & \rotatebox{90}{mIoU (\% ↑)} & \rotatebox{90}{mAcc (\% ↑)} \\
+      \hline
+      GrowSP$^{*}$   & \textbf{81.9} & 0.1 & \textbf{0.5} & \textbf{0.2} & 1.0 & \textbf{0.3} & 0.0 & 0.0 & 25.0 & 0.0 & \textbf{17.4} & 0.5 & 64.6 & 1.4 & 29.4 & \textbf{26.6} & \textbf{22.4} & 0.3 & 0.5 & 14.3 & -- \\
+      GrowSP$^{\ddagger}$ & 67.6 & 0.0 & 0.0 & 0.0 & 1.4 & 0.0 & \textbf{0.3} & 0.0 & 36.3 & 0.1 & 5.7 & 0.1 & 68.3 & \textbf{9.2} & 35.3 & 19.1 & 19.7 & \textbf{2.3} & \textbf{0.8} & 14.0 & 49.1 \\
+      \textbf{TCUSS} & 78.0 & \textbf{0.3} & 0.4 & 0.1 & \textbf{1.6} & \textbf{0.3} & 0.0 & 0.0 & \textbf{56.1} & \textbf{0.6} & 13.5 & \textbf{0.9} & \textbf{69.4} & 0.9 & \textbf{54.6} & 23.6 & 4.2 & 0.3 & 0.0 & \textbf{16.0} & \textbf{60.7} \\
+      \hline
+    \end{tabular}
+  }%
+\end{table*}

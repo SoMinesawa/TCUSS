@@ -1,13 +1,15 @@
 import os
 import random
+from collections import OrderedDict
 from functools import lru_cache
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, List, Tuple, Optional, Set, cast
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import MinkowskiEngine as ME
 import open3d as o3d
+import h5py
 
 from lib.helper_ply import read_ply
 from lib.aug_tools import rota_coords, scale_coords, trans_coords
@@ -315,7 +317,7 @@ class NuScenesTrain(Dataset):
 
     def __getitem__(self, index):
         file = self.file_selected[index]
-        data = read_ply(file)
+        data = cast(Any, read_ply(file))
         coords = np.array([data["x"], data["y"], data["z"]], dtype=np.float32).T
         feats = np.array(data["remission"], dtype=np.float32)[:, np.newaxis]
         labels = np.array(data["class"], dtype=np.int32)
@@ -340,7 +342,7 @@ class NuScenesTrain(Dataset):
 
         # Mixup (same as KITTItrain)
         mix = random.randint(0, len(self.name) - 1)
-        data_mix = read_ply(self.file_selected[mix])
+        data_mix = cast(Any, read_ply(self.file_selected[mix]))
         coords_mix = np.array([data_mix["x"], data_mix["y"], data_mix["z"]], dtype=np.float32).T
         feats_mix = np.array(data_mix["remission"], dtype=np.float32)[:, np.newaxis]
         labels_mix = np.array(data_mix["class"], dtype=np.int32)
@@ -355,6 +357,8 @@ class NuScenesTrain(Dataset):
         coords = np.concatenate((coords, coords_mix), axis=0)
 
         coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
+        if labels is None:
+            raise RuntimeError("NuScenesTrain.augment_coords_to_feats returned labels=None (unexpected)")
 
         # label: 0..16 -> -1..15
         labels = labels.astype(np.int32) - 1
@@ -443,7 +447,7 @@ class NuScenesVal(Dataset):
 
     def __getitem__(self, index):
         file = self.file[index]
-        data = read_ply(file)
+        data = cast(Any, read_ply(file))
         coords = np.array([data["x"], data["y"], data["z"]], dtype=np.float32).T
         feats = np.array(data["remission"], dtype=np.float32)[:, np.newaxis]
         labels = np.array(data["class"], dtype=np.int32)  # (N,) original points
@@ -498,14 +502,447 @@ class cfl_collate_fn_val:
         return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch, original_coords_batch
 
 
+class NuScenesstc(Dataset):
+    """STC (Superpoint Time Consistency) 学習用データセット（nuScenes版）
+
+    - VoteFlow preprocess の H5（`stc.voteflow_preprocess_path/scene-xxxx.h5`）から
+      `lidar/pose/ground_mask/flow_est` を読み込む
+    - GrowSP の init superpoint（`sp_path`）と、クラスタリング時に生成された
+      `sp_id_path/*_sp_mapping.npy` を用いて「統合SPラベル」を構築する
+    - `scene_flow.correspondence.compute_superpoint_correspondence_direct` により
+      SP対応行列（スコア行列）を計算して返す
+
+    重要:
+    - 現状のnuScenes preprocessの `flow_est` は「10Hz相当（1scan飛ばし）」として生成されている前提。
+      そのため stc では `scan_window=1`（隣接ペア）を前提とし、それ以外はエラーとする。
+    """
+
+    def __init__(self, args):
+        self.args = args
+
+        # STCは隣接ペアのみ（flow_estが10Hz相当のため）
+        if int(args.scan_window) != 1:
+            raise ValueError(
+                "nuScenesのSTCでは scan_window=1 のみサポートしています。"
+                f"現在の設定: scan_window={args.scan_window}"
+            )
+
+        # nuScenesのflow_estは「1scan飛ばし(=2フレーム)」で作られている前提なので frame_stride=2 を要求
+        if int(args.frame_stride) != 2:
+            raise ValueError(
+                "nuScenesのSTCでは frame_stride=2（20Hz->10Hz）を前提に `flow_est` を使用します。"
+                f"現在の設定: frame_stride={args.frame_stride}"
+            )
+
+        # 10Hz（frame_stride後）のファイルインデックスを構築（global index -> file path）
+        files, scenes, scene_counts, scene_offsets = _build_file_index(
+            self.args.data_path, split="train", frame_stride=int(self.args.frame_stride)
+        )
+        self._files = files
+        self._scenes = scenes
+        self._scene_counts = scene_counts
+        self._scene_offsets = scene_offsets
+
+        self.scene_idx_t1: List[int] = []
+        self.scene_idx_t2: List[int] = []
+
+        # augmentation（GrowSP trainと同様）
+        self.trans_coords = trans_coords(shift_ratio=50)
+        self.rota_coords = rota_coords(rotation_bound=((-np.pi / 32, np.pi / 32), (-np.pi / 32, np.pi / 32), (-np.pi, np.pi)))
+        self.scale_coords = scale_coords(scale_bound=(0.9, 1.1))
+
+        # H5ファイルハンドルのキャッシュ（scene_name -> handle）
+        # nuScenesはscene数が多いので、開きっぱなしにするとFD枯渇し得る。LRUで上限を設ける。
+        self._h5_handles: "OrderedDict[str, h5py.File]" = OrderedDict()
+        self._max_open_h5 = 16
+
+        # tokens.txt のキャッシュ（scene_name -> tokens list）
+        self._tokens_cache: Dict[str, List[str]] = {}
+
+        # SPマッチング設定
+        sp_matching = args.stc.sp_matching
+        self.weight_centroid_distance = sp_matching.weight_centroid_distance
+        self.weight_spread_similarity = sp_matching.weight_spread_similarity
+        self.weight_point_count_similarity = sp_matching.weight_point_count_similarity
+        self.max_centroid_distance = sp_matching.max_centroid_distance
+        self.min_score_threshold = sp_matching.min_score_threshold
+        self.min_sp_points = sp_matching.min_sp_points
+        self.remove_ego_motion = sp_matching.remove_ego_motion
+        self.exclude_ground = sp_matching.exclude_ground
+
+        from scene_flow.correspondence import compute_superpoint_correspondence_direct
+        self._compute_sp_correspondence_direct = compute_superpoint_correspondence_direct
+
+    def augs(self, coords: np.ndarray) -> np.ndarray:
+        coords = self.rota_coords(coords)
+        coords = self.trans_coords(coords)
+        coords = self.scale_coords(coords)
+        return coords
+
+    def set_scene_pairs(self, scene_idx_t1: List[int], scene_idx_t2: List[int]):
+        self.scene_idx_t1 = scene_idx_t1
+        self.scene_idx_t2 = scene_idx_t2
+
+    def __len__(self):
+        return len(self.scene_idx_t1)
+
+    def _get_h5_handle(self, scene_name: str) -> h5py.File:
+        if scene_name in self._h5_handles:
+            # LRU更新
+            self._h5_handles.move_to_end(scene_name)
+            return self._h5_handles[scene_name]
+
+        else:
+            h5_path = os.path.join(self.args.stc.voteflow_preprocess_path, f"{scene_name}.h5")
+            if not os.path.exists(h5_path):
+                raise FileNotFoundError(f"VoteFlow preprocess H5 が見つかりません: {h5_path}")
+            self._h5_handles[scene_name] = h5py.File(h5_path, "r")
+            self._h5_handles.move_to_end(scene_name)
+
+            # LRU eviction
+            while len(self._h5_handles) > int(self._max_open_h5):
+                old_scene, old_handle = self._h5_handles.popitem(last=False)
+                try:
+                    old_handle.close()
+                except Exception:
+                    # 終了処理中などでh5py内部が破棄されている場合があるため、ここでは握りつぶす
+                    pass
+
+            return self._h5_handles[scene_name]
+
+    def _close_h5_handles(self):
+        for h in list(self._h5_handles.values()):
+            try:
+                h.close()
+            except Exception:
+                # 終了処理中などでh5py内部が破棄されている場合があるため、ここでは握りつぶす
+                pass
+        self._h5_handles.clear()
+
+    def __del__(self):
+        try:
+            self._close_h5_handles()
+        except Exception:
+            # __del__ では例外を出すと警告になるため無視
+            pass
+
+    def _load_tokens(self, scene_name: str) -> List[str]:
+        if scene_name in self._tokens_cache:
+            return self._tokens_cache[scene_name]
+        token_txt = os.path.join(self.args.data_path, scene_name, "tokens.txt")
+        if not os.path.exists(token_txt):
+            raise FileNotFoundError(
+                f"tokens.txt が見つかりません: {token_txt}\n"
+                "data_prepare/data_prepare_nuScenes.py を実行して tokens.txt を生成してください。"
+            )
+        with open(token_txt, "r") as f:
+            tokens = [line.strip() for line in f if line.strip()]
+        if len(tokens) == 0:
+            raise ValueError(f"tokens.txt が空です: {token_txt}")
+        self._tokens_cache[scene_name] = tokens
+        return tokens
+
+    @staticmethod
+    def _parse_scene_and_frame_from_ply(ply_path: str) -> Tuple[str, int]:
+        """PLYパスから (scene_name, frame_idx_original) を抽出する。
+
+        例: .../growsp/scene-0001/000002_s.ply -> ('scene-0001', 2)
+        """
+        scene_name = os.path.basename(os.path.dirname(ply_path))
+        base = os.path.basename(ply_path)
+        idx_str = base.split("_", 1)[0]
+        if len(idx_str) != 6 or not idx_str.isdigit():
+            raise ValueError(f"Unexpected nuScenes frame filename: {base} (path={ply_path})")
+        return scene_name, int(idx_str)
+
+    def _voxelize(self, coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """点群をvoxel化（KITTIstc互換の戻り値処理）"""
+        coords = np.ascontiguousarray(coords)
+
+        res = ME.utils.sparse_quantize(
+            coords,
+            return_index=True,
+            return_inverse=True,
+            quantization_size=float(self.args.voxel_size),
+            return_maps_only=True,
+        )
+
+        # MinkowskiEngineのバージョン差吸収（戻り値が2 or 4）
+        if len(res) == 2:
+            unique_map, inverse_map = res
+        else:
+            # (quantized_coords, voxel_idx, inverse_map, voxel_counts)
+            _, voxel_idx, inverse_map, _ = res
+            original_idx = np.arange(len(coords))
+            unique_map = original_idx[voxel_idx]
+
+        quantized_coords = coords[unique_map]
+        quantized_coords = (quantized_coords / float(self.args.voxel_size))
+        return quantized_coords, unique_map, inverse_map
+
+    def _get_item_one_frame(self, ply_path: str, require_flow: bool = True):
+        """1フレーム分のSTC用データをロードしてvoxelize/cropし、統合SPラベルを作る。
+
+        Args:
+            ply_path: GrowSP PLYのパス
+            require_flow: True の場合、H5グループに `flow_est` が必須（STCのsource側）。
+                          False の場合、`flow_est` が無くても許容（target側。flowは使用しない）。
+        """
+        scene_name, frame_idx_original = self._parse_scene_and_frame_from_ply(ply_path)
+        tokens = self._load_tokens(scene_name)
+        if frame_idx_original < 0 or frame_idx_original >= len(tokens):
+            raise ValueError(
+                f"frame_idx out of range for tokens.txt: scene={scene_name}, idx={frame_idx_original}, tokens={len(tokens)}"
+            )
+        token = tokens[frame_idx_original]
+
+        h5_file = self._get_h5_handle(scene_name)
+        if token not in h5_file:
+            raise KeyError(f"token がH5に存在しません: scene={scene_name}, token={token}, h5={h5_file.filename}")
+        g = cast(h5py.Group, h5_file[token])
+
+        # raw data (order must match GrowSP PLY and initSP)
+        coords = np.asarray(cast(h5py.Dataset, g["lidar"])[:], dtype=np.float32)  # (N, 3)
+        pose = np.asarray(cast(h5py.Dataset, g["pose"])[:], dtype=np.float32)  # (4, 4)
+        ground_mask = np.asarray(cast(h5py.Dataset, g["ground_mask"])[:], dtype=bool)  # (N,)
+
+        flow = None
+        if require_flow:
+            if "flow_est" not in g:
+                hint = ""
+                # flow_est が (t -> t+frame_stride) で作られている場合、末尾フレームでは存在しないことがある
+                try:
+                    gap = int(self.args.frame_stride)
+                except Exception:
+                    gap = 0
+                if gap > 0 and frame_idx_original >= (len(tokens) - gap):
+                    hint = (
+                        "\n補足: frame_idx がシーン末尾に近いため、flow_est が無いのは仕様の可能性があります。"
+                        f" frame_idx={frame_idx_original}, tokens={len(tokens)}, frame_stride={gap}"
+                    )
+                raise KeyError(
+                    f"flow_est がH5に存在しません: scene={scene_name}, token={token}, h5={h5_file.filename}{hint}"
+                )
+            flow = np.asarray(cast(h5py.Dataset, g["flow_est"])[:], dtype=np.float32)  # (N, 3)
+            if flow.shape != coords.shape:
+                raise ValueError(
+                    "flow_est の形状が lidar と一致しません: "
+                    f"scene={scene_name}, token={token}, flow={flow.shape}, lidar={coords.shape}, h5={h5_file.filename}"
+                )
+
+        coords_original = coords.copy()
+        means = coords.mean(0)
+        coords_centered = coords - means
+
+        # voxelize
+        coords_vox, unique_map, inverse_map = self._voxelize(coords_centered)
+        coords_vox = coords_vox.astype(np.float32)
+
+        # r_crop
+        mask = np.sqrt(((coords_vox * self.args.voxel_size) ** 2).sum(-1)) < float(self.args.r_crop)
+        coords_vox = coords_vox[mask]
+
+        # init SP
+        rel_name = ply_path[0:-4].replace(self.args.data_path, "")  # '/scene-0001/000002_s'
+        init_sp_file = os.path.join(self.args.sp_path, rel_name.lstrip("/") + "_superpoint.npy")
+        if not os.path.exists(init_sp_file):
+            raise FileNotFoundError(f"init superpoint が見つかりません: {init_sp_file}")
+        init_sp_labels = np.load(init_sp_file)  # (N,)
+        if init_sp_labels.shape[0] != coords_original.shape[0]:
+            raise ValueError(
+                "init superpoint の点数がH5(lidar)と一致しません: "
+                f"scene={scene_name}, token={token}, init_sp={init_sp_labels.shape[0]}, lidar={coords_original.shape[0]}, file={init_sp_file}"
+            )
+
+        # sp_mapping (init SP -> merged SP)
+        sp_mapping_file = os.path.join(self.args.sp_id_path, rel_name.lstrip("/") + "_sp_mapping.npy")
+        if not os.path.exists(sp_mapping_file):
+            raise FileNotFoundError(
+                f"sp_mappingファイルが見つかりません: {sp_mapping_file}\n"
+                "STCを使用するには、まずクラスタリングを実行してsp_mappingを生成してください。"
+            )
+        sp_mapping = np.load(sp_mapping_file)  # (max_init_sp_id+1,)
+
+        sp_labels_full = np.full_like(init_sp_labels, -1, dtype=np.int32)
+        valid_init_mask = (init_sp_labels >= 0) & (init_sp_labels < len(sp_mapping))
+        mapped = sp_mapping[init_sp_labels[valid_init_mask]]
+        sp_labels_full[valid_init_mask] = np.where(mapped >= 0, mapped, -1)
+
+        sp_labels = sp_labels_full[unique_map][mask]
+        ground_mask_vox = ground_mask[unique_map][mask]
+        flow_vox = None
+        if require_flow:
+            # require_flow=True の場合のみ使用される
+            assert flow is not None
+            flow_vox = flow[unique_map][mask]
+        coords_original_masked = coords_original[unique_map][mask]
+
+        return {
+            "scene_name": rel_name,  # '/scene-0001/000002_s'
+            "frame_idx_original": frame_idx_original,
+            "token": token,
+            "coords_vox": coords_vox,
+            "coords_original": coords_original_masked,
+            "sp_labels": sp_labels,
+            "pose": pose,
+            "flow_vox": flow_vox,
+            "ground_mask_vox": ground_mask_vox,
+            "inverse_map": inverse_map,
+            "unique_map": unique_map,
+            "mask": mask,
+        }
+
+    def __getitem__(self, index):
+        if len(self.scene_idx_t1) == 0 or len(self.scene_idx_t2) == 0:
+            raise RuntimeError("NuScenesstc.set_scene_pairs() が呼ばれていません")
+        g1 = int(self.scene_idx_t1[index])
+        g2 = int(self.scene_idx_t2[index])
+        if g1 < 0 or g1 >= len(self._files) or g2 < 0 or g2 >= len(self._files):
+            raise ValueError(f"global index out of range: g1={g1}, g2={g2}, total={len(self._files)}")
+
+        ply1 = self._files[g1]
+        ply2 = self._files[g2]
+
+        scene1, idx1 = self._parse_scene_and_frame_from_ply(ply1)
+        scene2, idx2 = self._parse_scene_and_frame_from_ply(ply2)
+        if scene1 != scene2:
+            raise ValueError(f"STC pair must be in the same scene: {scene1} vs {scene2} (g1={g1}, g2={g2})")
+
+        # STCは時間順に揃える（flowは早い時刻のものを使う）
+        if idx1 <= idx2:
+            src_ply, tgt_ply = ply1, ply2
+            src_idx, tgt_idx = idx1, idx2
+        else:
+            src_ply, tgt_ply = ply2, ply1
+            src_idx, tgt_idx = idx2, idx1
+
+        expected_gap = int(self.args.frame_stride)
+        actual_gap = int(tgt_idx - src_idx)
+        if actual_gap != expected_gap:
+            raise ValueError(
+                "nuScenes STCでは隣接(10Hz)ペアのみサポートしています。"
+                f"expected_gap(frame_stride)={expected_gap}, actual_gap={actual_gap}. "
+                f"src={os.path.basename(src_ply)}, tgt={os.path.basename(tgt_ply)}"
+            )
+
+        # source側のみ flow_est が必須。target側は flow を使用しないため欠損を許容する。
+        src = self._get_item_one_frame(src_ply, require_flow=True)
+        tgt = self._get_item_one_frame(tgt_ply, require_flow=False)
+
+        # SP対応行列を計算（SPレベル直接マッチング）
+        corr_matrix, unique_sp_t, unique_sp_t2 = self._compute_sp_correspondence_direct(
+            src["coords_original"],
+            tgt["coords_original"],
+            src["flow_vox"],
+            src["sp_labels"],
+            tgt["sp_labels"],
+            src["pose"],
+            tgt["pose"],
+            src["ground_mask_vox"],
+            tgt["ground_mask_vox"],
+            weight_centroid_distance=self.weight_centroid_distance,
+            weight_spread_similarity=self.weight_spread_similarity,
+            weight_point_count_similarity=self.weight_point_count_similarity,
+            max_centroid_distance=self.max_centroid_distance,
+            min_score_threshold=self.min_score_threshold,
+            min_sp_points=self.min_sp_points,
+            remove_ego_motion=self.remove_ego_motion,
+            exclude_ground=self.exclude_ground,
+        )
+
+        # augmentation（tとt2で別々に適用）
+        coords_t_aug = self.augs(src["coords_vox"].copy())
+        coords_t2_aug = self.augs(tgt["coords_vox"].copy())
+
+        return {
+            "coords_t": coords_t_aug,
+            "coords_t2": coords_t2_aug,
+            "sp_labels_t": src["sp_labels"],
+            "sp_labels_t2": tgt["sp_labels"],
+            "corr_matrix": corr_matrix,
+            "unique_sp_t": unique_sp_t,
+            "unique_sp_t2": unique_sp_t2,
+            "scene_name_t": src["scene_name"],
+            "scene_name_t2": tgt["scene_name"],
+        }
+
+
+class cfl_collate_fn_stc:
+    """STC用collate関数（nuScenes版）
+
+    NuScenesstc が返すdictをバッチ化する。
+    coords_t/coords_t2はMinkowskiEngine用にバッチIDを付与。
+    SP対応行列などはリストのまま返す。
+    """
+
+    def __call__(self, list_data):
+        coords_t_batch = []
+        coords_t2_batch = []
+        sp_labels_t_list = []
+        sp_labels_t2_list = []
+        corr_matrix_list = []
+        unique_sp_t_list = []
+        unique_sp_t2_list = []
+        scene_name_t_list = []
+        scene_name_t2_list = []
+
+        for batch_id, data in enumerate(list_data):
+            coords_t = data["coords_t"]
+            coords_t2 = data["coords_t2"]
+            num_points_t = coords_t.shape[0]
+            num_points_t2 = coords_t2.shape[0]
+
+            coords_t_batch.append(
+                torch.cat(
+                    (torch.ones(num_points_t, 1).int() * batch_id, torch.from_numpy(coords_t).int()),
+                    1,
+                )
+            )
+            coords_t2_batch.append(
+                torch.cat(
+                    (torch.ones(num_points_t2, 1).int() * batch_id, torch.from_numpy(coords_t2).int()),
+                    1,
+                )
+            )
+
+            sp_labels_t_list.append(torch.from_numpy(data["sp_labels_t"]).long())
+            sp_labels_t2_list.append(torch.from_numpy(data["sp_labels_t2"]).long())
+            corr_matrix_list.append(torch.from_numpy(data["corr_matrix"]).float())
+            unique_sp_t_list.append(data["unique_sp_t"])
+            unique_sp_t2_list.append(data["unique_sp_t2"])
+            scene_name_t_list.append(data["scene_name_t"])
+            scene_name_t2_list.append(data["scene_name_t2"])
+
+        coords_t_batch = torch.cat(coords_t_batch, 0).float()
+        coords_t2_batch = torch.cat(coords_t2_batch, 0).float()
+
+        return {
+            "coords_t": coords_t_batch,
+            "coords_t2": coords_t2_batch,
+            "sp_labels_t": sp_labels_t_list,
+            "sp_labels_t2": sp_labels_t2_list,
+            "corr_matrix": corr_matrix_list,
+            "unique_sp_t": unique_sp_t_list,
+            "unique_sp_t2": unique_sp_t2_list,
+            "scene_name_t": scene_name_t_list,
+            "scene_name_t2": scene_name_t2_list,
+        }
+
+
 class NuScenestcuss(Dataset):
-    """GrowSP用: t1とt2を返す複合データセット（STCなし）"""
+    """TCUSS用の複合データセット（nuScenes）
+
+    stc.enabled=True: GrowSP + STC
+    stc.enabled=False: GrowSPのみ
+    """
 
     def __init__(self, args):
         self.args = args
         self.phase = 0
+        self.stc_enabled = bool(args.stc.enabled)
         self.train_t1 = NuScenesTrain(args, scene_idx=[], split="train")
         self.train_t2 = NuScenesTrain(args, scene_idx=[], split="train")
+        self.nuscstc = NuScenesstc(args) if self.stc_enabled else None
         self.scene_idx_t1: List[int] = []
         self.scene_idx_t2: List[int] = []
 
@@ -514,6 +951,8 @@ class NuScenestcuss(Dataset):
         self.scene_idx_t2 = scene_idx_t2
         self.train_t1.random_select_sample(scene_idx_t1)
         self.train_t2.random_select_sample(scene_idx_t2)
+        if self.stc_enabled and self.nuscstc is not None:
+            self.nuscstc.set_scene_pairs(scene_idx_t1, scene_idx_t2)
 
     def __len__(self):
         return len(self.scene_idx_t1)
@@ -521,19 +960,31 @@ class NuScenestcuss(Dataset):
     def __getitem__(self, index):
         growsp_t1 = self.train_t1.__getitem__(index)
         growsp_t2 = self.train_t2.__getitem__(index)
-        return growsp_t1, growsp_t2, None
+        if self.stc_enabled and self.nuscstc is not None:
+            stc_data = self.nuscstc.__getitem__(index)
+        else:
+            stc_data = None
+        return growsp_t1, growsp_t2, stc_data
 
 
 class cfl_collate_fn_tcuss:
-    """TCUSS用collate（GrowSPのみ：stc=None）"""
+    """TCUSS用collate（nuScenes）
+
+    stc_dataがNoneの場合（STC無効時）はstc=Noneを返す
+    """
 
     def __init__(self):
         self.growsp_collate = cfl_collate_fn()
+        self.stc_collate = cfl_collate_fn_stc()
 
     def __call__(self, list_data):
-        growsp_t1_data, growsp_t2_data, _ = list(zip(*list_data))
+        growsp_t1_data, growsp_t2_data, stc_data = list(zip(*list_data))
         growsp_t1 = self.growsp_collate(growsp_t1_data)
         growsp_t2 = self.growsp_collate(growsp_t2_data)
-        return growsp_t1, growsp_t2, None
+        if stc_data[0] is None:
+            stc = None
+        else:
+            stc = self.stc_collate(stc_data)
+        return growsp_t1, growsp_t2, stc
 
 

@@ -32,7 +32,7 @@ accum_step: 1
 # データロード設定
 workers: 3
 cluster_workers: 24
-eval_workers: 44  # 評価時のワーカー数（GPU boundなので多めに設定）
+eval_workers: 3
 batch_size: [8, 8]
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
