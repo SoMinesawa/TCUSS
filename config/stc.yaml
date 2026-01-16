@@ -6,13 +6,13 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "stc_window1"
+name: "semantickitti_stc_1"
 dataset: "semantickitti"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/stc_window1"
+save_path: "data/users/minesawa/semantickitti/semantickitti_stc_1"
 pseudo_label_path: "pseudo_label_kitti/"
 sp_id_path: "sp_id_kitti/" 
 
@@ -25,15 +25,15 @@ bn_momentum: 0.02
 conv1_kernel_size: 5
 
 # 最適化設定
-lr: 0.02  # バックボーンの学習率
+lr: 0.04  # バックボーンの学習率
 weight_decay: 0.01
 accum_step: 1
 
 # データロード設定
-workers: 3
+workers: 6
 cluster_workers: 24
-eval_workers: 3
-batch_size: [8, 8]
+eval_workers: 6
+batch_size: [32, 32]
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
 
@@ -99,8 +99,8 @@ debug: false
 vis: false
 vis_sp: false
 # 学習再開設定
-resume: true
-wandb_run_id: 0sjra8qz
+resume: false
+wandb_run_id: null
 
 # ===========================================
 # STC (Superpoint Time Consistency) 設定
@@ -110,7 +110,7 @@ stc:
   weight: 0.5  # loss_stc の重み
 
   # VoteFlow前処理済みデータのパス（H5ファイル）
-  voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_fixed"
+  voteflow_preprocess_path: "data/dataset/semantickitti/voteflow_preprocess_0109"
 
   # SPマッチング設定（Superpointレベルでの対応計算）
   sp_matching:

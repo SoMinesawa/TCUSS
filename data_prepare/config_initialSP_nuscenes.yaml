@@ -9,7 +9,7 @@
 input_path: "data/users/minesawa/nuscenes/growsp"
 
 # Output directory for init superpoint labels (*_superpoint.npy)
-sp_path: "data/users/minesawa/nuscenes/growsp_sp"
+sp_path: "data/users/minesawa/nuscenes/growsp_sp_1"
 
 # nuScenes meta (required when ground_detection_method == 'patchwork++')
 nuscenes:
@@ -25,7 +25,7 @@ patchwork:
 # - "all": process all scene-* directories under input_path
 # - "first": process only the first scene directory (sorted) for quick testing
 # - list: process only specified scenes, e.g. ["scene-0001"]
-target_scenes: "all"
+target_scenes: ["scene-0001"]
 
 # Ground detection: 'ransac' or 'patchwork++'
 ground_detection_method: "ransac"
@@ -35,6 +35,9 @@ clustering_method: "hdbscan"
 
 # Visualization (writes colored PLYs under sp_path/vis/)
 vis: true
+
+# Visualization of semantic ground-truth labels (keyframes only; writes *_gt.ply under sp_path/vis/)
+vis_gt: true
 
 # Parallel workers
 max_workers: 24
@@ -56,8 +59,8 @@ dbscan:
 
 # HDBSCAN settings (required when clustering_method == 'hdbscan')
 hdbscan:
-  min_cluster_size: 20
-  min_samples: 10
+  min_cluster_size: 10
+  min_samples: 5
   metric: "euclidean"
   cluster_selection_method: "eom"
 
