@@ -32,8 +32,8 @@ accum_step: 1
 # データロード設定
 workers: 6
 cluster_workers: 24
-eval_workers: 6
-batch_size: [32, 32]
+eval_workers: 12
+batch_size: [8, 8]
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
 

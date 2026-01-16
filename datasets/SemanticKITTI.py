@@ -484,8 +484,14 @@ class KITTIval(Dataset):
         frame_id = name_parts[1]  # '000000'
         raw_labels = self._load_raw_labels(seq_id, frame_id)
         
-        # labels -= 1 別にいらんよ。だってtrainでは、validゾーン作るためにlabel=-1を作っていたわけだから。
-        # labels[labels == self.args.ignore_label - 1] = self.args.ignore_label
+        # NOTE:
+        # growspのPLY内ラベルは 0..19（semantic-kitti.yaml の learning_map と同じ）。
+        # 学習/テスト推論は labels -= 1 により unlabeled(0) を ignore(-1) にし、
+        # 1..19 を 0..18 に詰めて semantic_class=19 と整合させている。
+        # valだけ前処理が違うと、unlabeledが評価に入って traffic-sign(19) が落ちるため、
+        # train/test と同じ前処理に揃える。
+        labels -= 1
+        labels[labels == self.args.ignore_label - 1] = self.args.ignore_label
         return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index, original_coords, raw_labels
 
 
@@ -558,17 +564,13 @@ class KITTItest(Dataset):
         coords = coords.astype(np.float32)
         coords -= coords.mean(0)
 
-        coords, feats, _, unique_map, inverse_map = self.voxelize(coords, feats, labels)
+        coords, feats, _, _, inverse_map = self.voxelize(coords, feats, labels)
         coords = coords.astype(np.float32)
-
-        region_file = self.args.sp_path + '/' +self.name[index] + '_superpoint.npy'
-        region = np.load(region_file)
-        region = region[unique_map]
 
         coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
         labels -= 1
         labels[labels == self.args.ignore_label - 1] = self.args.ignore_label
-        return coords, feats, np.ascontiguousarray(labels), inverse_map, region, index, file
+        return coords, feats, np.ascontiguousarray(labels), inverse_map, index, file
 
 
 class cfl_collate_fn_val:
@@ -612,9 +614,8 @@ class cfl_collate_fn_val:
 class cfl_collate_fn_test:
 
     def __call__(self, list_data):
-        coords, feats, labels, inverse_map, region, index, file_path = list(zip(*list_data))
+        coords, feats, labels, inverse_map, index, file_path = list(zip(*list_data))
         coords_batch, feats_batch, inverse_batch, labels_batch = [], [], [], []
-        region_batch = []
         for batch_id, _ in enumerate(coords):
             num_points = coords[batch_id].shape[0]
             coords_batch.append(
@@ -622,16 +623,14 @@ class cfl_collate_fn_test:
             feats_batch.append(torch.from_numpy(feats[batch_id]))
             inverse_batch.append(torch.from_numpy(inverse_map[batch_id]))
             labels_batch.append(torch.from_numpy(labels[batch_id]).int())
-            region_batch.append(torch.from_numpy(region[batch_id])[:, None])
         #
         # Concatenate all lists
         coords_batch = torch.cat(coords_batch, 0).float()
         feats_batch = torch.cat(feats_batch, 0).float()
         inverse_batch = torch.cat(inverse_batch, 0).int()
         labels_batch = torch.cat(labels_batch, 0).int()
-        region_batch = torch.cat(region_batch, 0)
 
-        return coords_batch, feats_batch, inverse_batch, labels_batch, index, region_batch, file_path
+        return coords_batch, feats_batch, inverse_batch, labels_batch, index, file_path
 
 
 class KITTIstc(Dataset):

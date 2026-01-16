@@ -1,0 +1,48 @@
+# nuScenes LiDARSeg test submission configuration (TCUSS)
+#
+# Usage:
+#   python test_nuScenes_lidarseg.py --config config/nuscenes_lidarseg_test.yaml
+#
+# Notes:
+# - This config is ONLY for generating nuScenes-lidarseg test submissions (EvalAI).
+# - The model hyperparameters are taken from `train_config` (TCUSSConfig YAML).
+# - We do NOT convert test to PLY. We directly read nuScenes `samples/*/*.pcd.bin` to
+#   preserve point order required by the submission format.
+#
+# Required output structure (inside results_dir):
+#   test/submission.json
+#   lidarseg/test/<lidar_sample_data_token>_lidarseg.bin
+
+# TCUSS training config used for this model (must be dataset: nuscenes)
+train_config: "config/nuscenes_stc.yaml"
+
+# Directory that contains checkpoints:
+#   - best_model.pth / best_classifier.pth
+#   - OR model_<epoch>_checkpoint.pth / cls_<epoch>_checkpoint.pth
+model_dir: "data/users/minesawa/nuscenes/nuscenes_stc"
+
+# Checkpoint selection (exactly one mode)
+checkpoint:
+  type: "epoch"   # "best" or "epoch"
+  epoch: 160      # required when type == "epoch"
+
+# Output
+results_dir: "data/users/minesawa/nuscenes/nuscenes_stc/lidarseg_test_results"
+zip_path: "data/users/minesawa/nuscenes/nuscenes_stc/lidarseg_test_results.zip"
+
+# nuScenes dataset root / versions
+nuscenes:
+  dataroot: "data/dataset/nuscenes"
+  version_val: "v1.0-trainval"
+  version_test: "v1.0-test"
+  lidar_sensor: "LIDAR_TOP"
+
+# submission.json meta (required by validator)
+meta:
+  use_camera: false
+  use_lidar: true
+  use_radar: false
+  use_map: false
+  use_external: false
+
+

@@ -40,8 +40,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='TCUSS - SemanticKITTI Testing')
     parser.add_argument('--data_path', type=str, default='data/users/minesawa/semantickitti/growsp',
                         help='点群データパス')
-    parser.add_argument('--sp_path', type=str, default='data/users/minesawa/semantickitti/growsp_sp',
-                        help='初期スーパーポイントパス')
     parser.add_argument('--save_path', type=str, default='data/users/minesawa/semantickitti/growsp_model',
                         help='モデル保存パス')
     ###
@@ -80,8 +78,13 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.enabled = False
 
 
-def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: DataLoader, classifier: torch.nn.Module) -> Tuple[List, List, List, List, List]:
-    """一回の評価を実行する関数
+def eval_once(
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    test_loader: DataLoader,
+    classifier: torch.nn.Module
+) -> Tuple[np.ndarray, List[Tuple[str, str]]]:
+    """一回の推論を実行し、(1) Hungarian用の混同行列、(2) raw予測の保存先と最終保存先の対応を返す。
     
     Args:
         args: コマンドライン引数
@@ -90,21 +93,24 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
         classifier: 分類器
     
     Returns:
-        all_preds: すべての予測結果（ignore labelを除く）
-        all_no_ignore_preds: すべての予測結果（元の形状）
-        all_labels: すべてのラベル（ignore labelを除く）
-        all_no_ignore_labels: すべてのラベル（元の形状）
-        all_save_path: すべての保存パス
+        histogram: (semantic_class, semantic_class) の混同行列（GT=行, pred=列）
+        raw_and_save_paths: [(raw_pred_path, final_label_path), ...]
     """
-    # 結果保存ディレクトリを作成
+    # 結果保存ディレクトリ（最終提出物）
     save_dir = os.path.join(args.save_path, 'pred_result', 'sequences')
     os.makedirs(save_dir, exist_ok=True)
-    
-    all_preds, all_preds_no_ignore, all_label, all_label_no_ignore, all_save_path = [], [], [], [], []
+
+    # raw予測保存ディレクトリ（提出物に含めない）
+    raw_dir = os.path.join(args.save_path, 'pred_result_raw', 'sequences')
+    os.makedirs(raw_dir, exist_ok=True)
+
+    sem_num = args.semantic_class
+    histogram = np.zeros((sem_num, sem_num), dtype=np.int64)
+    raw_and_save_paths: List[Tuple[str, str]] = []
     
     for data in tqdm(test_loader):
         with torch.no_grad():
-            coords, features, inverse_map, labels, index, region, file_paths = data
+            coords, features, inverse_map, labels, index, file_paths = data
 
             # TensorFieldを作成
             in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
@@ -115,36 +121,44 @@ def eval_once(args: argparse.Namespace, model: torch.nn.Module, test_loader: Dat
             scores = F.linear(F.normalize(feats), F.normalize(classifier.weight))
             preds = torch.argmax(scores, dim=1).cpu()
             preds = preds[inverse_map.long()]
-            preds_no_ignore = preds.clone()
-            labels_no_ignore = labels.clone()
-            
-            # シーケンス番号に基づいて処理を分岐
-            if int(os.path.split(os.path.dirname(file_paths[0]))[1]) < 11:
-                preds = preds_no_ignore[labels!=args.ignore_label]
-            labels = labels[labels!=args.ignore_label]
-            
+
+            # Hungarian用の混同行列を逐次更新（全点を溜めない）
+            # 既存実装: mask = (all_no_ignore_labels>=0)&(all_no_ignore_labels<sem_num) と同等
+            preds_np = preds.numpy().astype(np.int64, copy=False)
+            labels_np = labels.numpy().astype(np.int64, copy=False)
+            valid_mask = (labels_np >= 0) & (labels_np < sem_num)
+            if valid_mask.any():
+                flat = sem_num * labels_np[valid_mask] + preds_np[valid_mask]
+                local_hist = np.bincount(flat, minlength=sem_num ** 2).reshape(sem_num, sem_num)
+                histogram += local_hist
+
             # 相対パスを取得
             relative_path = os.path.relpath(file_paths[0], args.data_path)
             sequence, filename = os.path.split(relative_path)
-            filename = os.path.splitext(filename)[0] + '.label'
+            base = os.path.splitext(filename)[0]
+            filename_label = base + '.label'
+            filename_raw = base + '.bin'
             
             # 保存先のディレクトリを作成
             sequence_dir = os.path.join(save_dir, sequence, 'predictions')
             os.makedirs(sequence_dir, exist_ok=True)
+
+            raw_sequence_dir = os.path.join(raw_dir, sequence, 'predictions')
+            os.makedirs(raw_sequence_dir, exist_ok=True)
             
             # 保存パスを設定
-            save_path = os.path.join(sequence_dir, filename)
-            all_preds.append(preds)
-            all_preds_no_ignore.append(preds_no_ignore)
-            all_label.append(labels)
-            all_label_no_ignore.append(labels_no_ignore)
-            all_save_path.append(save_path)
+            save_path = os.path.join(sequence_dir, filename_label)
+            raw_path = os.path.join(raw_sequence_dir, filename_raw)
+
+            # raw予測（cluster id: 0..sem_num-1）をディスクへ退避（uint8で十分）
+            preds_np.astype(np.uint8, copy=False).tofile(raw_path)
+            raw_and_save_paths.append((raw_path, save_path))
 
             # メモリ解放
             torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device("cuda"))
     
-    return all_preds, all_preds_no_ignore, all_label, all_label_no_ignore, all_save_path
+    return histogram, raw_and_save_paths
 
 
 def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str, Dict[str, float]]:
@@ -199,19 +213,15 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
     test_dataset = KITTItest(args)
     test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=cfl_collate_fn_test(), num_workers=args.cluster_workers, pin_memory=True)
 
-    # 評価を実行
-    preds, no_ignore_preds, labels, no_ignore_labels, save_paths = eval_once(args, model, test_loader, classifier)
-    
-    # 結果を連結
-    all_preds = torch.cat(preds).numpy()
-    all_no_ignore_preds = torch.cat(no_ignore_preds).numpy()
-    all_labels = torch.cat(labels).numpy()
-    all_no_ignore_labels = torch.cat(no_ignore_labels).numpy()
+    # 推論を実行（全点を溜めずに混同行列を作る + raw予測を退避）
+    histogram, raw_and_save_paths = eval_once(args, model, test_loader, classifier)
 
-    # 教師なし評価：予測をGTにマッチング
     sem_num = args.semantic_class
-    mask = (all_no_ignore_labels >= 0) & (all_no_ignore_labels < sem_num)
-    histogram = np.bincount(sem_num * all_no_ignore_labels[mask] + all_no_ignore_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
+    if histogram.sum() == 0:
+        raise RuntimeError(
+            "Hungarianマッチング用の有効GT点が0です。"
+            "（labelsが全てignore/範囲外の可能性）"
+        )
     
     # ハンガリアンマッチング
     m = assignment_function(histogram.max() - histogram)
@@ -222,14 +232,18 @@ def eval(epoch: int, args: argparse.Namespace) -> Tuple[float, float, float, str
         hist_new[:, idx] = histogram[:, m[idx, 1]]
 
     # 予測結果を保存
-    for no_ignore_pred, save_path in zip(no_ignore_preds, save_paths):
-        no_ignore_pred = no_ignore_pred.numpy().astype(np.int64)
-        no_ignore_pred_copy = no_ignore_pred.copy()
-        for row in m:
-            no_ignore_pred_copy[no_ignore_pred == row[1]] = row[0]
-        no_ignore_pred_copy = no_ignore_pred_copy + 1
-        no_ignore_pred_inv = np.vectorize(learning_map_inv.get)(no_ignore_pred_copy).astype(np.uint32)
-        no_ignore_pred_inv.tofile(save_path)
+    # cluster id -> semantic class への写像（Hungarian結果は置換）
+    cluster_to_class = np.empty((sem_num,), dtype=np.int64)
+    for row in m:
+        cluster_to_class[int(row[1])] = int(row[0])
+
+    for raw_path, save_path in raw_and_save_paths:
+        raw_pred = np.fromfile(raw_path, dtype=np.uint8).astype(np.int64, copy=False)
+        mapped = cluster_to_class[raw_pred]  # 0..sem_num-1
+        mapped = mapped + 1
+        mapped_inv = np.vectorize(learning_map_inv.get)(mapped).astype(np.uint32)
+        mapped_inv.tofile(save_path)
+        os.remove(raw_path)
     
     # 最終評価指標を計算
     tp = np.diag(hist_new)
@@ -302,19 +316,15 @@ def eval_best(args: argparse.Namespace) -> Tuple[float, float, float, str, Dict[
     test_dataset = KITTItest(args)
     test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=cfl_collate_fn_test(), num_workers=args.cluster_workers, pin_memory=True)
 
-    # 評価を実行
-    preds, no_ignore_preds, labels, no_ignore_labels, save_paths = eval_once(args, model, test_loader, classifier)
-    
-    # 結果を連結
-    all_preds = torch.cat(preds).numpy()
-    all_no_ignore_preds = torch.cat(no_ignore_preds).numpy()
-    all_labels = torch.cat(labels).numpy()
-    all_no_ignore_labels = torch.cat(no_ignore_labels).numpy()
+    # 推論を実行（全点を溜めずに混同行列を作る + raw予測を退避）
+    histogram, raw_and_save_paths = eval_once(args, model, test_loader, classifier)
 
-    # 教師なし評価：予測をGTにマッチング
     sem_num = args.semantic_class
-    mask = (all_no_ignore_labels >= 0) & (all_no_ignore_labels < sem_num)
-    histogram = np.bincount(sem_num * all_no_ignore_labels[mask] + all_no_ignore_preds[mask], minlength=sem_num ** 2).reshape(sem_num, sem_num)
+    if histogram.sum() == 0:
+        raise RuntimeError(
+            "Hungarianマッチング用の有効GT点が0です。"
+            "（labelsが全てignore/範囲外の可能性）"
+        )
     
     # ハンガリアンマッチング
     m = assignment_function(histogram.max() - histogram)
@@ -325,14 +335,17 @@ def eval_best(args: argparse.Namespace) -> Tuple[float, float, float, str, Dict[
         hist_new[:, idx] = histogram[:, m[idx, 1]]
 
     # 予測結果を保存
-    for no_ignore_pred, save_path in zip(no_ignore_preds, save_paths):
-        no_ignore_pred = no_ignore_pred.numpy().astype(np.int64)
-        no_ignore_pred_copy = no_ignore_pred.copy()
-        for row in m:
-            no_ignore_pred_copy[no_ignore_pred == row[1]] = row[0]
-        no_ignore_pred_copy = no_ignore_pred_copy + 1
-        no_ignore_pred_inv = np.vectorize(learning_map_inv.get)(no_ignore_pred_copy).astype(np.uint32)
-        no_ignore_pred_inv.tofile(save_path)
+    cluster_to_class = np.empty((sem_num,), dtype=np.int64)
+    for row in m:
+        cluster_to_class[int(row[1])] = int(row[0])
+
+    for raw_path, save_path in raw_and_save_paths:
+        raw_pred = np.fromfile(raw_path, dtype=np.uint8).astype(np.int64, copy=False)
+        mapped = cluster_to_class[raw_pred]  # 0..sem_num-1
+        mapped = mapped + 1
+        mapped_inv = np.vectorize(learning_map_inv.get)(mapped).astype(np.uint32)
+        mapped_inv.tofile(save_path)
+        os.remove(raw_path)
     
     # 最終評価指標を計算
     tp = np.diag(hist_new)

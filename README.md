@@ -31,6 +31,8 @@ conda activate tcuss_vf
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 export LIBRARY_PATH="$CONDA_PREFIX/lib:$LIBRARY_PATH"
 export CUDA_HOME="$CONDA_PREFIX"
+# setuptools が同梱する distutils だと MinkowskiEngine のビルドが失敗することがあるため、stdlib を使用
+export SETUPTOOLS_USE_DISTUTILS=stdlib
 export TORCH_CUDA_ARCH_LIST="8.0"  # A100の場合。環境に合わせて調整してください
 
 # MinkowskiEngine（PyPI版はtorch 2.0と非互換のためGitHub版を使用）

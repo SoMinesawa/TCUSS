@@ -19,6 +19,8 @@ dependencies:
   - plotly
   - dash
   - wandb
+  # open3d(PIP)が依存するPillowが libtiff.so.5 を要求するケースがあるため固定
+  - libtiff=4.4.0
   - cmake
   - ninja
   # PyTorch 2.0.0 で iJIT_NotifyEvent が解決できず import 失敗することがあるため固定
