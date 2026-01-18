@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, Iterator, List, Tuple, Optional
 
 import numpy as np
 import open3d as o3d
@@ -29,6 +29,7 @@ def load_config(config_path: str) -> dict:
         "ground_detection_method",
         "clustering_method",
         "vis",
+        "vis_gt",
         "max_workers",
         "chunksize",
         "semantic_class",
@@ -36,6 +37,11 @@ def load_config(config_path: str) -> dict:
     for key in required_keys:
         if key not in config:
             raise ValueError(f"設定ファイルに必須キー '{key}' がありません: {config_path}")
+
+    # bool options validation（文字列 "false" などを許さない）
+    for k in ["vis", "vis_gt"]:
+        if not isinstance(config[k], bool):
+            raise ValueError(f"{k} は bool である必要があります: value={config[k]} type={type(config[k])}")
 
     gdm = config["ground_detection_method"]
     if gdm == "ransac":
@@ -194,7 +200,8 @@ def construct_superpoints(
 ):
     """単一のPLYから init superpoint を構築して *_superpoint.npy を保存する"""
     f = Path(ply_path)
-    data = read_ply(str(f))
+    # read_ply は structured ndarray を返すが、型スタブが無いため Any 扱いにする
+    data: Any = read_ply(str(f))
     coords = np.vstack((data["x"], data["y"], data["z"])).T.astype(np.float32, copy=False)
 
     # center for stable plane detection
@@ -261,6 +268,60 @@ def construct_superpoints(
             colors[i] = color_map.get(sp, np.array([0, 0, 0], dtype=np.uint8))
         out_vis = os.path.join(vis_dir, frame_name)
         write_ply(out_vis, [coords, colors], ["x", "y", "z", "red", "green", "blue"])
+
+    # vis_gt (semantic ground-truth; keyframes only)
+    if bool(config["vis_gt"]):
+        base = f.name
+        if not base.endswith(".ply"):
+            raise ValueError(f"Unexpected PLY filename (expected *.ply): {base} (path={ply_path})")
+        stem = base[:-4]
+        parts = stem.split("_")
+        if len(parts) < 2:
+            raise ValueError(
+                "vis_gt=true の場合、ファイル名から keyframe/sweep を判定するため "
+                "nuScenes PLY名は '<6digits>_..._<k|s>.ply' を想定します: "
+                f"got={base} (path={ply_path})"
+            )
+        idx_str = parts[0]
+        if len(idx_str) != 6 or not idx_str.isdigit():
+            raise ValueError(
+                "vis_gt=true の場合、先頭に6桁のlocal indexが必要です（data_prepare_nuScenes.py の出力形式）: "
+                f"got={base} (path={ply_path})"
+            )
+        kf_flag = parts[-1]
+        if kf_flag == "s":
+            # sweep は lidarseg GT が無いので保存しない
+            return out_npy
+        if kf_flag != "k":
+            raise ValueError(
+                "vis_gt=true の場合、ファイル名末尾の種別は 'k' or 's' を想定します: "
+                f"got={base} (path={ply_path})"
+            )
+
+        required_fields = ["class", "red", "green", "blue"]
+        names = getattr(data.dtype, "names", None)
+        if names is None:
+            raise ValueError(
+                "vis_gt=true には入力PLYが structured PLY である必要があります（'class'/'red'/'green'/'blue' を含む）: "
+                f"{ply_path}"
+            )
+        for rf in required_fields:
+            if rf not in names:
+                raise ValueError(
+                    f"vis_gt=true には入力PLYに '{rf}' が必要です（data_prepare_nuScenes.py の出力を使用してください）: {ply_path}"
+                )
+
+        gt_labels = data["class"].astype(np.int32, copy=False)
+        gt_colors = np.vstack((data["red"], data["green"], data["blue"])).T.astype(np.uint8, copy=False)
+
+        vis_dir = os.path.join(config["sp_path"], "vis", scene_id)
+        os.makedirs(vis_dir, exist_ok=True)
+        out_gt = os.path.join(vis_dir, frame_name[:-4] + "_gt.ply")
+        write_ply(
+            out_gt,
+            [coords, gt_colors, gt_labels.reshape(-1, 1)],
+            ["x", "y", "z", "red", "green", "blue", "label"],
+        )
 
     return out_npy
 
@@ -338,7 +399,7 @@ def main():
         # cache tokens per scene
         tokens_cache: Dict[str, List[str]] = {}
 
-        def iter_tasks() -> Tuple[str, str]:
+        def iter_tasks() -> Iterator[Tuple[str, str]]:
             for ply_path in ply_paths:
                 pf = Path(ply_path)
                 scene_id = pf.parent.name
@@ -375,8 +436,10 @@ def main():
                     raise FileNotFoundError(f"patchwork++ label が見つかりません: {label_path} (token={token})")
                 yield (ply_path, label_path)
 
+        tasks = iter_tasks()
         process_func = partial(construct_superpoints_patchwork_task, config=config)
     else:
+        tasks = ply_paths
         process_func = partial(construct_superpoints, config=config)
     max_workers = int(config["max_workers"])
     chunksize = int(config["chunksize"])
@@ -385,7 +448,7 @@ def main():
 
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
         for _ in tqdm(
-            pool.map(process_func, iter_tasks() if gdm == "patchwork++" else ply_paths, chunksize=chunksize),
+            pool.map(process_func, tasks, chunksize=chunksize),
             total=len(ply_paths),
             desc="initialSP",
         ):
