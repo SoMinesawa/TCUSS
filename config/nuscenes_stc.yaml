@@ -136,6 +136,7 @@ stc:
     weight_centroid_distance: 1.0
     weight_spread_similarity: 1.0
     weight_point_count_similarity: 1.0
+    weight_remission_similarity: 1.0
     max_centroid_distance: 5.0
     min_score_threshold: 0.7
     min_sp_points: 10

@@ -564,6 +564,7 @@ class NuScenesstc(Dataset):
         self.weight_centroid_distance = sp_matching.weight_centroid_distance
         self.weight_spread_similarity = sp_matching.weight_spread_similarity
         self.weight_point_count_similarity = sp_matching.weight_point_count_similarity
+        self.weight_remission_similarity = getattr(sp_matching, "weight_remission_similarity", 0.0)
         self.max_centroid_distance = sp_matching.max_centroid_distance
         self.min_score_threshold = sp_matching.min_score_threshold
         self.min_sp_points = sp_matching.min_sp_points
@@ -705,6 +706,19 @@ class NuScenesstc(Dataset):
         coords = np.asarray(cast(h5py.Dataset, g["lidar"])[:], dtype=np.float32)  # (N, 3)
         pose = np.asarray(cast(h5py.Dataset, g["pose"])[:], dtype=np.float32)  # (4, 4)
         ground_mask = np.asarray(cast(h5py.Dataset, g["ground_mask"])[:], dtype=bool)  # (N,)
+        remission_full = None
+        remission_vox = None
+        # remission（強度）は必要な場合のみPLYから取得（GrowSP PLYの順序に揃える）
+        if float(getattr(self, "weight_remission_similarity", 0.0)) != 0.0:
+            ply = read_ply(ply_path)
+            if "remission" not in ply.dtype.names:
+                raise KeyError(f"PLYに'remission'が存在しません: {ply_path} (fields={ply.dtype.names})")
+            remission_full = np.asarray(ply["remission"], dtype=np.float32).reshape(-1)
+            if remission_full.shape[0] != coords.shape[0]:
+                raise ValueError(
+                    "PLY remission と H5 lidar の点数が一致しません: "
+                    f"ply={remission_full.shape[0]}, h5={coords.shape[0]}, ply_path={ply_path}, h5={h5_file.filename}"
+                )
 
         flow = None
         if require_flow:
@@ -776,6 +790,8 @@ class NuScenesstc(Dataset):
             assert flow is not None
             flow_vox = flow[unique_map][mask]
         coords_original_masked = coords_original[unique_map][mask]
+        if remission_full is not None:
+            remission_vox = remission_full[unique_map][mask]
 
         return {
             "scene_name": rel_name,  # '/scene-0001/000002_s'
@@ -787,6 +803,7 @@ class NuScenesstc(Dataset):
             "pose": pose,
             "flow_vox": flow_vox,
             "ground_mask_vox": ground_mask_vox,
+            "remission_vox": remission_vox,
             "inverse_map": inverse_map,
             "unique_map": unique_map,
             "mask": mask,
@@ -840,9 +857,12 @@ class NuScenesstc(Dataset):
             tgt["pose"],
             src["ground_mask_vox"],
             tgt["ground_mask_vox"],
+            remission_t=src["remission_vox"],
+            remission_t1=tgt["remission_vox"],
             weight_centroid_distance=self.weight_centroid_distance,
             weight_spread_similarity=self.weight_spread_similarity,
             weight_point_count_similarity=self.weight_point_count_similarity,
+            weight_remission_similarity=self.weight_remission_similarity,
             max_centroid_distance=self.max_centroid_distance,
             min_score_threshold=self.min_score_threshold,
             min_sp_points=self.min_sp_points,

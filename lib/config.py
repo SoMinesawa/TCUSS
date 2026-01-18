@@ -12,6 +12,7 @@ class STCSPMatchingConfig:
     weight_centroid_distance: float = 1.0  # 重心距離（近いほど高スコア）
     weight_spread_similarity: float = 0.3  # 広がり（σx, σy, σz）の類似度
     weight_point_count_similarity: float = 0.2  # 点数の類似度
+    weight_remission_similarity: float = 0.0  # remission（強度）の類似度
     
     # 閾値
     max_centroid_distance: float = 3.0  # これ以上離れたSPは対応候補から除外 (m)

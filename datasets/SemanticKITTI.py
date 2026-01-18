@@ -681,6 +681,7 @@ class KITTIstc(Dataset):
         self.weight_centroid_distance = sp_matching.weight_centroid_distance
         self.weight_spread_similarity = sp_matching.weight_spread_similarity
         self.weight_point_count_similarity = sp_matching.weight_point_count_similarity
+        self.weight_remission_similarity = getattr(sp_matching, "weight_remission_similarity", 0.0)
         self.max_centroid_distance = sp_matching.max_centroid_distance
         self.min_score_threshold = sp_matching.min_score_threshold
         self.min_sp_points = sp_matching.min_sp_points
@@ -743,10 +744,10 @@ class KITTIstc(Dataset):
         scene_name_t2 = self._tuple_to_scene_name((seq_t2, idx_t2))
         
         # 時刻tのデータ（座標、統合SPラベル、pose、Scene Flow）
-        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t = self._get_item_one_scene(seq_t, idx_t)
+        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t, remission_t = self._get_item_one_scene(seq_t, idx_t)
         
         # 時刻t2のデータ
-        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2 = self._get_item_one_scene(seq_t2, idx_t2)
+        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2, remission_t2 = self._get_item_one_scene(seq_t2, idx_t2)
         
         # SP対応行列を計算（SPレベル直接マッチング）
         # scan_window=1なので、flow_tをそのまま使用
@@ -760,9 +761,12 @@ class KITTIstc(Dataset):
             pose_t2,
             ground_mask_t,
             ground_mask_t2,
+            remission_t=remission_t,
+            remission_t1=remission_t2,
             weight_centroid_distance=self.weight_centroid_distance,
             weight_spread_similarity=self.weight_spread_similarity,
             weight_point_count_similarity=self.weight_point_count_similarity,
+            weight_remission_similarity=self.weight_remission_similarity,
             max_centroid_distance=self.max_centroid_distance,
             min_score_threshold=self.min_score_threshold,
             min_sp_points=self.min_sp_points,
@@ -872,11 +876,28 @@ class KITTIstc(Dataset):
         sp_labels = sp_labels_full[unique_map][mask]
         ground_mask_vox = ground_mask[unique_map][mask]
         flow_vox = flow[unique_map][mask]
+
+        # remission（強度）は必要な場合のみPLYから取得（H5には入っていない想定）
+        remission_vox = None
+        if float(getattr(self, "weight_remission_similarity", 0.0)) != 0.0:
+            ply_path = os.path.join(self.args.data_path, seq_str, f"{idx_str}.ply")
+            if not os.path.exists(ply_path):
+                raise FileNotFoundError(f"PLYが見つかりません（remission取得用）: {ply_path}")
+            ply = read_ply(ply_path)
+            if "remission" not in ply.dtype.names:
+                raise KeyError(f"PLYに'remission'が存在しません: {ply_path} (fields={ply.dtype.names})")
+            remission_full = np.asarray(ply["remission"], dtype=np.float32).reshape(-1)
+            if remission_full.shape[0] != coords_original.shape[0]:
+                raise ValueError(
+                    "PLY remission と H5 lidar の点数が一致しません: "
+                    f"ply={remission_full.shape[0]}, h5={coords_original.shape[0]}, ply_path={ply_path}"
+                )
+            remission_vox = remission_full[unique_map][mask]
         
         # オリジナル座標（mask後）
         coords_original_masked = coords_original[unique_map][mask]
         
-        return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox
+        return coords_vox, coords_original_masked, sp_labels, pose, flow_vox, ground_mask_vox, remission_vox
     
     def _voxelize(self, coords):
         """点群をvoxel化"""

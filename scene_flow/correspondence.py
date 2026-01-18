@@ -357,7 +357,8 @@ def compute_sp_features(
     pose_t1: Optional[np.ndarray] = None,
     min_sp_points: int = 10,
     exclude_ground: bool = False,
-    remove_ego_motion: bool = False
+    remove_ego_motion: bool = False,
+    remission: Optional[np.ndarray] = None,
 ) -> Dict[int, Dict]:
     """
     各Superpointの特徴量を計算
@@ -366,6 +367,7 @@ def compute_sp_features(
         points: 点群座標 [N, 3]
         sp_labels: 各点のSPラベル [N]
         flow: Scene flow [N, 3]
+        remission: 各点のremission（強度）[N] or [N, 1]（Noneなら未使用）
         ground_mask: 地面マスク [N]（Trueが地面）
         pose_t: 時刻tのワールド姿勢行列 [4, 4]（エゴモーション除去用）
         pose_t1: 時刻t+1のワールド姿勢行列 [4, 4]（エゴモーション除去用）
@@ -374,8 +376,18 @@ def compute_sp_features(
         remove_ego_motion: エゴモーションを除去するかどうか
         
     Returns:
-        sp_features: {sp_id: {'centroid': [3], 'spread': [3], 'point_count': int, 'motion': [3]}}
+        sp_features: {sp_id: {'centroid': [3], 'spread': [3], 'point_count': int, 'motion': [3], 'remission_mean': float}}
     """
+    if remission is not None:
+        rem = np.asarray(remission, dtype=np.float32).reshape(-1)
+        if rem.shape[0] != points.shape[0]:
+            raise ValueError(
+                "remission length mismatch: "
+                f"points={points.shape}, remission={np.asarray(remission).shape}"
+            )
+    else:
+        rem = None
+
     # エゴモーション除去
     if remove_ego_motion and pose_t is not None and pose_t1 is not None:
         object_flow = compute_object_flow(flow, points, pose_t, pose_t1)
@@ -412,13 +424,20 @@ def compute_sp_features(
         
         # 移動ベクトル（flowの平均）
         motion = sp_flow.mean(axis=0)
-        
-        sp_features[sp_id] = {
+
+        feat = {
             'centroid': centroid,
             'spread': spread,
             'point_count': point_count,
-            'motion': motion
+            'motion': motion,
         }
+
+        # remission（強度）の平均（任意）
+        if rem is not None:
+            sp_rem = rem[sp_mask]
+            feat['remission_mean'] = float(sp_rem.mean()) if sp_rem.size > 0 else 0.0
+
+        sp_features[sp_id] = feat
     
     return sp_features
 
@@ -429,6 +448,7 @@ def compute_sp_matching_score_matrix(
     weight_centroid_distance: float = 1.0,
     weight_spread_similarity: float = 0.3,
     weight_point_count_similarity: float = 0.2,
+    weight_remission_similarity: float = 0.0,
     max_centroid_distance: float = 3.0
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -440,6 +460,7 @@ def compute_sp_matching_score_matrix(
         weight_centroid_distance: 重心距離の重み
         weight_spread_similarity: 広がり類似度の重み
         weight_point_count_similarity: 点数類似度の重み
+        weight_remission_similarity: remission（強度）類似度の重み
         max_centroid_distance: 重心距離の最大値（これ以上は対応候補から除外）
         
     Returns:
@@ -464,6 +485,8 @@ def compute_sp_matching_score_matrix(
     counts_t = np.array([sp_features_t[sp_id]['point_count'] for sp_id in sp_ids_t])
     counts_t1 = np.array([sp_features_t1[sp_id]['point_count'] for sp_id in sp_ids_t1])
     motions_t = np.array([sp_features_t[sp_id]['motion'] for sp_id in sp_ids_t])
+    remission_score = np.zeros((num_sp_t, num_sp_t1), dtype=np.float32)
+    effective_weight_remission = 0.0
     
     # 予測重心（重心 + 移動ベクトル）
     predicted_centroids_t = centroids_t + motions_t  # [num_sp_t, 3]
@@ -501,14 +524,36 @@ def compute_sp_matching_score_matrix(
     count_min = np.minimum(counts_t_expanded, counts_t1_expanded)
     count_max = np.maximum(counts_t_expanded, counts_t1_expanded)
     count_score = count_min / (count_max + 1e-8)
+
+    # === 4. remission 類似度スコア ===
+    if weight_remission_similarity != 0.0:
+        # 入力にremissionが無いのにweightだけ有効だとスコアが壊れるので明示的にエラーにする
+        if ('remission_mean' not in sp_features_t[sp_ids_t[0]]) or ('remission_mean' not in sp_features_t1[sp_ids_t1[0]]):
+            raise ValueError(
+                "weight_remission_similarity != 0 ですが SP特徴量に remission_mean がありません。"
+                "データセット側で各点のremissionを読み出し、compute_superpoint_correspondence_direct に"
+                " remission_t / remission_t1 を渡してください。"
+            )
+
+        # 1 - |a-b|/max(a,b)（両方0なら1）
+        remissions_t = np.array([sp_features_t[sp_id]['remission_mean'] for sp_id in sp_ids_t], dtype=np.float32)
+        remissions_t1 = np.array([sp_features_t1[sp_id]['remission_mean'] for sp_id in sp_ids_t1], dtype=np.float32)
+        rem_t = remissions_t[:, np.newaxis]
+        rem_t1 = remissions_t1[np.newaxis, :]
+        rem_max = np.maximum(rem_t, rem_t1)
+        rem_diff = np.abs(rem_t - rem_t1)
+        remission_score = 1.0 - (rem_diff / (rem_max + 1e-8))
+        remission_score = np.clip(remission_score, 0.0, 1.0)
+        effective_weight_remission = weight_remission_similarity
     
     # === 総合スコア ===
-    total_weight = weight_centroid_distance + weight_spread_similarity + weight_point_count_similarity
+    total_weight = weight_centroid_distance + weight_spread_similarity + weight_point_count_similarity + effective_weight_remission
     if total_weight > 0:
         score_matrix = (
             weight_centroid_distance * centroid_score +
             weight_spread_similarity * spread_score +
-            weight_point_count_similarity * count_score
+            weight_point_count_similarity * count_score +
+            effective_weight_remission * remission_score
         ) / total_weight
     
     # max_centroid_distance以上のペアは強制的に0
@@ -594,11 +639,14 @@ def compute_superpoint_correspondence_direct(
     weight_centroid_distance: float = 1.0,
     weight_spread_similarity: float = 0.3,
     weight_point_count_similarity: float = 0.2,
+    weight_remission_similarity: float = 0.0,
     max_centroid_distance: float = 3.0,
     min_score_threshold: float = 0.3,
     min_sp_points: int = 10,
     remove_ego_motion: bool = False,
-    exclude_ground: bool = False
+    exclude_ground: bool = False,
+    remission_t: Optional[np.ndarray] = None,
+    remission_t1: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     SPレベルで直接対応を計算する（新方式）
@@ -619,11 +667,14 @@ def compute_superpoint_correspondence_direct(
         weight_centroid_distance: 重心距離の重み
         weight_spread_similarity: 広がり類似度の重み
         weight_point_count_similarity: 点数類似度の重み
+        weight_remission_similarity: remission（強度）類似度の重み
         max_centroid_distance: 重心距離の最大値 (m)
         min_score_threshold: 最小スコア閾値
         min_sp_points: 最小SP点数
         remove_ego_motion: エゴモーション除去
         exclude_ground: 地面除外
+        remission_t: 時刻tのremission（強度）[N] or [N, 1]（任意）
+        remission_t1: 時刻t+1のremission（強度）[M] or [M, 1]（任意）
         
     Returns:
         corr_matrix: 対応行列 [num_valid_sp_t, num_valid_sp_t1]（1対1マッチ箇所が1、他は0）
@@ -634,14 +685,16 @@ def compute_superpoint_correspondence_direct(
     sp_features_t = compute_sp_features(
         points_t, sp_labels_t, flow_t,
         ground_mask_t, pose_t, pose_t1,
-        min_sp_points, exclude_ground, remove_ego_motion
+        min_sp_points, exclude_ground, remove_ego_motion,
+        remission=remission_t,
     )
     
     # t+1側はflowは使わない（ゼロで代用）
     sp_features_t1 = compute_sp_features(
         points_t1, sp_labels_t1, np.zeros_like(points_t1),
         ground_mask_t1, None, None,
-        min_sp_points, exclude_ground, False
+        min_sp_points, exclude_ground, False,
+        remission=remission_t1,
     )
     
     if len(sp_features_t) == 0 or len(sp_features_t1) == 0:
@@ -653,6 +706,7 @@ def compute_superpoint_correspondence_direct(
         weight_centroid_distance,
         weight_spread_similarity,
         weight_point_count_similarity,
+        weight_remission_similarity,
         max_centroid_distance
     )
     

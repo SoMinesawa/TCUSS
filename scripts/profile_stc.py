@@ -47,14 +47,14 @@ def profile_getitem(config, num_samples=5):
         
         # 1. _get_item_one_scene (t)
         t0 = time.time()
-        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t = dataset._get_item_one_scene(seq_t, idx_t)
+        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t, remission_t = dataset._get_item_one_scene(seq_t, idx_t)
         t1 = time.time()
         times['get_item_one_scene_t'].append(t1 - t0)
         print(f"  _get_item_one_scene (t): {t1-t0:.3f}s, points={len(coords_t)}, unique_sps={len(np.unique(sp_labels_t[sp_labels_t >= 0]))}")
         
         # 2. _get_item_one_scene (t2)
         t0 = time.time()
-        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2 = dataset._get_item_one_scene(seq_t2, idx_t2)
+        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2, remission_t2 = dataset._get_item_one_scene(seq_t2, idx_t2)
         t1 = time.time()
         times['get_item_one_scene_t2'].append(t1 - t0)
         print(f"  _get_item_one_scene (t2): {t1-t0:.3f}s, points={len(coords_t2)}, unique_sps={len(np.unique(sp_labels_t2[sp_labels_t2 >= 0]))}")
@@ -71,9 +71,12 @@ def profile_getitem(config, num_samples=5):
             pose_t2,
             ground_mask_t,
             ground_mask_t2,
+            remission_t=remission_t,
+            remission_t1=remission_t2,
             weight_centroid_distance=dataset.weight_centroid_distance,
             weight_spread_similarity=dataset.weight_spread_similarity,
             weight_point_count_similarity=dataset.weight_point_count_similarity,
+            weight_remission_similarity=getattr(dataset, "weight_remission_similarity", 0.0),
             max_centroid_distance=dataset.max_centroid_distance,
             min_score_threshold=dataset.min_score_threshold,
             min_sp_points=dataset.min_sp_points,
@@ -142,8 +145,8 @@ def profile_sp_matching_detail(config, num_samples=3):
         seq_t, idx_t = dataset.scene_locates[i]
         seq_t2, idx_t2 = dataset.scene_diff_locates[i]
         
-        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t = dataset._get_item_one_scene(seq_t, idx_t)
-        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2 = dataset._get_item_one_scene(seq_t2, idx_t2)
+        coords_t, coords_t_original, sp_labels_t, pose_t, flow_t, ground_mask_t, remission_t = dataset._get_item_one_scene(seq_t, idx_t)
+        coords_t2, coords_t2_original, sp_labels_t2, pose_t2, _, ground_mask_t2, remission_t2 = dataset._get_item_one_scene(seq_t2, idx_t2)
         
         print(f"\n--- Sample {i}: SPs_t={len(np.unique(sp_labels_t[sp_labels_t >= 0]))}, SPs_t2={len(np.unique(sp_labels_t2[sp_labels_t2 >= 0]))} ---")
         
@@ -152,7 +155,8 @@ def profile_sp_matching_detail(config, num_samples=3):
         sp_features_t = compute_sp_features(
             coords_t_original, sp_labels_t, flow_t,
             ground_mask_t, pose_t, pose_t2,
-            dataset.min_sp_points, dataset.exclude_ground, dataset.remove_ego_motion
+            dataset.min_sp_points, dataset.exclude_ground, dataset.remove_ego_motion,
+            remission=remission_t,
         )
         t1 = time.time()
         times['compute_sp_features_t'].append(t1 - t0)
@@ -163,7 +167,8 @@ def profile_sp_matching_detail(config, num_samples=3):
         sp_features_t1 = compute_sp_features(
             coords_t2_original, sp_labels_t2, np.zeros_like(coords_t2_original),
             ground_mask_t2, None, None,
-            dataset.min_sp_points, dataset.exclude_ground, False
+            dataset.min_sp_points, dataset.exclude_ground, False,
+            remission=remission_t2,
         )
         t1 = time.time()
         times['compute_sp_features_t1'].append(t1 - t0)
@@ -176,6 +181,7 @@ def profile_sp_matching_detail(config, num_samples=3):
             dataset.weight_centroid_distance,
             dataset.weight_spread_similarity,
             dataset.weight_point_count_similarity,
+            getattr(dataset, "weight_remission_similarity", 0.0),
             dataset.max_centroid_distance
         )
         t1 = time.time()
