@@ -30,10 +30,10 @@ weight_decay: 0.01
 accum_step: 1
 
 # データロード設定
-workers: 6
+workers: 6 # itachi: 6 poseidon: 3
 cluster_workers: 24
 eval_workers: 12
-batch_size: [8, 8]
+batch_size: [16, 16] # itachi: 16 poseidon: 8
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
 
