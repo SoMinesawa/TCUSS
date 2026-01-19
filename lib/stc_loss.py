@@ -224,6 +224,100 @@ def loss_stc_similarity_weighted(
     return loss
 
 
+def loss_stc_kl_primitive_weighted(
+    sp_features_t: torch.Tensor,
+    sp_features_t1: torch.Tensor,
+    weight_matrix: torch.Tensor,
+    primitive_centers: torch.Tensor,
+    temperature: float,
+    valid_mask_t: Optional[torch.Tensor] = None,
+    valid_mask_t1: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    STC損失（primitive/prototype への soft assignment 分布の一致; 対称KL）
+
+    - 対応ペアのみを使って、primitive中心への割当分布を一致させる
+    - corr_matrix(=weight_matrix) は 1対1マッチングスコア（0〜1、未マッチは0）を想定
+    - 未マッチ(0)は損失にも勾配にも寄与しない
+
+    Args:
+        sp_features_t: [M, D]
+        sp_features_t1: [N, D]
+        weight_matrix: [M, N]（0〜1, sparse）
+        primitive_centers: [P, D]（GrowSPのclassifier.weight）
+        temperature: softmax温度（>0）。logits = sim / temperature
+        valid_mask_t/valid_mask_t1: 無効SPを除外するマスク
+
+    Returns:
+        loss: スカラー
+    """
+    M, D = sp_features_t.shape
+    N = sp_features_t1.shape[0]
+    device = sp_features_t.device
+
+    if M == 0 or N == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    if primitive_centers.ndim != 2 or primitive_centers.shape[1] != D:
+        raise ValueError(
+            "primitive_centers shape mismatch: "
+            f"expected [P, {D}], got {tuple(primitive_centers.shape)}"
+        )
+
+    if not (isinstance(temperature, float) or isinstance(temperature, int)):
+        raise TypeError(f"temperature must be float, got {type(temperature)}")
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+
+    if valid_mask_t is None:
+        valid_mask_t = torch.ones(M, dtype=torch.bool, device=device)
+    if valid_mask_t1 is None:
+        valid_mask_t1 = torch.ones(N, dtype=torch.bool, device=device)
+
+    w = weight_matrix.to(device)
+    if w.shape != (M, N):
+        raise ValueError(f"weight_matrix shape mismatch: expected {(M, N)}, got {tuple(w.shape)}")
+
+    # 無効SPは重みを0にして除外
+    w = w * valid_mask_t.float().unsqueeze(1) * valid_mask_t1.float().unsqueeze(0)
+
+    # 対応ペアのみ抽出（sparse）
+    pair_idx = torch.nonzero(w > 0, as_tuple=False)  # [K, 2]
+    if pair_idx.numel() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    pair_w = w[pair_idx[:, 0], pair_idx[:, 1]]  # [K]
+    total_w = pair_w.sum()
+    if total_w <= 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # primitive中心とSP特徴を正規化し、cos類似度をlogitsとしてsoftmax
+    centers = F.normalize(primitive_centers.to(device), dim=-1)  # [P, D]
+    z_t = F.normalize(sp_features_t, dim=-1)  # [M, D]
+    z_t1 = F.normalize(sp_features_t1, dim=-1)  # [N, D]
+
+    logits_t = torch.mm(z_t, centers.t()) / temperature  # [M, P]
+    logits_t1 = torch.mm(z_t1, centers.t()) / temperature  # [N, P]
+
+    log_p_t = F.log_softmax(logits_t, dim=-1)  # [M, P]
+    log_p_t1 = F.log_softmax(logits_t1, dim=-1)  # [N, P]
+
+    log_p_i = log_p_t[pair_idx[:, 0]]  # [K, P]
+    log_p_j = log_p_t1[pair_idx[:, 1]]  # [K, P]
+    p_i = log_p_i.exp()
+    p_j = log_p_j.exp()
+
+    # 対称KL: 0.5*(KL(p_i||p_j) + KL(p_j||p_i))
+    kl_ij = F.kl_div(log_p_j, p_i, reduction="none").sum(dim=-1)  # [K]
+    kl_ji = F.kl_div(log_p_i, p_j, reduction="none").sum(dim=-1)  # [K]
+    sym_kl = 0.5 * (kl_ij + kl_ji)
+
+    loss = (pair_w * sym_kl).sum() / (total_w + eps)
+    return loss
+
+
 def loss_stc_mse(
     sp_features_t: torch.Tensor,
     sp_features_t1: torch.Tensor,

@@ -6,6 +6,8 @@ bn_momentum: 0.02
 cluster_interval: 10
 cluster_workers: 24
 eval_workers: 44
+eval_batch_size: 32
+cluster_batch_size: 16
 conv1_kernel_size: 5
 data_path: data/users/minesawa/semantickitti/growsp
 debug: false
@@ -27,20 +29,20 @@ growsp:
   end: 30
   start: 80
   w_rgb: 1.0
-ignore_hdbscan_outliers: true
 ignore_label: -1
 input_dim: 3
-lmb: 1.0
 lr: 0.01
 max_epoch:
 - 100
 - 350
 name: test_stc
 dataset: semantickitti
+frame_stride: 1
 original_data_path: data/dataset/semantickitti/dataset/sequences
 patchwork_path: data/users/minesawa/semantickitti/patchwork
 primitive_num: 500
 pseudo_label_path: pseudo_label_kitti/
+sp_id_path: sp_id_kitti/
 r_crop: 50.0
 resume: false
 save_path: data/users/minesawa/semantickitti/growsp_model
@@ -58,16 +60,21 @@ stc:
     remove_ego_motion: true
   enabled: true
   loss:
+    type: "kl"
     temperature: 0.1
   voteflow_preprocess_path: data/dataset/semantickitti/voteflow_preprocess_fixed
   weight: 1.0
-tarl_lr: 0.0002
 vis: false
 vis_sp: false
 voxel_size: 0.15
 wandb_run_id: null
 weight_decay: 0.01
 workers: 24
+persistent_workers: false
+prefetch_factor: 4
+use_ddp: true
+ddp_backend: "nccl"
+ddp_timeout_minutes: 90
 log_interval: 1000000
 max_iter:
 - 10000

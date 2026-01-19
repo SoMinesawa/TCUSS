@@ -65,6 +65,7 @@ prefetch_factor: 4
 # マルチGPU設定
 use_ddp: true
 ddp_backend: "nccl"
+ddp_timeout_minutes: 90
 
 # 実験設定
 seed: 2022
@@ -143,6 +144,7 @@ stc:
     exclude_ground: false
 
   loss:
+    type: "kl"
     temperature: 0.1
 
 

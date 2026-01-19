@@ -44,6 +44,7 @@ prefetch_factor: 4  # プリフェッチ数
 # マルチGPU設定
 use_ddp: true  # DistributedDataParallelを使用
 ddp_backend: "nccl"  # DDPバックエンド
+ddp_timeout_minutes: 90
 
 # 実験設定
 seed: 2022
@@ -133,4 +134,5 @@ stc:
 
   # 損失関数設定
   loss:
+    type: "cosine"
     temperature: 0.1  # 将来的に使う可能性

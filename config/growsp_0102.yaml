@@ -14,6 +14,7 @@ original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
 save_path: "data/users/minesawa/semantickitti/growsp_12000_19"
 pseudo_label_path: "pseudo_label_kitti/"
+sp_id_path: "sp_id_kitti/"
 
 # エポック設定
 max_epoch: [100, 350]  # [非成長フェーズ, 成長フェーズ]
@@ -43,6 +44,7 @@ prefetch_factor: 4  # プリフェッチ数
 # マルチGPU設定
 use_ddp: true  # DistributedDataParallelを使用
 ddp_backend: "nccl"  # DDPバックエンド
+ddp_timeout_minutes: 90
 
 # 実験設定
 seed: 2022
@@ -120,4 +122,5 @@ stc:
 
   # 損失関数設定
   loss:
+    type: "cosine"
     temperature: 0.1  # 将来的に使う可能性

@@ -25,7 +25,11 @@ from lib.config import TCUSSConfig
 from lib.utils import (
     get_pseudo_kitti, get_kittisp_feature, get_fixclassifier, get_kmeans_labels
 )
-from lib.stc_loss import compute_sp_features, loss_stc_similarity_weighted
+from lib.stc_loss import (
+    compute_sp_features,
+    loss_stc_similarity_weighted,
+    loss_stc_kl_primitive_weighted,
+)
 import sys
 
 
@@ -706,15 +710,36 @@ class TCUSSTrainer:
                 target_sp_ids=unique_sp_t2
             )
             
-            # 新方式: corr_matrixはマッチングスコア（0〜1）を格納（未マッチは0）
-            # スコアを重みとして、重み付きコサイン類似度を最大化（=負の値を最小化）
-            loss = loss_stc_similarity_weighted(
-                sp_feats_t,
-                sp_feats_t2,
-                corr_matrix,
-                valid_mask_t,
-                valid_mask_t2
-            )
+            stc_loss_type = getattr(self.config.stc.loss, "type", None)
+            if not isinstance(stc_loss_type, str):
+                raise ValueError(f"stc.loss.type must be str, got {type(stc_loss_type)}: {stc_loss_type}")
+            stc_loss_type = stc_loss_type.lower().strip()
+
+            if stc_loss_type == "cosine":
+                # corr_matrixはマッチングスコア（0〜1）を格納（未マッチは0）
+                # スコアを重みとして、重み付きコサイン類似度を最大化（=負の値を最小化）
+                loss = loss_stc_similarity_weighted(
+                    sp_feats_t,
+                    sp_feats_t2,
+                    corr_matrix,
+                    valid_mask_t,
+                    valid_mask_t2
+                )
+            elif stc_loss_type == "kl":
+                # primitive(prototype)へのsoft assignment分布を一致（重み付き対称KL）
+                if self.classifier is None:
+                    raise RuntimeError("STC loss 'kl' requires self.classifier (primitive centers), but classifier is None.")
+                loss = loss_stc_kl_primitive_weighted(
+                    sp_feats_t,
+                    sp_feats_t2,
+                    corr_matrix,
+                    primitive_centers=self.classifier.weight,
+                    temperature=float(self.config.stc.loss.temperature),
+                    valid_mask_t=valid_mask_t,
+                    valid_mask_t1=valid_mask_t2,
+                )
+            else:
+                raise ValueError(f"Unknown stc.loss.type: {stc_loss_type}. Supported: 'cosine', 'kl'.")
             
             if loss.grad_fn is not None:
                 total_loss = total_loss + loss

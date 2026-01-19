@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings('ignore')
 import os
+import datetime
 import numpy as np
 import random
 import torch
@@ -91,7 +92,10 @@ def setup_ddp(config):
     
     # プロセスグループの初期化
     backend = getattr(config, 'ddp_backend', 'nccl')
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(
+        backend=backend,
+        timeout=datetime.timedelta(minutes=config.ddp_timeout_minutes),
+    )
     
     # GPUを設定
     torch.cuda.set_device(local_rank)

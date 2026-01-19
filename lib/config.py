@@ -29,7 +29,11 @@ class STCSPMatchingConfig:
 @dataclass
 class STCLossConfig:
     """STC損失設定"""
-    temperature: float = 0.1
+    # 選択可能: "cosine" | "kl"
+    # - cosine: 対応SP特徴を重み付きcos類似度で近づける（現状方式）
+    # - kl: primitive(prototype)へのsoft assignment分布を重み付き対称KLで一致させる
+    type: str
+    temperature: float
 
 
 @dataclass
@@ -58,6 +62,7 @@ class TCUSSConfig:
     name: str  # 実験の名前
     dataset: str  # 使用するデータセット ("semantickitti" | "nuscenes")
     frame_stride: int  # 時系列サンプリング間隔（SemanticKITTI=1, nuScenes(20Hz->10Hz)=2 など）
+    ddp_timeout_minutes: int  # DDP collective timeout（分）
     data_path: str = 'data/users/minesawa/semantickitti/growsp'  # 点群データパス
     sp_path: str = 'data/users/minesawa/semantickitti/growsp_sp'  # 初期スーパーポイントパス
     original_data_path: str = 'data/dataset/semantickitti/dataset/sequences'  # オリジナルデータパス

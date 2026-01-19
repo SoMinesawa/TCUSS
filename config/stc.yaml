@@ -6,13 +6,13 @@
 # export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 
 # 基本設定
-name: "semantickitti_stc_1"
+name: "semantickitti_stc_kl"
 dataset: "semantickitti"
 data_path: "data/users/minesawa/semantickitti/growsp"
 sp_path: "data/users/minesawa/semantickitti/growsp_sp_1"
 original_data_path: "data/dataset/semantickitti/dataset/sequences"
 patchwork_path: "data/users/minesawa/semantickitti/patchwork"
-save_path: "data/users/minesawa/semantickitti/semantickitti_stc_1"
+save_path: "data/users/minesawa/semantickitti/semantickitti_stc_kl"
 pseudo_label_path: "pseudo_label_kitti/"
 sp_id_path: "sp_id_kitti/" 
 
@@ -44,6 +44,7 @@ prefetch_factor: 4  # プリフェッチ数
 # マルチGPU設定
 use_ddp: true  # DistributedDataParallelを使用
 ddp_backend: "nccl"  # DDPバックエンド
+ddp_timeout_minutes: 90
 
 # 実験設定
 seed: 2022
@@ -133,4 +134,5 @@ stc:
 
   # 損失関数設定
   loss:
+    type: "kl"
     temperature: 0.1  # 将来的に使う可能性
