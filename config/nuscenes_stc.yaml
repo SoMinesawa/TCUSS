@@ -17,7 +17,7 @@
 #     - scan_window: 1  (adjacent pairs after frame_stride)
 
 # 基本設定
-name: "nuscenes_stc"
+name: "nuscenes_stc_kl"
 dataset: "nuscenes"
 
 # 20Hz PLY（data_prepare/data_prepare_nuScenes.py の output_path）
@@ -31,7 +31,7 @@ original_data_path: "data/dataset/nuscenes"
 patchwork_path: "data/dataset/nuscenes"
 
 # checkpoints / logs
-save_path: "data/users/minesawa/nuscenes/nuscenes_stc"
+save_path: "data/users/minesawa/nuscenes/nuscenes_stc_kl"
 
 # pseudo labels / sp_id mapping outputs
 pseudo_label_path: "pseudo_label_nuscenes/"

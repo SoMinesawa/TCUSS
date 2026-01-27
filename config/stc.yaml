@@ -30,10 +30,10 @@ weight_decay: 0.01
 accum_step: 1
 
 # データロード設定
-workers: 6 # itachi: 6 poseidon: 3
+workers: 3 # itachi: 6 poseidon: 3
 cluster_workers: 24
 eval_workers: 12
-batch_size: [16, 16] # itachi: 16 poseidon: 8
+batch_size: [8, 8] # itachi: 16 poseidon: 8
 eval_batch_size: 16  # 評価時のバッチサイズ
 cluster_batch_size: 1  # クラスタリング時のバッチサイズ
 
@@ -44,7 +44,7 @@ prefetch_factor: 4  # プリフェッチ数
 # マルチGPU設定
 use_ddp: true  # DistributedDataParallelを使用
 ddp_backend: "nccl"  # DDPバックエンド
-ddp_timeout_minutes: 90
+ddp_timeout_minutes: 180
 
 # 実験設定
 seed: 2022
@@ -119,7 +119,7 @@ stc:
     weight_centroid_distance: 1.0  # 重心距離（近いほど高スコア）
     weight_spread_similarity: 1.0  # 広がり（σx, σy, σz）の類似度
     weight_point_count_similarity: 1.0  # 点数の類似度
-    weight_remission_similarity: 1.0  # remission（強度）の類似度
+    weight_remission_similarity: 0  # remission（強度）の類似度
     
     # 閾値
     max_centroid_distance: 5.0  # これ以上離れたSPは対応候補から除外 (m)

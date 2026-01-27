@@ -310,13 +310,25 @@ def get_kmeans_labels(n_clusters, pcds, max_iter=300):
         # centroids = centroids.squeeze(0)
         # distances = torch.cdist(pcds, centroids)
         # labels = torch.argmin(distances, dim=1)
-        except ValueError:
-            # print("kmeans-gpu ValueError so use sklearn")
+        except ValueError as e:
+            # NOTE: フォールバックが発生した場合は強く可視化する（時間が大きく伸びる主因になり得る）
+            print(
+                "[WARN][get_kmeans_labels] KMeans_gpu failed with ValueError; "
+                "falling back to sklearn KMeans on CPU (this can be VERY slow). "
+                f"n_clusters={n_clusters}, pcds_shape={tuple(pcds.shape)}. "
+                f"error={repr(e)}",
+                flush=True,
+            )
             pcds = pcds.cpu().numpy()
             # np.save("kmeans_error.npy", pcds)
             try:
                 labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0).fit_predict(pcds))
             except:
+                print(
+                    "[WARN][get_kmeans_labels] sklearn KMeans first attempt failed; retrying with n_jobs=5. "
+                    f"n_clusters={n_clusters}, pcds_shape={tuple(pcds.shape)}",
+                    flush=True,
+                )
                 labels = torch.from_numpy(KMeans_sklearn(n_clusters=n_clusters, n_init=5, random_state=0, n_jobs=5).fit_predict(pcds))
     lbls = labels.float().squeeze(0).cuda()
     del labels, model, pcds
