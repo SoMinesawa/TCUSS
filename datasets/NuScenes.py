@@ -213,9 +213,10 @@ class cfl_collate_fn:
     """KITTI版と同等のcollate（coordsとfeatsのサイズ差、indsオフセットに対応）"""
 
     def __call__(self, list_data):
-        coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals = list(zip(*list_data))
+        coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals, remission_all = list(zip(*list_data))
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch = [], [], [], [], [], [], []
         region_batch = []
+        remission_all_batch = []
         feats_sizes = []
         unique_vals_list = []
         accm_coords = 0
@@ -232,6 +233,7 @@ class cfl_collate_fn:
             pseudo_batch.append(torch.from_numpy(pseudo[batch_id]))
             inds_batch.append(torch.from_numpy(inds[batch_id] + accm_coords).int())
             region_batch.append(torch.from_numpy(region[batch_id])[:, None])
+            remission_all_batch.append(torch.from_numpy(remission_all[batch_id]))
             accm_coords += num_coords
 
         coords_batch = torch.cat(coords_batch, 0).float()
@@ -242,6 +244,7 @@ class cfl_collate_fn:
         pseudo_batch = torch.cat(pseudo_batch, -1)
         inds_batch = torch.cat(inds_batch, 0)
         region_batch = torch.cat(region_batch, 0)
+        remission_all_batch = torch.cat(remission_all_batch, 0).float()
 
         return (
             coords_batch,
@@ -255,6 +258,7 @@ class cfl_collate_fn:
             index,
             feats_sizes,
             unique_vals_list,
+            remission_all_batch,
         )
 
 
@@ -339,6 +343,7 @@ class NuScenesTrain(Dataset):
         coords = self.augs(coords)
 
         inds = np.arange(coords.shape[0])
+        remission_all = feats  # coordsと同じ点数（Mixup後は連結）
 
         # Mixup (same as KITTItrain)
         mix = random.randint(0, len(self.name) - 1)
@@ -352,9 +357,10 @@ class NuScenesTrain(Dataset):
         coords_mix, feats_mix, _, unique_map_mix, _ = self.voxelize(coords_mix, feats_mix, labels_mix)
         coords_mix = coords_mix.astype(np.float32)
         mask_mix = np.sqrt(((coords_mix * self.args.voxel_size) ** 2).sum(-1)) < self.args.r_crop
-        coords_mix, _ = coords_mix[mask_mix], feats_mix[mask_mix]
+        coords_mix, feats_mix = coords_mix[mask_mix], feats_mix[mask_mix]
         coords_mix = self.augs(coords_mix)
         coords = np.concatenate((coords, coords_mix), axis=0)
+        remission_all = np.concatenate((remission_all, feats_mix), axis=0)
 
         coords, feats, labels = self.augment_coords_to_feats(coords, feats, labels)
         if labels is None:
@@ -396,7 +402,7 @@ class NuScenesTrain(Dataset):
                     f"pseudo ファイルのサイズが一致しません: scene={scene_name}, pseudo={len(pseudo)}, expected={expected_size}, ply_file={file}"
                 )
 
-        return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals
+        return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals, remission_all
 
 
 class NuScenesVal(Dataset):
@@ -709,7 +715,8 @@ class NuScenesstc(Dataset):
         remission_full = None
         remission_vox = None
         # remission（強度）は必要な場合のみPLYから取得（GrowSP PLYの順序に揃える）
-        if float(getattr(self, "weight_remission_similarity", 0.0)) != 0.0:
+        need_remission = (float(getattr(self, "weight_remission_similarity", 0.0)) != 0.0) or (int(getattr(self.args, "input_dim", 0)) == 4)
+        if need_remission:
             ply = read_ply(ply_path)
             if "remission" not in ply.dtype.names:
                 raise KeyError(f"PLYに'remission'が存在しません: {ply_path} (fields={ply.dtype.names})")
@@ -874,7 +881,7 @@ class NuScenesstc(Dataset):
         coords_t_aug = self.augs(src["coords_vox"].copy())
         coords_t2_aug = self.augs(tgt["coords_vox"].copy())
 
-        return {
+        out = {
             "coords_t": coords_t_aug,
             "coords_t2": coords_t2_aug,
             "sp_labels_t": src["sp_labels"],
@@ -885,6 +892,15 @@ class NuScenesstc(Dataset):
             "scene_name_t": src["scene_name"],
             "scene_name_t2": tgt["scene_name"],
         }
+        if int(getattr(self.args, "input_dim", 0)) == 4:
+            if src["remission_vox"] is None or tgt["remission_vox"] is None:
+                raise ValueError(
+                    "input_dim=4 ですが remission_vox が取得できませんでした。"
+                    "PLYにremissionが存在するか、data_pathが正しいか確認してください。"
+                )
+            out["remission_t"] = np.asarray(src["remission_vox"], dtype=np.float32).reshape(-1, 1)
+            out["remission_t2"] = np.asarray(tgt["remission_vox"], dtype=np.float32).reshape(-1, 1)
+        return out
 
 
 class cfl_collate_fn_stc:
@@ -898,6 +914,8 @@ class cfl_collate_fn_stc:
     def __call__(self, list_data):
         coords_t_batch = []
         coords_t2_batch = []
+        remission_t_batch = []
+        remission_t2_batch = []
         sp_labels_t_list = []
         sp_labels_t2_list = []
         corr_matrix_list = []
@@ -909,6 +927,8 @@ class cfl_collate_fn_stc:
         for batch_id, data in enumerate(list_data):
             coords_t = data["coords_t"]
             coords_t2 = data["coords_t2"]
+            remission_t = data.get("remission_t", None)
+            remission_t2 = data.get("remission_t2", None)
             num_points_t = coords_t.shape[0]
             num_points_t2 = coords_t2.shape[0]
 
@@ -924,6 +944,10 @@ class cfl_collate_fn_stc:
                     1,
                 )
             )
+            if remission_t is not None:
+                remission_t_batch.append(torch.from_numpy(remission_t))
+            if remission_t2 is not None:
+                remission_t2_batch.append(torch.from_numpy(remission_t2))
 
             sp_labels_t_list.append(torch.from_numpy(data["sp_labels_t"]).long())
             sp_labels_t2_list.append(torch.from_numpy(data["sp_labels_t2"]).long())
@@ -935,8 +959,10 @@ class cfl_collate_fn_stc:
 
         coords_t_batch = torch.cat(coords_t_batch, 0).float()
         coords_t2_batch = torch.cat(coords_t2_batch, 0).float()
+        remission_t_out = torch.cat(remission_t_batch, 0).float() if len(remission_t_batch) > 0 else None
+        remission_t2_out = torch.cat(remission_t2_batch, 0).float() if len(remission_t2_batch) > 0 else None
 
-        return {
+        out = {
             "coords_t": coords_t_batch,
             "coords_t2": coords_t2_batch,
             "sp_labels_t": sp_labels_t_list,
@@ -947,6 +973,10 @@ class cfl_collate_fn_stc:
             "scene_name_t": scene_name_t_list,
             "scene_name_t2": scene_name_t2_list,
         }
+        if remission_t_out is not None and remission_t2_out is not None:
+            out["remission_t"] = remission_t_out
+            out["remission_t2"] = remission_t2_out
+        return out
 
 
 class NuScenestcuss(Dataset):

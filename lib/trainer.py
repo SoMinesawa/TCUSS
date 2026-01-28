@@ -567,19 +567,23 @@ class TCUSSTrainer:
     def train_growsp(self, growsp_data):
         """GrowSPのトレーニング（DDP対応版）
         
-        growsp_dataはcollate結果で、11要素タプル:
-        (coords, feats, normal, labels, inverse, pseudo, inds, region, index, feats_sizes, unique_vals_list)
+        growsp_dataはcollate結果で、12要素タプル:
+        (coords, feats, normal, labels, inverse, pseudo, inds, region, index, feats_sizes, unique_vals_list, remission_all)
+        
+        - feats: (N_orig, 1) 元シーン側のremission（SP特徴計算用）
+        - remission_all: (N_coords, 1) Mixup後coordsと同じ点数のremission（backbone入力用）
         """
         loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.config.ignore_label).to(self.device)
         
-        # データ形式をアンパック（11要素タプルのみ対応）
-        if len(growsp_data) != 11:
-            raise ValueError(f"Unexpected growsp_data length: {len(growsp_data)}. Expected 11.")
+        # データ形式をアンパック（12要素タプルのみ対応）
+        if len(growsp_data) != 12:
+            raise ValueError(f"Unexpected growsp_data length: {len(growsp_data)}. Expected 12.")
         
         coords = growsp_data[0]
         pseudo_labels = growsp_data[5]
         inds = growsp_data[6]
         feats_sizes = growsp_data[9]
+        remission_all = growsp_data[11]
         # unique_vals_list = growsp_data[10]  # STC用（train_growspでは使用しない）
         
         # サイズ不一致チェック
@@ -587,7 +591,25 @@ class TCUSSTrainer:
             raise ValueError(f"inds ({len(inds)}) と pseudo_labels ({len(pseudo_labels)}) のサイズが一致しません")
         
         # 入力フィールドの作成（DDPデバイスを使用）
-        in_field = ME.TensorField(coords[:, 1:] * self.config.voxel_size, coords, device=self.local_rank)
+        xyz = coords[:, 1:] * self.config.voxel_size
+        input_dim = int(self.config.input_dim)
+        if input_dim == 3:
+            in_feats = xyz
+        elif input_dim == 4:
+            if remission_all is None:
+                raise ValueError("config.input_dim=4 ですが remission_all が None です（dataset/collateの返り値を確認してください）")
+            if remission_all.ndim == 1:
+                remission_all = remission_all.view(-1, 1)
+            if remission_all.shape[0] != coords.shape[0]:
+                raise ValueError(
+                    "remission_all と coords の点数が一致しません: "
+                    f"remission_all={tuple(remission_all.shape)}, coords={tuple(coords.shape)}"
+                )
+            in_feats = torch.cat([xyz, remission_all.to(dtype=xyz.dtype)], dim=1)
+        else:
+            raise ValueError(f"Unsupported config.input_dim: {input_dim} (supported: 3, 4)")
+
+        in_field = ME.TensorField(in_feats, coords, device=self.local_rank)
         
         # 特徴抽出
         feats = self.model_q(in_field)
@@ -624,6 +646,8 @@ class TCUSSTrainer:
         
         coords_t = stc_data['coords_t']
         coords_t2 = stc_data['coords_t2']
+        remission_t = stc_data.get('remission_t', None)
+        remission_t2 = stc_data.get('remission_t2', None)
         sp_labels_t_list = stc_data['sp_labels_t']  # 統合SPラベル（リスト）
         sp_labels_t2_list = stc_data['sp_labels_t2']  # 統合SPラベル（リスト）
         corr_matrix_list = stc_data['corr_matrix']  # SP対応行列（リスト）
@@ -641,12 +665,42 @@ class TCUSSTrainer:
         
         # 結合して1回のforward
         coords_combined = torch.cat([coords_t, coords_t2_shifted], dim=0)
-        
-        in_field_combined = ME.TensorField(
-            coords_combined[:, 1:] * self.config.voxel_size, 
-            coords_combined, 
-            device=self.local_rank
-        )
+
+        xyz_combined = coords_combined[:, 1:] * self.config.voxel_size
+        input_dim = int(self.config.input_dim)
+        if input_dim == 3:
+            in_feats_combined = xyz_combined
+        elif input_dim == 4:
+            if remission_t is None or remission_t2 is None:
+                raise ValueError(
+                    "config.input_dim=4 ですが stc_data に remission_t / remission_t2 がありません。"
+                    "datasets/*stc と collate_fn_stc を更新してください。"
+                )
+            if remission_t.ndim == 1:
+                remission_t = remission_t.view(-1, 1)
+            if remission_t2.ndim == 1:
+                remission_t2 = remission_t2.view(-1, 1)
+            if remission_t.shape[0] != coords_t.shape[0]:
+                raise ValueError(
+                    "remission_t と coords_t の点数が一致しません: "
+                    f"remission_t={tuple(remission_t.shape)}, coords_t={tuple(coords_t.shape)}"
+                )
+            if remission_t2.shape[0] != coords_t2.shape[0]:
+                raise ValueError(
+                    "remission_t2 と coords_t2 の点数が一致しません: "
+                    f"remission_t2={tuple(remission_t2.shape)}, coords_t2={tuple(coords_t2.shape)}"
+                )
+            remission_combined = torch.cat([remission_t, remission_t2], dim=0)
+            if remission_combined.shape[0] != coords_combined.shape[0]:
+                raise ValueError(
+                    "remission_combined と coords_combined の点数が一致しません: "
+                    f"remission_combined={tuple(remission_combined.shape)}, coords_combined={tuple(coords_combined.shape)}"
+                )
+            in_feats_combined = torch.cat([xyz_combined, remission_combined.to(dtype=xyz_combined.dtype)], dim=1)
+        else:
+            raise ValueError(f"Unsupported config.input_dim: {input_dim} (supported: 3, 4)")
+
+        in_field_combined = ME.TensorField(in_feats_combined, coords_combined, device=self.local_rank)
         
         feats_combined = self.model_q(in_field_combined)
         

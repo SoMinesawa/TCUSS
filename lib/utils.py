@@ -34,15 +34,33 @@ def get_kittisp_feature(args, loader, model, current_growsp, epoch):
     
     with torch.no_grad():
         for batch_idx, data in tqdm(enumerate(loader), total=len(loader), desc="get_kittisp_feature"):
-            # collate_fnから11要素を受け取る（unique_vals_listが追加された）
-            coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index, feats_sizes, unique_vals_list = data
+            # collate_fnから12要素を受け取る（backbone入力用 remission_all が追加）
+            coords, features, normals, labels, inverse_map, pseudo_labels, inds, region, index, feats_sizes, unique_vals_list, remission_all = data
             
             # バッチサイズを取得（coordsの最初の列がbatch_id）
             batch_ids = coords[:, 0].int()
             actual_batch_size = len(feats_sizes)
             
             # === バッチでモデル推論 ===
-            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=0)
+            xyz = coords[:, 1:] * args.voxel_size
+            input_dim = int(getattr(args, "input_dim", 0))
+            if input_dim == 3:
+                in_feats = xyz
+            elif input_dim == 4:
+                if remission_all is None:
+                    raise ValueError("input_dim=4 ですが remission_all が None です（dataset/collateの返り値を確認してください）")
+                if remission_all.ndim == 1:
+                    remission_all = remission_all.view(-1, 1)
+                if remission_all.shape[0] != coords.shape[0]:
+                    raise ValueError(
+                        "remission_all と coords の点数が一致しません: "
+                        f"remission_all={tuple(remission_all.shape)}, coords={tuple(coords.shape)}"
+                    )
+                in_feats = torch.cat([xyz, remission_all.to(dtype=xyz.dtype)], dim=1)
+            else:
+                raise ValueError(f"Unsupported input_dim: {input_dim} (supported: 3, 4)")
+
+            in_field = ME.TensorField(in_feats, coords, device=0)
             all_feats = model(in_field)
             
             # featsの累積サイズを計算（collate_fnから受け取ったfeats_sizesを使用）

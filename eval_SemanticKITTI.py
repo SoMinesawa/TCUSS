@@ -119,7 +119,25 @@ def eval_once(
             coords, features, inverse_map, labels, index, region, original_coords, raw_labels = data
 
             # TensorFieldを作成（DDPデバイスを指定）
-            in_field = ME.TensorField(coords[:, 1:] * args.voxel_size, coords, device=device)
+            xyz = coords[:, 1:] * args.voxel_size
+            input_dim = int(getattr(args, "input_dim", 0))
+            if input_dim == 3:
+                in_feats = xyz
+            elif input_dim == 4:
+                if features is None:
+                    raise ValueError("input_dim=4 ですが features(remission) が None です")
+                if features.ndim == 1:
+                    features = features.view(-1, 1)
+                if features.shape[0] != coords.shape[0]:
+                    raise ValueError(
+                        "features(remission) と coords の点数が一致しません: "
+                        f"features={tuple(features.shape)}, coords={tuple(coords.shape)}"
+                    )
+                in_feats = torch.cat([xyz, features.to(dtype=xyz.dtype)], dim=1)
+            else:
+                raise ValueError(f"Unsupported input_dim: {input_dim} (supported: 3, 4)")
+
+            in_field = ME.TensorField(in_feats, coords, device=device)
             feats = model(in_field)
             feats = F.normalize(feats, dim=1)
 

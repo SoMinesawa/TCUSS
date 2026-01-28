@@ -119,9 +119,12 @@ class cfl_collate_fn:
     """データセットの出力を適切なフォーマットに変換するコレート関数
     
     Note: KITTItrainではMixupでcoordsだけが連結されるため、
-    coordsとfeatsのサイズが異なる。indsはモデル出力（coordsサイズ）から
-    original部分を取り出すためのインデックスなので、オフセットはcoordsの
-    点数で計算する必要がある。
+    coordsとfeats/labels/normals/regionのサイズが異なる（feats側は「元シーン側のみ」）。
+    一方で、backbone入力用に「coords側（Mixup後）と同じ点数のremission」を
+    remission_allとして別途返す。
+    
+    indsはモデル出力（coordsサイズ）から original 部分を取り出すためのインデックスなので、
+    オフセットはcoordsの点数で計算する必要がある。
     
     Returns:
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, 
@@ -132,9 +135,10 @@ class cfl_collate_fn:
     """
 
     def __call__(self, list_data):
-        coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals = list(zip(*list_data))
+        coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals, remission_all = list(zip(*list_data))
         coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch = [], [], [], [], [], [], []
         region_batch = []
+        remission_all_batch = []
         feats_sizes = []  # 各シーンのfeatsサイズを記録
         unique_vals_list = []  # 各シーンのunique_vals（連番ID→元init SP IDマッピング）
         accm_coords = 0   # inds用オフセット（coordsのサイズで計算）
@@ -152,6 +156,7 @@ class cfl_collate_fn:
             # indsのオフセットはcoordsの点数で計算（モデル出力がcoordsサイズに対応するため）
             inds_batch.append(torch.from_numpy(inds[batch_id] + accm_coords).int())
             region_batch.append(torch.from_numpy(region[batch_id])[:,None])
+            remission_all_batch.append(torch.from_numpy(remission_all[batch_id]))
             accm_coords += num_coords
 
         # Concatenate all lists
@@ -163,8 +168,22 @@ class cfl_collate_fn:
         pseudo_batch = torch.cat(pseudo_batch, -1)
         inds_batch = torch.cat(inds_batch, 0)
         region_batch = torch.cat(region_batch, 0)
+        remission_all_batch = torch.cat(remission_all_batch, 0).float()
 
-        return coords_batch, feats_batch, normal_batch, labels_batch, inverse_batch, pseudo_batch, inds_batch, region_batch, index, feats_sizes, unique_vals_list
+        return (
+            coords_batch,
+            feats_batch,
+            normal_batch,
+            labels_batch,
+            inverse_batch,
+            pseudo_batch,
+            inds_batch,
+            region_batch,
+            index,
+            feats_sizes,
+            unique_vals_list,
+            remission_all_batch,
+        )
 
 
 class KITTItrain(Dataset):
@@ -276,8 +295,12 @@ class KITTItrain(Dataset):
         # pcd.points = o3d.utility.Vector3dVector(coords)
         # o3d.io.write_point_cloud('mixup_before.pcd', pcd)
 
-        # ''' Take Mixup as an Augmentation'''
+        # Mixup: model入力のcoords側だけを連結する設計（lossは元シーン側のみ）。
+        # ただし backbone 入力で remission を使う場合、coordsと同じ点数のremissionが必要なので、
+        # remission_all（coordsと同じ点数）を別途作って返す。
         inds = np.arange(coords.shape[0])
+        remission_all = feats  # 元シーン側（coordsと同じ点数）
+
         '''Start Mixup(if you want to use Mixup, comment out the following)'''
         mix = random.randint(0, len(self.name)-1)
 
@@ -297,6 +320,7 @@ class KITTItrain(Dataset):
         #
         coords_mix = self.augs(coords_mix)
         coords = np.concatenate((coords, coords_mix), axis=0)
+        remission_all = np.concatenate((remission_all, feats_mix), axis=0)
         ''' End Mixup'''
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(coords)
@@ -371,7 +395,7 @@ class KITTItrain(Dataset):
                     f"debug_reprocess_size={debug_size}, ply_file={debug_file}"
                 )
 
-        return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals
+        return coords, feats, normals, labels, inverse_map, pseudo, inds, region, index, unique_vals, remission_all
 
 
 class KITTIval(Dataset):
@@ -778,8 +802,8 @@ class KITTIstc(Dataset):
         # voxel座標に対して適用（KITTItrainと同様）
         coords_t_aug = self.augs(coords_t.copy())
         coords_t2_aug = self.augs(coords_t2.copy())
-        
-        return {
+
+        out = {
             'coords_t': coords_t_aug,  # データ拡張後（特徴抽出用）
             'coords_t2': coords_t2_aug,  # データ拡張後（特徴抽出用）
             'sp_labels_t': sp_labels_t,
@@ -790,6 +814,16 @@ class KITTIstc(Dataset):
             'scene_name_t': scene_name_t,
             'scene_name_t2': scene_name_t2
         }
+        # backbone入力にremissionを使う場合は必須
+        if int(getattr(self.args, "input_dim", 0)) == 4:
+            if remission_t is None or remission_t2 is None:
+                raise ValueError(
+                    "input_dim=4 ですが remission_t/remission_t2 が取得できませんでした。"
+                    "PLYにremissionが存在するか、data_pathが正しいか確認してください。"
+                )
+            out["remission_t"] = remission_t.reshape(-1, 1).astype(np.float32, copy=False)
+            out["remission_t2"] = remission_t2.reshape(-1, 1).astype(np.float32, copy=False)
+        return out
     
     def _tuple_to_scene_name(self, tup: Tuple[int, int]) -> str:
         """シーン名を生成（KITTItrainと同じフォーマット）"""
@@ -878,7 +912,8 @@ class KITTIstc(Dataset):
 
         # remission（強度）は必要な場合のみPLYから取得（H5には入っていない想定）
         remission_vox = None
-        if float(getattr(self, "weight_remission_similarity", 0.0)) != 0.0:
+        need_remission = (float(getattr(self, "weight_remission_similarity", 0.0)) != 0.0) or (int(getattr(self.args, "input_dim", 0)) == 4)
+        if need_remission:
             ply_path = os.path.join(self.args.data_path, seq_str, f"{idx_str}.ply")
             if not os.path.exists(ply_path):
                 raise FileNotFoundError(f"PLYが見つかりません（remission取得用）: {ply_path}")
@@ -943,6 +978,8 @@ class cfl_collate_fn_stc:
         # list_dataは[{...}, {...}, ...]の形式
         coords_t_batch = []
         coords_t2_batch = []
+        remission_t_batch = []
+        remission_t2_batch = []
         sp_labels_t_list = []
         sp_labels_t2_list = []
         corr_matrix_list = []
@@ -954,6 +991,8 @@ class cfl_collate_fn_stc:
         for batch_id, data in enumerate(list_data):
             coords_t = data['coords_t']
             coords_t2 = data['coords_t2']
+            remission_t = data.get('remission_t', None)
+            remission_t2 = data.get('remission_t2', None)
             
             num_points_t = coords_t.shape[0]
             num_points_t2 = coords_t2.shape[0]
@@ -966,6 +1005,10 @@ class cfl_collate_fn_stc:
                 torch.cat((torch.ones(num_points_t2, 1).int() * batch_id, 
                           torch.from_numpy(coords_t2).int()), 1)
             )
+            if remission_t is not None:
+                remission_t_batch.append(torch.from_numpy(remission_t))
+            if remission_t2 is not None:
+                remission_t2_batch.append(torch.from_numpy(remission_t2))
             
             sp_labels_t_list.append(torch.from_numpy(data['sp_labels_t']).long())
             sp_labels_t2_list.append(torch.from_numpy(data['sp_labels_t2']).long())
@@ -977,8 +1020,10 @@ class cfl_collate_fn_stc:
         
         coords_t_batch = torch.cat(coords_t_batch, 0).float()
         coords_t2_batch = torch.cat(coords_t2_batch, 0).float()
+        remission_t_out = torch.cat(remission_t_batch, 0).float() if len(remission_t_batch) > 0 else None
+        remission_t2_out = torch.cat(remission_t2_batch, 0).float() if len(remission_t2_batch) > 0 else None
         
-        return {
+        out = {
             'coords_t': coords_t_batch,
             'coords_t2': coords_t2_batch,
             'sp_labels_t': sp_labels_t_list,
@@ -989,6 +1034,10 @@ class cfl_collate_fn_stc:
             'scene_name_t': scene_name_t_list,
             'scene_name_t2': scene_name_t2_list
         }
+        if remission_t_out is not None and remission_t2_out is not None:
+            out['remission_t'] = remission_t_out
+            out['remission_t2'] = remission_t2_out
+        return out
 
 
 class KITTItcuss_stc(Dataset):

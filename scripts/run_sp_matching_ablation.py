@@ -100,6 +100,18 @@ def main() -> None:
     parser.add_argument("--train-script", type=str, default="train_SemanticKITTI.py", help="学習スクリプト")
     parser.add_argument("--launcher", choices=["torchrun", "python"], default="torchrun", help="起動方法")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="torchrun時のGPUプロセス数")
+    parser.add_argument(
+        "--start-idx",
+        type=int,
+        default=1,
+        help="実行するgridの開始番号（1始まり, inclusive）",
+    )
+    parser.add_argument(
+        "--end-idx",
+        type=int,
+        default=None,
+        help="実行するgridの終了番号（1始まり, inclusive）。未指定なら最後まで。",
+    )
     parser.add_argument("--dry-run", action="store_true", help="YAML生成とコマンド表示のみ（実行しない）")
     parser.add_argument(
         "--if-exists",
@@ -127,7 +139,16 @@ def main() -> None:
     grid: List[Tuple[float, float, float, float]] = list(itertools.product(args.weights, repeat=4))
     total = len(grid)
 
+    start_idx = int(args.start_idx)
+    end_idx = total if args.end_idx is None else int(args.end_idx)
+    if start_idx < 1 or start_idx > total:
+        raise ValueError(f"--start-idx must be in [1, {total}], got: {start_idx}")
+    if end_idx < start_idx or end_idx > total:
+        raise ValueError(f"--end-idx must be in [{start_idx}, {total}], got: {end_idx}")
+
     for idx, (wcd, ws, wpc, wr) in enumerate(grid, start=1):
+        if idx < start_idx or idx > end_idx:
+            continue
         exp_id = (
             f"wcd{_fmt_weight(wcd)}_"
             f"ws{_fmt_weight(ws)}_"
